@@ -1626,7 +1626,7 @@ async def on_message_edit(before, after):
 
 print(f"[selfbot] starting — prefix '{PREFIX}'")
 try:
-    client.run(TOKEN, bot=False)
+    client.run(TOKEN)
 except discord.LoginFailure as e:
     print(f"[FATAL] login failed: {e}")
     sys.exit(1)
