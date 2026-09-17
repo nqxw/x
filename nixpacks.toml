@@ -1,0 +1,5 @@
+[phases.install]
+cmds = ["pip install discord.py-self aiohttp"]
+
+[start]
+cmd = "python selfbot.py"

@@ -1,0 +1,6 @@
+@echo off
+echo [selfbot] Installing dependencies...
+pip install -r requirements.txt
+echo [selfbot] Starting...
+python selfbot.py
+pause
