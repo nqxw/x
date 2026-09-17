@@ -1268,7 +1268,7 @@ async def on_message_edit(before, after):
 
 print(f"[selfbot] starting with prefix '{PREFIX}'")
 try:
-    client.run(TOKEN, bot=False)
+    client.run(TOKEN)
 except discord.LoginFailure as e:
     print(f"[FATAL] Login failed: {e}")
     print("[FATAL] Check your token. Make sure TOKEN env var or config.json is correct.")
