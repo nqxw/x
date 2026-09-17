@@ -327,12 +327,13 @@ BRAND_PRESETS = {
         "type": "playing",
         "name": "Roblox",
         "application_id": "363445589247131668",
-        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Roblox_player_icon_black.svg/2048px-Roblox_player_icon_black.svg.png",
+        # registered asset keys for Roblox's Discord app (363445589247131668)
+        "large_image": "roblox",
         "large_text": "Roblox",
-        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Roblox_player_icon_black.svg/2048px-Roblox_player_icon_black.svg.png",
-        "small_text": "Playing Roblox",
-        "_args": ["game"],
-        "_usage": ".rpc roblox <game name>",
+        "small_image": "roblox",
+        "small_text": "Playing on Roblox",
+        "_args": ["game", "details", "state", "large_text", "small_text"],
+        "_usage": ".rpc roblox <game> | <details> | <state> | <image_text> | <small_text>",
     },
     "custom": {
         "type": "playing",
@@ -440,10 +441,20 @@ async def apply_brand_rpc(brand: str, user_args: list):
         if ts: kwargs["timestamps"] = ts
 
     elif brand == "roblox":
-        game = " ".join(user_args).split("|")[0].strip() if user_args else "Roblox"
-        kwargs["details"] = game
-        kwargs["state"]   = "Playing on Roblox"
-        assets_kwargs["large_text"] = game
+        # .rpc roblox <game> | <details> | <state> | <image_hover_text> | <small_hover_text>
+        parts = " ".join(user_args).split("|") if user_args else []
+        game        = parts[0].strip() if len(parts) > 0 and parts[0].strip() else "Roblox"
+        details     = parts[1].strip() if len(parts) > 1 and parts[1].strip() else game
+        state       = parts[2].strip() if len(parts) > 2 and parts[2].strip() else "Playing on Roblox"
+        large_text  = parts[3].strip() if len(parts) > 3 and parts[3].strip() else game
+        small_text  = parts[4].strip() if len(parts) > 4 and parts[4].strip() else "Playing on Roblox"
+        kwargs["name"]    = "Roblox"
+        kwargs["details"] = details
+        kwargs["state"]   = state
+        assets_kwargs["large_image"] = "roblox"
+        assets_kwargs["large_text"]  = large_text
+        assets_kwargs["small_image"] = "roblox"
+        assets_kwargs["small_text"]  = small_text
         ts = _ts(start=now)
         if ts: kwargs["timestamps"] = ts
 
@@ -1118,7 +1129,7 @@ def build_help_rpc():
         f"  {p}rpc xbox <game>\n"
         f"  {p}rpc playstation <game>\n"
         f"  {p}rpc crunchyroll <anime> | <episode>\n"
-        f"  {p}rpc roblox <game>\n"
+        f"  {p}rpc roblox <game> | <details> | <state> | <img_text> | <small_text>\n"
         f"  {p}rpc custom <name> | <details> | <state>\n"
         f"  {p}rpc clear               alias for disable\n"
         f"```"
