@@ -1,11 +1,11 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# railway: set TOKEN env var in Variables tab
-# local: put token in config.json
 
 import discord
 import asyncio
+import aiohttp
 import json
 import os
+import sys
 import re
 import base64
 import datetime as dt
@@ -13,10 +13,8 @@ import configparser
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
-import aiohttp
-
 # ─────────────────────────────────────────────
-# BOOTSTRAP — safe for Railway (no config.json needed)
+# BOOTSTRAP
 # ─────────────────────────────────────────────
 
 os.makedirs("config", exist_ok=True)
@@ -38,33 +36,183 @@ def save_config(cfg):
     except Exception as e:
         print(f"[Config] save error: {e}")
 
-# Token: env var beats config.json
 _cfg = load_config()
 TOKEN = (
     os.environ.get("TOKEN", "").strip()
     or os.environ.get("DISCORD_TOKEN", "").strip()
     or str(_cfg.get("token", "")).strip()
-)
-
-# strip any accidental quotes
-TOKEN = TOKEN.strip('"').strip("'")
+).strip('"').strip("'")
 
 print(f"[selfbot] token loaded: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else '(short)'}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token found. Set TOKEN env var or put it in config.json")
-    raise SystemExit(1)
+    sys.exit(1)
 
-PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-AUTOQUEST_ENABLED = os.environ.get("AUTOQUEST", "").lower() in ("1", "true", "yes") or _cfg.get("autoquest_enabled", False)
+PREFIX         = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
+AUTOQUEST_ENABLED = (
+    os.environ.get("AUTOQUEST", "").lower() in ("1", "true", "yes")
+    or _cfg.get("autoquest_enabled", False)
+)
 
-LOG_FILE = "message_log.txt"
+LOG_FILE       = "message_log.txt"
 AUTO_RESPONSES = {}
 SNIPER_ENABLED = True
 LOGGER_ENABLED = True
 
 # ─────────────────────────────────────────────
-# CLIENT — discord.py-self specific flags
+# ANSI HELPERS
+# ─────────────────────────────────────────────
+# Discord ANSI in code blocks:  ```ansi\n...\n```
+# \u001b[{code}m
+
+R  = "\u001b[0m"        # reset
+B  = "\u001b[1m"        # bold
+DIM= "\u001b[2m"        # dim/gray
+CY = "\u001b[36m"       # cyan
+GR = "\u001b[32m"       # green
+YE = "\u001b[33m"       # yellow
+RD = "\u001b[31m"       # red
+BL = "\u001b[34m"       # blue
+MG = "\u001b[35m"       # magenta
+WH = "\u001b[37m"       # white
+
+def ansi(text): return f"```ansi\n{text}\n```"
+
+def help_header(title, subtitle=""):
+    line = f"{DIM}{'─'*42}{R}"
+    h = f"{B}{CY}> {title.lower()}{R}"
+    if subtitle:
+        h += f"  {DIM}{subtitle}{R}"
+    return f"{line}\n{h}\n{line}"
+
+def help_row(cmd, desc, indent=0):
+    pad = "  " * indent
+    return f"{pad}{DIM}├{R} {B}{WH}{cmd}{R}  {DIM}{desc}{R}"
+
+def help_section(name):
+    return f"\n{YE}{B}  {name}{R}"
+
+# ─────────────────────────────────────────────
+# PLATFORM SPOOFER
+# ─────────────────────────────────────────────
+
+PLATFORM_MAP = {
+    "phone":     {"os": "iOS", "browser": "Discord iOS"},
+    "android":   {"os": "Android", "browser": "Discord Android"},
+    "desktop":   {"os": "Windows", "browser": "Discord Client"},
+    "web":       {"os": "Windows", "browser": "Chrome"},
+    "console":   {"os": "PlayStation 4", "browser": "Discord Embedded"},
+    "xbox":      {"os": "Xbox One", "browser": "Discord Embedded"},
+    "playstation": {"os": "PlayStation 4", "browser": "Discord Embedded"},
+    "vr":        {"os": "Windows", "browser": "Discord Embedded"},
+}
+
+_current_platform = "desktop"
+
+# ─────────────────────────────────────────────
+# HYPESQUAD
+# ─────────────────────────────────────────────
+
+HOUSE_NAMES = {1: "Bravery", 2: "Brilliance", 3: "Balance"}
+HOUSE_IDS   = {"bravery": 1, "brilliance": 2, "balance": 3}
+
+async def change_hypesquad(session, token, house_id):
+    url = "https://discord.com/api/v9/hypesquad/online"
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    try:
+        async with session.post(url, headers=headers, json={"house_id": house_id}) as resp:
+            if resp.status in (200, 201, 204):
+                return True, HOUSE_NAMES[house_id]
+            text = await resp.text()
+            try:
+                data = json.loads(text)
+                return False, data.get("message", f"HTTP {resp.status}")
+            except Exception:
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)
+
+async def remove_hypesquad(session, token):
+    url = "https://discord.com/api/v9/hypesquad/online"
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    try:
+        async with session.delete(url, headers=headers) as resp:
+            if resp.status in (200, 201, 204):
+                return True, "removed"
+            text = await resp.text()
+            try:
+                data = json.loads(text)
+                return False, data.get("message", f"HTTP {resp.status}")
+            except Exception:
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)
+
+
+async def set_platform(platform: str):
+    """Change the gateway identify properties to spoof platform."""
+    global _current_platform
+    props = PLATFORM_MAP.get(platform.lower())
+    if not props:
+        return False
+
+    _current_platform = platform.lower()
+
+    # discord.py-self exposes the websocket; patch the identify properties
+    try:
+        ws = client.ws
+        if ws and hasattr(ws, '_identify'):
+            # Force a re-identify by closing and reconnecting
+            # The properties are baked at IDENTIFY time so we need reconnect
+            pass
+        # Patch the internal identify data on the connection
+        conn = client._connection
+        if hasattr(conn, '_identify'):
+            conn._identify['properties']['$os'] = props['os']
+            conn._identify['properties']['$browser'] = props['browser']
+            conn._identify['properties']['$device'] = props['browser']
+    except Exception as e:
+        print(f"[Platform] patch error: {e}")
+
+    # Easiest reliable method: change presence which re-sends gateway data
+    # The platform indicator is set in the IDENTIFY payload on reconnect
+    # We store it and reconnect the ws
+    try:
+        if client.ws:
+            await client.ws.close(code=4000)  # triggers auto-reconnect with new identify
+    except Exception as e:
+        print(f"[Platform] reconnect error: {e}")
+
+    return True
+
+# Patch the identify payload before connection
+_original_identify = None
+
+async def patched_identify(self, *, resume=False, reconnect=True):
+    global _current_platform
+    props = PLATFORM_MAP.get(_current_platform, PLATFORM_MAP["desktop"])
+    try:
+        data = self._identify if hasattr(self, '_identify') else {}
+        if 'properties' in data:
+            data['properties']['$os'] = props['os']
+            data['properties']['$browser'] = props['browser']
+            data['properties']['$device'] = props['browser']
+    except Exception:
+        pass
+    if _original_identify:
+        return await _original_identify(self, resume=resume, reconnect=reconnect)
+
+# ─────────────────────────────────────────────
+# CLIENT
 # ─────────────────────────────────────────────
 
 client = discord.Client(
@@ -79,18 +227,10 @@ client = discord.Client(
 def load_rpc_config():
     path = "config/rpc_config.json"
     default = {
-        "enabled": False,
-        "type": "playing",
-        "name": "selfbot",
-        "state": "running",
-        "details": "",
-        "url": "https://twitch.tv/voltrix",
-        "application_id": None,
-        "large_image": "",
-        "large_text": "",
-        "small_image": "",
-        "small_text": "",
-        "start_timestamp": None,
+        "enabled": False, "type": "playing", "name": "selfbot",
+        "state": "running", "details": "", "url": "https://twitch.tv/discord",
+        "application_id": None, "large_image": "", "large_text": "",
+        "small_image": "", "small_text": "", "start_timestamp": None,
         "end_timestamp": None,
         "party": {"enabled": False, "current": 1, "max": 5},
         "buttons": [{"label": "", "url": ""}, {"label": "", "url": ""}],
@@ -105,7 +245,6 @@ def load_rpc_config():
     try:
         with open(path, "r") as f:
             data = json.load(f)
-        # fill missing keys with defaults
         for k, v in default.items():
             if k not in data:
                 data[k] = v
@@ -118,7 +257,198 @@ def save_rpc_config(cfg):
         with open("config/rpc_config.json", "w") as f:
             json.dump(cfg, f, indent=4)
     except Exception as e:
-        print(f"[RPC] config save error: {e}")
+        print(f"[RPC] save error: {e}")
+
+# ─────────────────────────────────────────────
+# BRAND RPC PRESETS
+# ─────────────────────────────────────────────
+# application_ids sourced from discord's partnership integrations
+
+BRAND_PRESETS = {
+    "spotify": {
+        "type": "listening",
+        "name": "Spotify",
+        "application_id": "367827983903490050",
+        "large_image": "spotify:ab67616d00001e02ff9ca10b55ce82ae553d50e",
+        "large_text": "Spotify",
+        "small_image": "spotify:ab6761610000f178049d8eda6f0fd7a34bb0db9",
+        "small_text": "Listening",
+        "_args": ["title", "artist", "duration"],
+        "_usage": ".rpc spotify <title> | <artist> | <duration_secs>",
+    },
+    "youtube": {
+        "type": "watching",
+        "name": "YouTube",
+        "application_id": "880218394199220334",
+        "large_image": "youtube",
+        "large_text": "YouTube",
+        "_args": ["video", "channel", "duration"],
+        "_usage": ".rpc youtube <video title> | <channel> | <duration_secs>",
+    },
+    "xbox": {
+        "type": "playing",
+        "name": "Xbox",
+        "application_id": "438122941302046720",
+        "large_image": "xbox",
+        "large_text": "Xbox",
+        "small_image": "controller",
+        "small_text": "Playing",
+        "_args": ["game"],
+        "_usage": ".rpc xbox <game name>",
+    },
+    "playstation": {
+        "type": "playing",
+        "name": "PlayStation",
+        "application_id": "473226677884kwarg",
+        "large_image": "playstation",
+        "large_text": "PlayStation",
+        "small_image": "controller",
+        "small_text": "Playing",
+        "_args": ["game"],
+        "_usage": ".rpc playstation <game name>",
+    },
+    "crunchyroll": {
+        "type": "watching",
+        "name": "Crunchyroll",
+        "application_id": "1020123345567822899",
+        "large_image": "crunchyroll",
+        "large_text": "Crunchyroll",
+        "_args": ["anime", "episode"],
+        "_usage": ".rpc crunchyroll <anime name> | <episode>",
+    },
+    "custom": {
+        "type": "playing",
+        "name": "",
+        "_args": ["name", "details", "state"],
+        "_usage": ".rpc custom <name> | <details> | <state>",
+    },
+}
+
+async def apply_brand_rpc(brand: str, user_args: list):
+    """Build and apply a brand RPC preset."""
+    try:
+        from discord.activity import ActivityAssets, ActivityParty, ActivityTimestamps
+        from discord import ActivityButton, ActivityType, Activity
+    except ImportError as e:
+        print(f"[RPC] import error: {e}")
+        return False
+
+    preset = BRAND_PRESETS.get(brand)
+    if not preset:
+        return False
+
+    type_map = {
+        "playing": ActivityType.playing, "streaming": ActivityType.streaming,
+        "listening": ActivityType.listening, "watching": ActivityType.watching,
+        "competing": ActivityType.competing,
+    }
+
+    act_type = type_map.get(preset.get("type", "playing"), ActivityType.playing)
+    now = datetime.now(timezone.utc)
+
+    kwargs = {"type": act_type, "name": preset.get("name", brand.capitalize())}
+
+    if preset.get("application_id"):
+        try:
+            kwargs["application_id"] = int(preset["application_id"])
+        except (ValueError, TypeError):
+            pass
+
+    assets_kwargs = {}
+    if preset.get("large_image"):
+        assets_kwargs["large_image"] = preset["large_image"]
+    if preset.get("large_text"):
+        assets_kwargs["large_text"] = preset["large_text"]
+    if preset.get("small_image"):
+        assets_kwargs["small_image"] = preset["small_image"]
+    if preset.get("small_text"):
+        assets_kwargs["small_text"] = preset["small_text"]
+
+    # map user_args to fields based on brand
+    if brand == "spotify" and user_args:
+        parts = " ".join(user_args).split("|")
+        title  = parts[0].strip() if len(parts) > 0 else "Unknown"
+        artist = parts[1].strip() if len(parts) > 1 else "Unknown"
+        dur    = int(parts[2].strip()) if len(parts) > 2 else 210
+        kwargs["details"] = title
+        kwargs["state"]   = f"by {artist}"
+        kwargs["name"]    = "Spotify"
+        try:
+            kwargs["timestamps"] = ActivityTimestamps(
+                start=now, end=now + timedelta(seconds=dur)
+            )
+        except Exception:
+            pass
+
+    elif brand == "youtube" and user_args:
+        parts = " ".join(user_args).split("|")
+        video   = parts[0].strip() if len(parts) > 0 else "Video"
+        channel = parts[1].strip() if len(parts) > 1 else "Channel"
+        dur     = int(parts[2].strip()) if len(parts) > 2 else 600
+        kwargs["details"] = video
+        kwargs["state"]   = channel
+        assets_kwargs["large_text"] = channel
+        try:
+            kwargs["timestamps"] = ActivityTimestamps(
+                start=now, end=now + timedelta(seconds=dur)
+            )
+        except Exception:
+            pass
+
+    elif brand in ("xbox", "playstation") and user_args:
+        game = " ".join(user_args).split("|")[0].strip()
+        kwargs["details"] = game
+        assets_kwargs["large_text"] = game
+        try:
+            kwargs["timestamps"] = ActivityTimestamps(start=now)
+        except Exception:
+            pass
+
+    elif brand == "crunchyroll" and user_args:
+        parts = " ".join(user_args).split("|")
+        anime   = parts[0].strip() if len(parts) > 0 else "Anime"
+        episode = parts[1].strip() if len(parts) > 1 else "Anime"
+        kwargs["details"] = anime
+        kwargs["state"]   = episode
+        assets_kwargs["large_text"] = anime
+        dur = 1440
+        try:
+            kwargs["timestamps"] = ActivityTimestamps(
+                start=now, end=now + timedelta(seconds=dur)
+            )
+        except Exception:
+            pass
+
+    elif brand == "custom" and user_args:
+        parts = " ".join(user_args).split("|")
+        kwargs["name"]    = parts[0].strip() if len(parts) > 0 else "Custom"
+        if len(parts) > 1:
+            kwargs["details"] = parts[1].strip()
+        if len(parts) > 2:
+            kwargs["state"] = parts[2].strip()
+        try:
+            kwargs["timestamps"] = ActivityTimestamps(start=now)
+        except Exception:
+            pass
+
+    else:
+        try:
+            kwargs["timestamps"] = ActivityTimestamps(start=now)
+        except Exception:
+            pass
+
+    if assets_kwargs:
+        try:
+            kwargs["assets"] = ActivityAssets(**assets_kwargs)
+        except Exception as e:
+            print(f"[RPC] assets error: {e}")
+
+    try:
+        await client.change_presence(activity=Activity(**kwargs))
+        return True
+    except Exception as e:
+        print(f"[RPC] presence error: {e}")
+        return False
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -161,10 +491,7 @@ def parse_timestamp(value, is_end=False):
             parts = value.split(":")
             if len(parts) in (2, 3):
                 try:
-                    if len(parts) == 2:
-                        delta = int(parts[0]) * 60 + int(parts[1])
-                    else:
-                        delta = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                    delta = (int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])) if len(parts) == 3 else int(parts[0]) * 60 + int(parts[1])
                     now = datetime.now(timezone.utc)
                     return now + timedelta(seconds=delta) if is_end else now - timedelta(seconds=delta)
                 except ValueError:
@@ -177,7 +504,6 @@ async def update_rpc():
         if not cfg.get("enabled", False):
             await client.change_presence(activity=None)
             return
-
         try:
             from discord.activity import ActivityAssets, ActivityParty, ActivityTimestamps
             from discord import ActivityButton, ActivityType, Activity
@@ -186,14 +512,11 @@ async def update_rpc():
             return
 
         type_map = {
-            "playing": ActivityType.playing,
-            "streaming": ActivityType.streaming,
-            "listening": ActivityType.listening,
-            "watching": ActivityType.watching,
+            "playing": ActivityType.playing, "streaming": ActivityType.streaming,
+            "listening": ActivityType.listening, "watching": ActivityType.watching,
             "competing": ActivityType.competing,
         }
         act_type = type_map.get(str(cfg.get("type", "playing")).lower(), ActivityType.playing)
-
         kwargs = {"name": cfg.get("name", "selfbot") or "selfbot", "type": act_type}
 
         if cfg.get("application_id"):
@@ -203,125 +526,85 @@ async def update_rpc():
                 pass
 
         if act_type == ActivityType.streaming:
-            kwargs["url"] = cfg.get("url") or "https://twitch.tv/voltrix"
-
-        if cfg.get("state"):
-            kwargs["state"] = cfg["state"]
-        if cfg.get("details"):
-            kwargs["details"] = cfg["details"]
+            kwargs["url"] = cfg.get("url") or "https://twitch.tv/discord"
+        if cfg.get("state"):   kwargs["state"]   = cfg["state"]
+        if cfg.get("details"): kwargs["details"] = cfg["details"]
 
         try:
-            ts_kwargs = {}
-            parsed_start = parse_timestamp(cfg.get("start_timestamp"), is_end=False)
-            ts_kwargs["start"] = parsed_start if parsed_start else datetime.now(timezone.utc)
-            parsed_end = parse_timestamp(cfg.get("end_timestamp"), is_end=True)
-            if parsed_end:
-                ts_kwargs["end"] = parsed_end
-            kwargs["timestamps"] = ActivityTimestamps(**ts_kwargs)
+            ts = {}
+            ps = parse_timestamp(cfg.get("start_timestamp"), is_end=False)
+            ts["start"] = ps if ps else datetime.now(timezone.utc)
+            pe = parse_timestamp(cfg.get("end_timestamp"), is_end=True)
+            if pe: ts["end"] = pe
+            kwargs["timestamps"] = ActivityTimestamps(**ts)
         except Exception as e:
             print(f"[RPC] timestamp error: {e}")
 
-        assets_kwargs = {}
-        for k in ("large_image", "large_text", "small_image", "small_text"):
-            if cfg.get(k):
-                assets_kwargs[k] = cfg[k]
-        if assets_kwargs:
-            try:
-                kwargs["assets"] = ActivityAssets(**assets_kwargs)
-            except Exception as e:
-                print(f"[RPC] assets error: {e}")
+        ak = {k: cfg[k] for k in ("large_image","large_text","small_image","small_text") if cfg.get(k)}
+        if ak:
+            try: kwargs["assets"] = ActivityAssets(**ak)
+            except Exception: pass
 
-        party_cfg = cfg.get("party", {})
-        if party_cfg.get("enabled", False):
+        pc = cfg.get("party", {})
+        if pc.get("enabled"):
             try:
                 kwargs["party"] = ActivityParty(
                     id="selfbot-party",
-                    current_size=int(party_cfg.get("current", 1)),
-                    max_size=int(party_cfg.get("max", 5)),
+                    current_size=int(pc.get("current", 1)),
+                    max_size=int(pc.get("max", 5)),
                 )
-            except Exception as e:
-                print(f"[RPC] party error: {e}")
+            except Exception: pass
 
-        buttons_list = cfg.get("buttons", [])
         buttons = [
             ActivityButton(label=b["label"], url=b["url"])
-            for b in buttons_list[:2]
+            for b in cfg.get("buttons", [])[:2]
             if b.get("label") and b.get("url")
         ]
         if buttons:
-            try:
-                kwargs["buttons"] = buttons
-            except Exception as e:
-                print(f"[RPC] buttons error: {e}")
+            try: kwargs["buttons"] = buttons
+            except Exception: pass
 
         await client.change_presence(activity=Activity(**kwargs))
-        print("[RPC] presence updated")
-
     except Exception as e:
         print(f"[RPC] update_rpc error: {e}")
 
 async def rpc_prompt(channel, author, prompt_text):
-    prompt_msg = await channel.send(f"✏️ {prompt_text}\n*(type your value — 60s)*")
+    pm = await channel.send(f"```ansi\n{YE}✏  {prompt_text}{R}\n{DIM}type value — 60s timeout{R}\n```")
     def check(m):
         return m.author.id == author.id and m.channel.id == channel.id
     try:
         msg = await client.wait_for("message", check=check, timeout=60.0)
         val = msg.content.strip()
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
+        try: await msg.delete()
+        except Exception: pass
+        try: await pm.delete()
+        except Exception: pass
         return None if val.lower() == "none" else val
     except asyncio.TimeoutError:
-        try:
-            await prompt_msg.delete()
-        except Exception:
-            pass
-        await channel.send("❌ timed out.", delete_after=5)
+        try: await pm.delete()
+        except Exception: pass
+        await channel.send("```ansi\n\u001b[31m✗  timed out\u001b[0m\n```", delete_after=4)
         return "__TIMEOUT__"
 
 # ─────────────────────────────────────────────
 # QUEST SYSTEM
 # ─────────────────────────────────────────────
 
-UI_EMOJIS = {
-    "header": "🎯", "reward": "🎁", "game": "🎮",
-    "progress": "⏳", "time": "🕐", "mode": "⚡",
-    "overview": "💎", "completed": "✅", "running": "🔄",
-    "recovering": "🔃", "failed": "❌", "stopped": "⏹",
-}
-TASK_EMOJIS = {
-    "WATCH_VIDEO_ON_MOBILE": "📱", "WATCH_VIDEO": "📺",
-    "STREAM_ON_DESKTOP": "🖥", "PLAY_ON_DESKTOP": "🕹",
-    "PLAY_ON_DESKTOP_V2": "🕹", "PLAY_ACTIVITY": "🎲",
-}
-
 class APIError(Exception):
     def __init__(self, status, body=None, text=""):
         super().__init__(f"Discord API error {status}")
-        self.status = status
-        self.body = body or {}
-        self.text = text
+        self.status = status; self.body = body or {}; self.text = text
 
 def clean_token(token):
-    if not token:
-        return None
-    return token.strip().strip('"').strip("'")
+    return token.strip().strip('"').strip("'") if token else None
 
 def decode_token_user_id(token):
     token = clean_token(token)
-    if not token or "." not in token:
-        return None
+    if not token or "." not in token: return None
     first = token.split(".", 1)[0]
     padding = "=" * (-len(first) % 4)
-    try:
-        return base64.b64decode(first + padding).decode("utf-8")
-    except Exception:
-        return None
+    try: return base64.b64decode(first + padding).decode("utf-8")
+    except Exception: return None
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -348,13 +631,13 @@ def get_super_properties():
     }
 
 def get_headers(token):
-    super_props = base64.b64encode(json.dumps(get_super_properties()).encode()).decode()
+    sp = base64.b64encode(json.dumps(get_super_properties()).encode()).decode()
     return {
         "authorization": token, "accept": "*/*",
         "accept-language": "en,en-US;q=0.9",
         "content-type": "application/json",
         "user-agent": USER_AGENT,
-        "x-super-properties": super_props,
+        "x-super-properties": sp,
         "x-discord-locale": "en-US",
         "x-discord-timezone": "Africa/Algiers",
         "x-debug-options": "bugReporterEnabled",
@@ -363,10 +646,8 @@ def get_headers(token):
         "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "priority": "u=1, i",
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin", "priority": "u=1, i",
     }
 
 async def api_request(session, method, url, headers=None, json_body=None):
@@ -374,10 +655,8 @@ async def api_request(session, method, url, headers=None, json_body=None):
         text = await resp.text()
         body = {}
         if text:
-            try:
-                body = json.loads(text)
-            except Exception:
-                body = {"raw": text}
+            try: body = json.loads(text)
+            except Exception: body = {"raw": text}
         if resp.status >= 400:
             raise APIError(resp.status, body, text)
         return body
@@ -392,10 +671,8 @@ async def request_with_retry(session, method, url, headers=None, json_body=None,
             if exc.status == 429 or exc.status >= 500:
                 retry_after = 0.8 * (attempt + 1)
                 if isinstance(exc.body, dict):
-                    try:
-                        retry_after = float(exc.body.get("retry_after", retry_after))
-                    except Exception:
-                        pass
+                    try: retry_after = float(exc.body.get("retry_after", retry_after))
+                    except Exception: pass
                 await asyncio.sleep(retry_after)
                 continue
             raise
@@ -443,46 +720,33 @@ class QuestRecord:
     def expires_at(self): return self.config.get("expires_at") or self.config.get("expiresAt")
 
     def expires_relative(self):
-        if not self.expires_at:
-            return "Unknown"
+        if not self.expires_at: return "unknown"
         try:
             parsed = dt.datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
             return f"<t:{int(parsed.timestamp())}:R>"
-        except Exception:
-            return "Unknown"
+        except Exception: return "unknown"
 
     def is_expired(self):
-        if not self.expires_at:
-            return False
+        if not self.expires_at: return False
         try:
             parsed = dt.datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
             return dt.datetime.now(dt.timezone.utc) > parsed
-        except Exception:
-            return False
+        except Exception: return False
 
     def is_completed(self):
         return bool(self.user_status.get("completed_at") or self.user_status.get("completedAt"))
-
     def is_enrolled(self):
         return bool(self.user_status.get("enrolled_at"))
-
     def is_supported(self):
         return self.selected_task in SUPPORTED_TASKS
-
     def progress_value(self):
-        progress = self.user_status.get("progress", {})
-        task_progress = progress.get(self.selected_task, {})
-        return float(task_progress.get("value", 0) or 0) if task_progress else 0.0
-
+        p = self.user_status.get("progress", {}).get(self.selected_task, {})
+        return float(p.get("value", 0) or 0) if p else 0.0
     def progress_percent(self):
-        if not self.target:
-            return 0
-        return min(100, int((self.progress_value() / self.target) * 100))
-
+        return min(100, int((self.progress_value() / self.target) * 100)) if self.target else 0
     def _pick_task(self):
         for t in SUPPORTED_TASKS:
-            if t in self.tasks:
-                return t
+            if t in self.tasks: return t
         return next(iter(self.tasks.keys()), "UNKNOWN")
 
 class QuestService:
@@ -494,39 +758,28 @@ class QuestService:
 
     async def fetch_quests(self, session):
         try:
-            payload = await request_with_retry(
-                session, "GET", "https://discord.com/api/v9/quests/@me",
-                headers=self.headers)
-            quests = []
-            for raw in payload.get("quests", []):
-                q = QuestRecord(raw)
-                if not q.is_expired():
-                    quests.append(q)
-            return quests
+            payload = await request_with_retry(session, "GET",
+                "https://discord.com/api/v9/quests/@me", headers=self.headers)
+            return [QuestRecord(r) for r in payload.get("quests", []) if not QuestRecord(r).is_expired()]
         except Exception as e:
-            print(f"[QuestService] fetch error: {e}")
+            print(f"[Quest] fetch error: {e}")
             return []
 
     async def refresh_quest(self, session, quest_id):
         for q in await self.fetch_quests(session):
-            if q.id == quest_id:
-                return q
+            if q.id == quest_id: return q
         return None
 
     async def get_user_status(self, session, quest_id):
-        return await request_with_retry(
-            session, "GET",
-            f"https://discord.com/api/v9/quests/{quest_id}/user-status",
-            headers=self.headers)
+        return await request_with_retry(session, "GET",
+            f"https://discord.com/api/v9/quests/{quest_id}/user-status", headers=self.headers)
 
     async def enroll(self, session, quest):
-        payload = await request_with_retry(
-            session, "POST",
+        payload = await request_with_retry(session, "POST",
             f"https://discord.com/api/v9/quests/{quest.id}/enroll",
             headers=self.headers,
             json_body={"location": 11, "is_targeted": False, "metadata_raw": None})
-        if payload:
-            quest.data["user_status"] = payload
+        if payload: quest.data["user_status"] = payload
         return True
 
     async def run_quest(self, session, quest, on_update=None):
@@ -534,59 +787,51 @@ class QuestService:
             try:
                 if not quest.is_enrolled():
                     await self.enroll(session, quest)
-                    await self._emit(on_update, quest, "Enrolled", status="enrolled")
+                    await self._emit(on_update, quest, "enrolled", status="enrolled")
                 if not quest.is_supported():
-                    await self._emit(on_update, quest, "Unsupported task", status="unsupported")
+                    await self._emit(on_update, quest, "unsupported task", status="unsupported")
                     return {"status": "unsupported", "quest": quest}
                 result = await self._run_solver(session, quest, on_update)
-                if result["status"] == "completed":
-                    return result
+                if result["status"] == "completed": return result
                 fresh = await self.refresh_quest(session, quest.id)
                 if fresh and fresh.is_completed():
-                    await self._emit(on_update, fresh, "Completed", percent=100, status="completed")
+                    await self._emit(on_update, fresh, "completed", percent=100, status="completed")
                     return {"status": "completed", "quest": fresh, "percent": 100}
-                if fresh:
-                    quest = fresh
-                await self._emit(on_update, quest,
-                    f"Recovering from {quest.progress_percent()}%",
+                if fresh: quest = fresh
+                await self._emit(on_update, quest, f"recovering from {quest.progress_percent()}%",
                     percent=quest.progress_percent(), status="recovering")
                 await asyncio.sleep(5.0)
             except APIError as exc:
                 if exc.status == 404:
                     fresh = await self.refresh_quest(session, quest.id)
                     if fresh and fresh.is_completed():
-                        await self._emit(on_update, fresh, "Completed", percent=100, status="completed")
+                        await self._emit(on_update, fresh, "completed", percent=100, status="completed")
                         return {"status": "completed", "quest": fresh, "percent": 100}
-                    if fresh:
-                        quest = fresh
-                    await asyncio.sleep(5.0)
-                    continue
+                    if fresh: quest = fresh
+                    await asyncio.sleep(5.0); continue
                 if exc.status in (401, 403):
-                    msg = f"API error {exc.status}"
+                    msg = f"api error {exc.status}"
                     await self._emit(on_update, quest, msg, status="failed_unrecoverable")
-                    return {"status": "failed_unrecoverable", "quest": quest,
-                            "percent": quest.progress_percent(), "reason": msg}
+                    return {"status": "failed_unrecoverable", "quest": quest, "percent": quest.progress_percent(), "reason": msg}
                 await asyncio.sleep(5.0)
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError: raise
             except Exception as e:
-                print(f"[Quest] run_quest error: {e}")
+                print(f"[Quest] run error: {e}")
                 await asyncio.sleep(5.0)
 
     async def _run_solver(self, session, quest, on_update=None):
         task = quest.selected_task
-        await self._emit(on_update, quest, "Solver active", status="running")
+        await self._emit(on_update, quest, "solver active", status="running")
         if task in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
             return await self._run_video(session, quest, on_update)
         if task in ("PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2"):
             payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
-            if quest.app_id:
-                payloads.append({"application_id": quest.app_id, "terminal": False})
+            if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
             return await self._run_heartbeat(session, quest, payloads, on_update)
         if task == "PLAY_ACTIVITY":
-            user_key = self.user_id or quest.id
+            uk = self.user_id or quest.id
             return await self._run_heartbeat(session, quest, [
-                {"stream_key": f"call:{user_key}:1", "terminal": False},
+                {"stream_key": f"call:{uk}:1", "terminal": False},
                 {"stream_key": f"call:{quest.id}:1", "terminal": False},
             ], on_update)
         if task == "STREAM_ON_DESKTOP":
@@ -600,116 +845,95 @@ class QuestService:
         started_at = int(dt.datetime.now(dt.timezone.utc).timestamp()) - int(last_good)
         try:
             while last_good < quest.target:
-                timestamp = min(float(quest.target),
-                    float(int(dt.datetime.now(dt.timezone.utc).timestamp()) - started_at))
+                ts = min(float(quest.target), float(int(dt.datetime.now(dt.timezone.utc).timestamp()) - started_at))
                 try:
-                    data = await request_with_retry(
-                        session, "POST",
+                    data = await request_with_retry(session, "POST",
                         f"https://discord.com/api/v9/quests/{quest.id}/video-progress",
-                        headers=self.headers, json_body={"timestamp": timestamp}, retries=2)
+                        headers=self.headers, json_body={"timestamp": ts}, retries=2)
                 except APIError as exc:
                     if exc.status == 400:
-                        status_data = await self.get_user_status(session, quest.id)
-                        quest.data["user_status"] = status_data
+                        sd = await self.get_user_status(session, quest.id)
+                        quest.data["user_status"] = sd
                         last_good = max(last_good, quest.progress_value())
                         if quest.is_completed():
-                            await self._emit(on_update, quest, "Completed", percent=100, status="completed")
+                            await self._emit(on_update, quest, "completed", percent=100, status="completed")
                             return {"status": "completed", "quest": quest, "percent": 100}
-                        await asyncio.sleep(1.1)
-                        continue
+                        await asyncio.sleep(1.1); continue
                     raise
-                if data:
-                    quest.data["user_status"] = data
-                last_good = max(last_good, timestamp, quest.progress_value())
-                percent = min(100, int((last_good / quest.target) * 100)) if quest.target else 0
-                await self._emit(on_update, quest, f"Progressing [{percent}%]",
-                    percent=percent, status="running")
+                if data: quest.data["user_status"] = data
+                last_good = max(last_good, ts, quest.progress_value())
+                pct = min(100, int((last_good / quest.target) * 100)) if quest.target else 0
+                await self._emit(on_update, quest, f"progressing [{pct}%]", percent=pct, status="running")
                 if data.get("completed_at"):
                     fresh = await self.get_user_status(session, quest.id)
                     quest.data["user_status"] = fresh
-                    await self._emit(on_update, quest, "Completed", percent=100, status="completed")
+                    await self._emit(on_update, quest, "completed", percent=100, status="completed")
                     return {"status": "completed", "quest": quest, "percent": 100}
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
-            await self._emit(on_update, quest, "Stopped",
-                percent=quest.progress_percent(), status="manually_stopped")
+            await self._emit(on_update, quest, "stopped", percent=quest.progress_percent(), status="manually_stopped")
             raise
         if quest.is_completed() or quest.progress_value() >= quest.target:
-            await self._emit(on_update, quest, "Completed", percent=100, status="completed")
+            await self._emit(on_update, quest, "completed", percent=100, status="completed")
             return {"status": "completed", "quest": quest, "percent": 100}
         return {"status": "recovering", "quest": quest, "percent": quest.progress_percent()}
 
     async def _run_heartbeat(self, session, quest, payloads, on_update=None):
         interval = 30 if self.speed_mode == "fast" else 40
-        active_payload = payloads[0]
-        last_percent = -1
+        active_payload = payloads[0]; last_percent = -1
         try:
             while True:
                 data = None
                 for payload in payloads:
                     try:
-                        data = await request_with_retry(
-                            session, "POST",
+                        data = await request_with_retry(session, "POST",
                             f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
                             headers=self.headers, json_body=payload, retries=2)
-                        active_payload = payload
-                        break
-                    except APIError:
-                        continue
+                        active_payload = payload; break
+                    except APIError: continue
                 if data is None:
                     try:
-                        status_data = await self.get_user_status(session, quest.id)
-                        quest.data["user_status"] = status_data
+                        sd = await self.get_user_status(session, quest.id)
+                        quest.data["user_status"] = sd
                     except APIError as exc:
-                        if exc.status == 404:
-                            await asyncio.sleep(2.0)
-                            continue
+                        if exc.status == 404: await asyncio.sleep(2.0); continue
                         raise
-                else:
-                    quest.data["user_status"] = data
-                percent = quest.progress_percent()
-                if percent != last_percent:
-                    await self._emit(on_update, quest, f"Progressing [{percent}%]",
-                        percent=percent, status="running")
-                    last_percent = percent
-                if quest.is_completed() or quest.progress_value() >= quest.target:
-                    break
+                else: quest.data["user_status"] = data
+                pct = quest.progress_percent()
+                if pct != last_percent:
+                    await self._emit(on_update, quest, f"progressing [{pct}%]", percent=pct, status="running")
+                    last_percent = pct
+                if quest.is_completed() or quest.progress_value() >= quest.target: break
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             await self._send_terminal(session, quest.id, active_payload)
-            await self._emit(on_update, quest, "Stopped",
-                percent=quest.progress_percent(), status="manually_stopped")
+            await self._emit(on_update, quest, "stopped", percent=quest.progress_percent(), status="manually_stopped")
             raise
         await self._send_terminal(session, quest.id, active_payload)
         if quest.is_completed() or quest.progress_value() >= quest.target:
-            await self._emit(on_update, quest, "Completed", percent=100, status="completed")
+            await self._emit(on_update, quest, "completed", percent=100, status="completed")
             return {"status": "completed", "quest": quest, "percent": 100}
         return {"status": "recovering", "quest": quest, "percent": quest.progress_percent()}
 
     async def _send_terminal(self, session, quest_id, payload):
         try:
-            terminal = dict(payload)
-            terminal["terminal"] = True
+            t = dict(payload); t["terminal"] = True
             await request_with_retry(session, "POST",
                 f"https://discord.com/api/v9/quests/{quest_id}/heartbeat",
-                headers=self.headers, json_body=terminal, retries=2)
-        except Exception:
-            pass
+                headers=self.headers, json_body=t, retries=2)
+        except Exception: pass
 
-    async def _emit(self, callback, quest, message, percent=None, status=None):
-        if callback is None:
-            return
+    async def _emit(self, cb, quest, message, percent=None, status=None):
+        if cb is None: return
         payload = {
             "quest_id": quest.id, "quest_name": quest.name,
             "percent": percent if percent is not None else quest.progress_percent(),
             "status": status or "running", "message": message, "quest": quest,
         }
         try:
-            res = callback(payload)
-            if asyncio.iscoroutine(res):
-                await res
-        except Exception:
-            pass
+            res = cb(payload)
+            if asyncio.iscoroutine(res): await res
+        except Exception: pass
 
 # ─────────────────────────────────────────────
 # ORB BADGE
@@ -719,30 +943,22 @@ ORB_BADGE_SKU_ID = "1342211853484429445"
 
 async def _claim_orb_badge(session, token):
     headers = {
-        "accept": "*/*", "authorization": token,
-        "content-type": "application/json",
-        "origin": "https://discord.com",
-        "referer": "https://discord.com/shop?tab=orbs",
+        "accept": "*/*", "authorization": token, "content-type": "application/json",
+        "origin": "https://discord.com", "referer": "https://discord.com/shop?tab=orbs",
         "user-agent": USER_AGENT,
     }
     balance = None
-    for url in [
-        "https://discord.com/api/v9/users/@me/orbs/balance",
-        "https://discord.com/api/v9/users/@me/virtual-currency/balance",
-    ]:
+    for url in ["https://discord.com/api/v9/users/@me/orbs/balance",
+                "https://discord.com/api/v9/users/@me/virtual-currency/balance"]:
         try:
             async with session.get(url, headers=headers) as resp:
                 if resp.status < 400:
                     body = json.loads(await resp.text()) if await resp.text() else {}
                     for key in ("balance", "discord_orb", "orbs", "amount", "total"):
                         val = body.get(key)
-                        if isinstance(val, (int, float)):
-                            balance = int(val)
-                            break
-        except Exception:
-            pass
-        if balance is not None:
-            break
+                        if isinstance(val, (int, float)): balance = int(val); break
+        except Exception: pass
+        if balance is not None: break
     try:
         url = f"https://discord.com/api/v9/virtual-currency/skus/{ORB_BADGE_SKU_ID}/redeem"
         async with session.post(url, headers=headers, json={}) as resp:
@@ -764,10 +980,9 @@ async def run_autoquest_pass_now(token):
             quests = await service.fetch_quests(session)
             active = [q for q in quests if not q.is_completed() and q.is_supported()]
             if not active:
-                print("[AutoQuest] No active quests.")
-                return
+                print("[AutoQuest] no active quests."); return
             for quest in active:
-                print(f"[AutoQuest] Running: {quest.name}")
+                print(f"[AutoQuest] running: {quest.name}")
                 result = await service.run_quest(session, quest)
                 if result and result.get("status") == "completed":
                     print(f"[AutoQuest] ✅ {quest.name} | {quest.reward_name}")
@@ -776,7 +991,7 @@ async def run_autoquest_pass_now(token):
 
 def make_progress_bar(percent):
     filled = int(percent / 10)
-    return "█" * filled + "░" * (10 - filled) + f" {percent}%"
+    return f"{GR}{'█' * filled}{DIM}{'░' * (10 - filled)}{R} {WH}{percent}%{R}"
 
 # ─────────────────────────────────────────────
 # NITRO SNIPER
@@ -788,23 +1003,143 @@ async def snipe_nitro(code, channel_id):
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem"
-            headers = {
-                "Authorization": TOKEN,
-                "Content-Type": "application/json",
-                "User-Agent": USER_AGENT,
-            }
+            headers = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
             async with session.post(url, headers=headers, json={"channel_id": str(channel_id)}) as r:
                 data = {}
-                try:
-                    data = await r.json()
-                except Exception:
-                    pass
+                try: data = await r.json()
+                except Exception: pass
                 if r.status == 200:
                     log_message("SNIPER", f"✅ SNIPED: {code}")
                 else:
-                    log_message("SNIPER", f"❌ Failed: {code} | {r.status} | {data.get('message', '')}")
+                    log_message("SNIPER", f"❌ failed: {code} | {r.status} | {data.get('message', '')}")
     except Exception as e:
         log_message("SNIPER", f"error: {e}")
+
+# ─────────────────────────────────────────────
+# HELP SYSTEM
+# ─────────────────────────────────────────────
+
+def build_help_root():
+    p = PREFIX
+    lines = [
+        help_header("selfbot", "selfbot.local"),
+        "",
+        f"{DIM}> categories{R}",
+        help_row("general", "utilities, platform & status"),
+        help_row("rpc", "rich presence, brands & platform"),
+        help_row("quests", "quest completer & orb badge"),
+        help_row("sniper", "nitro sniper & message logger"),
+        help_row("ar", "auto-responder"),
+        "",
+        f"{DIM}  use {WH}{p}help <category>{DIM} for commands{R}",
+    ]
+    return ansi("\n".join(lines))
+
+def build_help_general():
+    p = PREFIX
+    lines = [
+        help_header("general", "utilities, platform & status"),
+        help_section("utilities"),
+        help_row(f"{p}ping", "latency check"),
+        help_row(f"{p}info", "account snapshot"),
+        help_row(f"{p}say <text>", "replace command with text"),
+        help_row(f"{p}spam <n> <text>", "send n messages (max 20)"),
+        help_row(f"{p}purge <n>", "delete your last n messages"),
+        help_row(f"{p}clear", "delete command message"),
+        help_row(f"{p}copycat <user_id>", "mirror next 10 messages from user"),
+        help_section("status"),
+        help_row(f"{p}status <text>", "set custom status text"),
+        help_row(f"{p}status clear", "clear status"),
+        help_section("platform spoofer"),
+        help_row(f"{p}platform <type>", "spoof gateway platform indicator"),
+        help_row(f"{p}platform off", "reset to desktop"),
+        f"",
+        f"  {DIM}types:{R} {CY}phone{R} {DIM}│{R} {CY}android{R} {DIM}│{R} {CY}desktop{R} {DIM}│{R} {CY}web{R} {DIM}│{R} {CY}xbox{R} {DIM}│{R} {CY}playstation{R} {DIM}│{R} {CY}console{R} {DIM}│{R} {CY}vr{R}",
+        help_section("hypesquad"),
+        help_row(f"{p}hypesquad bravery", "set house bravery"),
+        help_row(f"{p}hypesquad brilliance", "set house brilliance"),
+        help_row(f"{p}hypesquad balance", "set house balance"),
+        help_row(f"{p}hypesquad off", "remove hypesquad badge"),
+    ]
+    return ansi("\n".join(lines))
+
+def build_help_rpc():
+    p = PREFIX
+    lines = [
+        help_header("rpc", "rich presence, platform & status"),
+        help_section("control"),
+        help_row(f"{p}rpc enable", "turn on rich presence"),
+        help_row(f"{p}rpc disable / stop", "clear rich presence"),
+        help_row(f"{p}rpc status", "show current config"),
+        help_section("fields"),
+        help_row(f"{p}rpc type", "playing/streaming/watching/listening/competing"),
+        help_row(f"{p}rpc name", "activity name"),
+        help_row(f"{p}rpc details", "details line"),
+        help_row(f"{p}rpc state", "state line"),
+        help_row(f"{p}rpc url", "streaming URL (twitch)"),
+        help_row(f"{p}rpc start / end", "timestamps (unix / MM:SS / none)"),
+        help_row(f"{p}rpc large_image / large_text", "large asset"),
+        help_row(f"{p}rpc small_image / small_text", "small asset"),
+        help_row(f"{p}rpc button1_name / button1_url", "button 1"),
+        help_row(f"{p}rpc button2_name / button2_url", "button 2"),
+        help_row(f"{p}rpc party enable/disable/current/max", "party config"),
+        help_section("brand presets"),
+        help_row(f"{p}rpc spotify <title> | <artist> | <secs>", "listening to spotify"),
+        help_row(f"{p}rpc youtube <video> | <channel> | <secs>", "watching youtube"),
+        help_row(f"{p}rpc xbox <game>", "playing on xbox"),
+        help_row(f"{p}rpc playstation <game>", "playing on playstation"),
+        help_row(f"{p}rpc crunchyroll <anime> | <episode>", "watching crunchyroll"),
+        help_row(f"{p}rpc custom <name> | <details> | <state>", "custom activity"),
+        help_row(f"{p}rpc clear", "alias for disable"),
+    ]
+    return ansi("\n".join(lines))
+
+def build_help_quests():
+    p = PREFIX
+    lines = [
+        help_header("quests", "quest completer & orb badge"),
+        help_section("commands"),
+        help_row(f"{p}quest", "list active quests with progress"),
+        help_row(f"{p}questrun <index>", "solve specific quest by index"),
+        help_row(f"{p}questall", "solve all active quests at once"),
+        help_row(f"{p}autoquest on/off", "auto-run quests on startup"),
+        help_row(f"{p}orbbadge", "claim orb badge reward"),
+    ]
+    return ansi("\n".join(lines))
+
+def build_help_sniper():
+    p = PREFIX
+    lines = [
+        help_header("sniper", "nitro sniper & message logger"),
+        help_section("sniper"),
+        help_row(f"{p}sniper on/off", "toggle nitro gift sniper"),
+        help_section("logger"),
+        help_row(f"{p}logger on/off", "toggle message logger"),
+        help_row(f"{p}readlog <n>", "read last n lines of log"),
+    ]
+    return ansi("\n".join(lines))
+
+def build_help_ar():
+    p = PREFIX
+    lines = [
+        help_header("ar", "auto-responder"),
+        help_section("commands"),
+        help_row(f"{p}ar add <trigger> | <response>", "add auto-response"),
+        help_row(f"{p}ar remove <trigger>", "remove auto-response"),
+        help_row(f"{p}ar list", "list all auto-responses"),
+    ]
+    return ansi("\n".join(lines))
+
+HELP_MAP = {
+    "":          build_help_root,
+    "general":   build_help_general,
+    "rpc":       build_help_rpc,
+    "quests":    build_help_quests,
+    "quest":     build_help_quests,
+    "sniper":    build_help_sniper,
+    "logger":    build_help_sniper,
+    "ar":        build_help_ar,
+}
 
 # ─────────────────────────────────────────────
 # EVENTS
@@ -812,55 +1147,84 @@ async def snipe_nitro(code, channel_id):
 
 @client.event
 async def on_ready():
-    print(f"[+] Logged in as {client.user} ({client.user.id})")
-    print(f"[+] Prefix: {PREFIX} | Servers: {len(client.guilds)}")
+    print(f"[+] {client.user} ({client.user.id})")
+    print(f"[+] prefix: {PREFIX} | servers: {len(client.guilds)}")
     await update_rpc()
     if AUTOQUEST_ENABLED:
         asyncio.create_task(run_autoquest_pass_now(TOKEN))
-        print("[+] AutoQuest: running pass now")
+        print("[+] autoquest: running pass")
 
 @client.event
 async def on_message(message):
     global SNIPER_ENABLED, LOGGER_ENABLED
 
-    # logger
     if LOGGER_ENABLED and message.guild:
         try:
             log_message("MSG",
                 f"{message.guild.name}/#{message.channel.name} | "
                 f"{message.author} ({message.author.id}): {message.content}")
-        except Exception:
-            pass
+        except Exception: pass
 
-    # sniper
     if SNIPER_ENABLED and message.author.id != client.user.id:
         for _, code in GIFT_PATTERN.findall(message.content):
             asyncio.create_task(snipe_nitro(code, message.channel.id))
 
-    # auto-responder
     if message.author.id != client.user.id:
-        content_lower = message.content.lower()
+        cl = message.content.lower()
         for trigger, response in AUTO_RESPONSES.items():
-            if trigger.lower() in content_lower:
-                try:
-                    await message.channel.send(response)
-                except Exception:
-                    pass
+            if trigger.lower() in cl:
+                try: await message.channel.send(response)
+                except Exception: pass
                 break
         return
 
     if not message.content.startswith(PREFIX):
         return
 
-    raw = message.content[len(PREFIX):]
-    args = raw.split()
+    args = message.content[len(PREFIX):].split()
     cmd = args[0].lower() if args else ""
 
-    # ─── CORE COMMANDS ───
+    # ── HELP ──
+    if cmd == "help":
+        sub = args[1].lower() if len(args) > 1 else ""
+        builder = HELP_MAP.get(sub)
+        if builder:
+            await message.edit(content=builder())
+        else:
+            await message.edit(content=ansi(
+                f"{RD}✗  unknown category: {sub}{R}\n"
+                f"{DIM}available: general, rpc, quests, sniper, ar{R}"
+            ))
+        return
 
+    # ── GENERAL ──
     if cmd == "ping":
-        latency = round(client.latency * 1000)
-        await message.edit(content=f"pong. `{latency}ms`")
+        await message.edit(content=ansi(f"{GR}◈ pong{R}  {WH}{round(client.latency * 1000)}ms{R}"))
+
+    elif cmd == "info":
+        u = client.user
+        created = u.created_at.strftime("%Y-%m-%d")
+        await message.edit(content=ansi(
+            f"{help_header('account')}\n"
+            f"{help_row('user', f'{u} ({u.id})')}\n"
+            f"{help_row('created', created)}\n"
+            f"{help_row('servers', str(len(client.guilds)))}\n"
+            f"{help_row('prefix', PREFIX)}\n"
+            f"{help_row('platform', _current_platform)}"
+        ))
+
+    elif cmd == "say":
+        await message.edit(content=" ".join(args[1:]))
+
+    elif cmd == "spam":
+        if len(args) < 3:
+            return await message.edit(content=ansi(f"{RD}✗  usage: {PREFIX}spam <n> <text>{R}"))
+        count = min(int(args[1]), 20)
+        text = " ".join(args[2:])
+        await message.delete()
+        for _ in range(count):
+            await message.channel.send(text)
+            await asyncio.sleep(1)
 
     elif cmd == "purge":
         limit = int(args[1]) if len(args) > 1 else 5
@@ -868,126 +1232,161 @@ async def on_message(message):
         await message.delete()
         async for msg in message.channel.history(limit=300):
             if msg.author.id == client.user.id:
-                try:
-                    await msg.delete()
-                    deleted += 1
-                except Exception:
-                    pass
+                try: await msg.delete()
+                except Exception: pass
+                deleted += 1
                 await asyncio.sleep(0.4)
-                if deleted >= limit:
-                    break
-
-    elif cmd == "say":
-        text = " ".join(args[1:])
-        await message.edit(content=text)
-
-    elif cmd == "spam":
-        if len(args) < 3:
-            return await message.edit(content="usage: `.spam <count> <text>`")
-        count = int(args[1])
-        text = " ".join(args[2:])
-        await message.delete()
-        for _ in range(min(count, 20)):
-            await message.channel.send(text)
-            await asyncio.sleep(1)
-
-    elif cmd == "status":
-        text = " ".join(args[1:])
-        await client.change_presence(activity=discord.CustomActivity(name=text))
-        await message.edit(content=f"status → `{text}`")
+                if deleted >= limit: break
 
     elif cmd == "clear":
         await message.delete()
 
-    elif cmd == "info":
-        u = client.user
-        created = u.created_at.strftime("%Y-%m-%d")
-        await message.edit(content=(
-            f"**{u}** `{u.id}`\n"
-            f"created: `{created}`\n"
-            f"servers: `{len(client.guilds)}`\n"
-            f"prefix: `{PREFIX}`"
-        ))
-
     elif cmd == "copycat":
         if len(args) < 2:
-            return await message.edit(content="usage: `.copycat <user_id>`")
-        try:
-            target_id = int(args[1])
+            return await message.edit(content=ansi(f"{RD}✗  usage: {PREFIX}copycat <user_id>{R}"))
+        try: target_id = int(args[1])
         except ValueError:
-            return await message.edit(content="invalid user id")
+            return await message.edit(content=ansi(f"{RD}✗  invalid user id{R}"))
         await message.delete()
-        def check(m):
-            return m.author.id == target_id and m.channel.id == message.channel.id
+        def check(m): return m.author.id == target_id and m.channel.id == message.channel.id
         for _ in range(10):
             try:
                 msg = await client.wait_for("message", check=check, timeout=60)
                 await message.channel.send(msg.content)
-            except asyncio.TimeoutError:
-                break
+            except asyncio.TimeoutError: break
 
+    elif cmd == "status":
+        if len(args) < 2 or args[1].lower() == "clear":
+            await client.change_presence(activity=None)
+            await message.edit(content=ansi(f"{GR}✓ status cleared{R}"))
+        else:
+            text = " ".join(args[1:])
+            await client.change_presence(activity=discord.CustomActivity(name=text))
+            await message.edit(content=ansi(f"{GR}✓ status{R}  {WH}{text}{R}"))
+
+    # ── PLATFORM ──
+    elif cmd == "platform":
+        if len(args) < 2:
+            return await message.edit(content=ansi(
+                f"{help_header('platform')}\n"
+                f"{DIM}current: {CY}{_current_platform}{R}\n"
+                f"{DIM}types: phone │ android │ desktop │ web │ xbox │ playstation │ console │ vr │ off{R}"
+            ))
+        plat = args[1].lower()
+        if plat == "off": plat = "desktop"
+        if plat not in PLATFORM_MAP:
+            return await message.edit(content=ansi(f"{RD}✗  unknown platform: {plat}{R}"))
+        await message.edit(content=ansi(f"{YE}⟳  switching to {plat}...{R}"))
+        ok = await set_platform(plat)
+        if ok:
+            await message.edit(content=ansi(f"{GR}✓ platform{R}  {WH}{plat}{R}\n{DIM}gateway will reconnect{R}"))
+        else:
+            await message.edit(content=ansi(f"{RD}✗  platform switch failed{R}"))
+
+    # ── HYPESQUAD ──
+    elif cmd == "hypesquad":
+        if len(args) < 2:
+            return await message.edit(content=ansi(
+                f"{help_header('hypesquad')}\n"
+                f"{help_row(f'{PREFIX}hypesquad bravery', 'set house bravery')}\n"
+                f"{help_row(f'{PREFIX}hypesquad brilliance', 'set house brilliance')}\n"
+                f"{help_row(f'{PREFIX}hypesquad balance', 'set house balance')}\n"
+                f"{help_row(f'{PREFIX}hypesquad off', 'remove hypesquad badge')}"
+            ))
+        sub = args[1].lower()
+        if sub == "off":
+            await message.edit(content=ansi(f"{YE}⟳  removing hypesquad badge...{R}"))
+            async with aiohttp.ClientSession() as session:
+                ok, msg = await remove_hypesquad(session, TOKEN)
+            if ok:
+                await message.edit(content=ansi(f"{GR}✓ hypesquad badge removed{R}"))
+            else:
+                await message.edit(content=ansi(f"{RD}✗  failed: {msg}{R}"))
+        elif sub in HOUSE_IDS:
+            house_id = HOUSE_IDS[sub]
+            house_name = HOUSE_NAMES[house_id]
+            await message.edit(content=ansi(f"{YE}⟳  setting house {house_name}...{R}"))
+            async with aiohttp.ClientSession() as session:
+                ok, msg = await change_hypesquad(session, TOKEN, house_id)
+            if ok:
+                await message.edit(content=ansi(f"{GR}✓ hypesquad{R}  {WH}House {house_name}{R}"))
+            else:
+                await message.edit(content=ansi(f"{RD}✗  failed: {msg}{R}"))
+        else:
+            await message.edit(content=ansi(
+                f"{RD}✗  unknown house: {sub}{R}\n"
+                f"{DIM}use: bravery / brilliance / balance / off{R}"
+            ))
+
+    # ── SNIPER / LOGGER ──
     elif cmd == "sniper":
         SNIPER_ENABLED = len(args) < 2 or args[1].lower() == "on"
-        await message.edit(content=f"sniper → **{'ON' if SNIPER_ENABLED else 'OFF'}**")
+        state = f"{GR}ON{R}" if SNIPER_ENABLED else f"{RD}OFF{R}"
+        await message.edit(content=ansi(f"{GR}✓ sniper{R}  {state}"))
 
     elif cmd == "logger":
         LOGGER_ENABLED = len(args) < 2 or args[1].lower() == "on"
-        await message.edit(content=f"logger → **{'ON' if LOGGER_ENABLED else 'OFF'}**")
+        state = f"{GR}ON{R}" if LOGGER_ENABLED else f"{RD}OFF{R}"
+        await message.edit(content=ansi(f"{GR}✓ logger{R}  {state}"))
 
     elif cmd == "readlog":
         n = int(args[1]) if len(args) > 1 else 10
         if not os.path.exists(LOG_FILE):
-            return await message.edit(content="no log file yet.")
+            return await message.edit(content=ansi(f"{RD}✗  no log file yet{R}"))
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
         tail = "".join(lines[-n:])
-        if len(tail) > 1900:
-            tail = tail[-1900:]
+        if len(tail) > 1900: tail = tail[-1900:]
         await message.edit(content=f"```\n{tail}\n```")
 
+    # ── AUTO-RESPONDER ──
     elif cmd == "ar":
         if len(args) < 2:
-            return await message.edit(content="`.ar add trigger | response` / `.ar remove trigger` / `.ar list`")
+            return await message.edit(content=ansi(
+                f"{RD}✗  usage:{R}\n"
+                f"{help_row(f'{PREFIX}ar add trigger | response', 'add')}\n"
+                f"{help_row(f'{PREFIX}ar remove trigger', 'remove')}\n"
+                f"{help_row(f'{PREFIX}ar list', 'list all')}"
+            ))
         sub = args[1].lower()
         rest = " ".join(args[2:])
         if sub == "add":
             if "|" not in rest:
-                return await message.edit(content="format: `.ar add trigger | response`")
+                return await message.edit(content=ansi(f"{RD}✗  format: {PREFIX}ar add trigger | response{R}"))
             trigger, response = rest.split("|", 1)
             AUTO_RESPONSES[trigger.strip()] = response.strip()
-            await message.edit(content=f"added: `{trigger.strip()}` → `{response.strip()}`")
+            await message.edit(content=ansi(f"{GR}✓ added{R}  {WH}{trigger.strip()}{R} {DIM}→{R} {WH}{response.strip()}{R}"))
         elif sub == "remove":
             key = rest.strip()
             AUTO_RESPONSES.pop(key, None)
-            await message.edit(content=f"removed: `{key}`")
+            await message.edit(content=ansi(f"{GR}✓ removed{R}  {WH}{key}{R}"))
         elif sub == "list":
             if not AUTO_RESPONSES:
-                return await message.edit(content="no auto-responses set.")
-            lines = "\n".join(f"`{k}` → `{v}`" for k, v in AUTO_RESPONSES.items())
-            await message.edit(content=f"**auto-responses:**\n{lines}")
+                return await message.edit(content=ansi(f"{DIM}no auto-responses set{R}"))
+            lines = [help_header("auto-responder")]
+            for k, v in AUTO_RESPONSES.items():
+                lines.append(help_row(k, v))
+            await message.edit(content=ansi("\n".join(lines)))
         else:
-            await message.edit(content="unknown subcommand. use `add`, `remove`, or `list`.")
+            await message.edit(content=ansi(f"{RD}✗  unknown subcommand: {sub}{R}"))
 
-    # ─── QUEST COMMANDS ───
-
+    # ── QUESTS ──
     elif cmd == "quest":
         await message.delete()
         service = QuestService(TOKEN)
-        await message.channel.send("fetching quests...")
+        m = await message.channel.send(ansi(f"{YE}⟳  fetching quests...{R}"))
         async with aiohttp.ClientSession() as session:
             quests = await service.fetch_quests(session)
         if not quests:
-            return await message.channel.send("no quests found.")
-        lines = []
+            return await m.edit(content=ansi(f"{DIM}no quests found{R}"))
+        lines = [help_header("quests")]
         for i, q in enumerate(quests):
             bar = make_progress_bar(q.progress_percent())
-            tag = "✅" if q.is_completed() else ("🟢" if q.is_supported() else "🔴")
-            lines.append(
-                f"{tag} **[{i}]** {q.name}\n"
-                f"{bar} | `{q.selected_task}`\n"
-                f"reward: **{q.reward_name}** | expires: {q.expires_relative()}"
-            )
-        await message.channel.send("**quests:**\n\n" + "\n\n".join(lines))
+            tag = f"{GR}✓ done{R}" if q.is_completed() else (f"{GR}supported{R}" if q.is_supported() else f"{RD}unsupported{R}")
+            lines.append(f"\n{DIM}[{i}]{R} {B}{WH}{q.name}{R}  {tag}")
+            lines.append(f"    {bar}")
+            lines.append(f"    {DIM}task:{R} {q.selected_task}  {DIM}reward:{R} {YE}{q.reward_name}{R}  {DIM}expires:{R} {q.expires_relative()}")
+        await m.edit(content=ansi("\n".join(lines)))
 
     elif cmd == "questrun":
         await message.delete()
@@ -996,26 +1395,24 @@ async def on_message(message):
         async with aiohttp.ClientSession() as session:
             quests = await service.fetch_quests(session)
             if not quests or idx >= len(quests):
-                return await message.channel.send("quest index out of range.")
+                return await message.channel.send(ansi(f"{RD}✗  quest index out of range{R}"))
             quest = quests[idx]
             if quest.is_completed():
-                return await message.channel.send(f"**{quest.name}** is already completed.")
-            status_msg = await message.channel.send(f"starting **{quest.name}**...")
+                return await message.channel.send(ansi(f"{GR}✓  {quest.name} already completed{R}"))
+            sm = await message.channel.send(ansi(f"{YE}⟳  starting {quest.name}...{R}"))
             async def on_update(payload):
                 bar = make_progress_bar(payload["percent"])
                 try:
-                    await status_msg.edit(content=(
-                        f"**{payload['quest_name']}**\n"
-                        f"{bar}\n"
-                        f"status: `{payload['status']}`"
+                    await sm.edit(content=ansi(
+                        f"{help_row(payload['quest_name'], payload['status'])}\n"
+                        f"    {bar}"
                     ))
-                except Exception:
-                    pass
+                except Exception: pass
             result = await service.run_quest(session, quest, on_update=on_update)
             if result and result.get("status") == "completed":
-                await status_msg.edit(content=f"✅ **{quest.name}** complete! reward: **{quest.reward_name}**")
+                await sm.edit(content=ansi(f"{GR}✓  {quest.name} complete!{R}  {YE}{quest.reward_name}{R}"))
             else:
-                await status_msg.edit(content=f"ended with status: `{result.get('status', 'unknown')}`")
+                await sm.edit(content=ansi(f"{DIM}ended: {result.get('status', 'unknown')}{R}"))
 
     elif cmd == "questall":
         await message.delete()
@@ -1024,27 +1421,20 @@ async def on_message(message):
             quests = await service.fetch_quests(session)
             active = [q for q in quests if not q.is_completed() and q.is_supported()]
             if not active:
-                return await message.channel.send("no active supported quests.")
+                return await message.channel.send(ansi(f"{DIM}no active supported quests{R}"))
             for q in active:
                 if not q.is_enrolled():
-                    try:
-                        await service.enroll(session, q)
-                    except Exception:
-                        pass
-            tracker = {q.id: {"name": q.name, "percent": q.progress_percent(), "status": "queued"}
-                       for q in active}
-            status_msg = await message.channel.send("starting questall...")
-
+                    try: await service.enroll(session, q)
+                    except Exception: pass
+            tracker = {q.id: {"name": q.name, "percent": q.progress_percent(), "status": "queued"} for q in active}
+            sm = await message.channel.send(ansi(f"{YE}⟳  starting questall...{R}"))
             async def update_msg():
-                lines = [
-                    f"**{info['name']}**: {make_progress_bar(info['percent'])} `{info['status'].upper()}`"
-                    for info in tracker.values()
-                ]
-                try:
-                    await status_msg.edit(content="\n".join(lines))
-                except Exception:
-                    pass
-
+                lines = [help_header("questall")]
+                for info in tracker.values():
+                    lines.append(f"\n{DIM}├{R} {B}{WH}{info['name']}{R}  {DIM}{info['status'].upper()}{R}")
+                    lines.append(f"    {make_progress_bar(info['percent'])}")
+                try: await sm.edit(content=ansi("\n".join(lines)))
+                except Exception: pass
             async def run_one(q):
                 async def on_update(payload):
                     tracker[q.id]["percent"] = payload["percent"]
@@ -1057,15 +1447,9 @@ async def on_message(message):
                     tracker[q.id]["percent"] = 100 if res and res.get("status") == "completed" else tracker[q.id]["percent"]
                     tracker[q.id]["status"] = res.get("status", "done") if res else "done"
                     await update_msg()
-                except Exception as e:
-                    tracker[q.id]["status"] = "error"
-                    await update_msg()
-
+                except Exception:
+                    tracker[q.id]["status"] = "error"; await update_msg()
             await asyncio.gather(*(run_one(q) for q in active))
-            await status_msg.edit(content="**questall finished.**\n" + "\n".join(
-                f"**{info['name']}**: {make_progress_bar(info['percent'])} `{info['status'].upper()}`"
-                for info in tracker.values()
-            ))
 
     elif cmd == "autoquest":
         cfg = load_config()
@@ -1075,204 +1459,157 @@ async def on_message(message):
             cfg["autoquest_enabled"] = args[1].lower() in ("on", "enable", "true")
         save_config(cfg)
         enabled = cfg["autoquest_enabled"]
-        if enabled:
-            asyncio.create_task(run_autoquest_pass_now(TOKEN))
-        await message.edit(content=f"autoquest → **{'enabled' if enabled else 'disabled'}**")
+        if enabled: asyncio.create_task(run_autoquest_pass_now(TOKEN))
+        state = f"{GR}enabled{R}" if enabled else f"{RD}disabled{R}"
+        await message.edit(content=ansi(f"{GR}✓ autoquest{R}  {state}"))
 
     elif cmd == "orbbadge":
-        await message.edit(content="claiming orb badge...")
+        await message.edit(content=ansi(f"{YE}⟳  claiming orb badge...{R}"))
         async with aiohttp.ClientSession() as session:
             result = await _claim_orb_badge(session, TOKEN)
         if result["status"] == "SUCCESS":
-            extra = f"\nbalance before: `{result['balance']}` orbs." if isinstance(result.get("balance"), int) else ""
-            await message.edit(content=f"✅ orb badge claimed!{extra}")
-        else:
-            await message.edit(content=f"❌ failed: {result.get('message')} (code: `{result.get('code')}`)")
+            extra = f"  {DIM}balance before: {result['balance']} orbs{R}" if isinstance(result.get("balance"), int) else ""
+        await message.edit(content=ansi(
+            f"{GR}✓ orb badge claimed!{R}{extra}" if result["status"] == "SUCCESS"
+            else f"{RD}✗  failed: {result.get('message')} (code: {result.get('code')}){R}"
+        ))
 
-    # ─── RPC COMMANDS ───
-
+    # ── RPC ──
     elif cmd == "rpc":
         sub = args[1].lower() if len(args) > 1 else ""
 
+        # brand presets
+        if sub in BRAND_PRESETS:
+            brand_args = args[2:]
+            ok = await apply_brand_rpc(sub, brand_args)
+            preset = BRAND_PRESETS[sub]
+            if ok:
+                await message.edit(content=ansi(
+                    f"{GR}✓ rpc{R}  {WH}{preset.get('type', 'playing')} {preset.get('name', sub)}{R}"
+                ))
+            else:
+                await message.edit(content=ansi(f"{RD}✗  rpc preset failed{R}"))
+            return
+
         if not sub or sub == "help":
-            await message.edit(content=(
-                "**rpc commands**\n"
-                f"`{PREFIX}rpc enable` / `disable` — toggle\n"
-                f"`{PREFIX}rpc status` — current config\n"
-                f"`{PREFIX}rpc type` — playing/streaming/watching/listening/competing\n"
-                f"`{PREFIX}rpc name` / `details` / `state` / `url`\n"
-                f"`{PREFIX}rpc start` / `end` — timestamps (unix / MM:SS / none)\n"
-                f"`{PREFIX}rpc large_image` / `large_text` / `small_image` / `small_text`\n"
-                f"`{PREFIX}rpc button1_name` / `button1_url` / `button2_name` / `button2_url`\n"
-                f"`{PREFIX}rpc party enable` / `disable` / `current` / `max`"
-            ))
+            await message.edit(content=build_help_rpc())
+
+        elif sub in ("disable", "stop", "clear", "off"):
+            cfg = load_rpc_config()
+            cfg["enabled"] = False
+            save_rpc_config(cfg)
+            await client.change_presence(activity=None)
+            await message.edit(content=ansi(f"{RD}✗ rpc disabled{R}"))
 
         elif sub == "enable":
             cfg = load_rpc_config()
             cfg["enabled"] = True
             save_rpc_config(cfg)
             await update_rpc()
-            await message.edit(content="✅ RPC enabled")
-
-        elif sub == "disable":
-            cfg = load_rpc_config()
-            cfg["enabled"] = False
-            save_rpc_config(cfg)
-            await update_rpc()
-            await message.edit(content="❌ RPC disabled")
+            await message.edit(content=ansi(f"{GR}✓ rpc enabled{R}"))
 
         elif sub == "status":
             cfg = load_rpc_config()
-            state = "✅ enabled" if cfg.get("enabled") else "❌ disabled"
-            await message.edit(content=(
-                f"**RPC:** {state}\n"
-                f"type: `{cfg.get('type')}` | name: `{cfg.get('name')}`\n"
-                f"details: `{cfg.get('details') or 'none'}` | state: `{cfg.get('state') or 'none'}`\n"
-                f"large_image: `{cfg.get('large_image') or 'none'}`\n"
-                f"party: `{'on' if cfg.get('party', {}).get('enabled') else 'off'}`"
+            state = f"{GR}enabled{R}" if cfg.get("enabled") else f"{RD}disabled{R}"
+            await message.edit(content=ansi(
+                f"{help_header('rpc status')}\n"
+                f"{help_row('state', '')}{state}\n"
+                f"{help_row('type', cfg.get('type', 'playing'))}\n"
+                f"{help_row('name', cfg.get('name') or 'none')}\n"
+                f"{help_row('details', cfg.get('details') or 'none')}\n"
+                f"{help_row('state_field', cfg.get('state') or 'none')}\n"
+                f"{help_row('large_image', cfg.get('large_image') or 'none')}\n"
+                f"{help_row('party', 'on' if cfg.get('party', {}).get('enabled') else 'off')}"
             ))
 
         elif sub == "type":
             await message.delete()
             valid = ["playing", "streaming", "listening", "watching", "competing"]
-            val = await rpc_prompt(message.channel, message.author, f"Enter type ({'/'.join(valid)}):")
-            if val == "__TIMEOUT__":
-                return
+            val = await rpc_prompt(message.channel, message.author, f"type  ({'/'.join(valid)})")
+            if val == "__TIMEOUT__": return
             if val not in valid:
-                return await message.channel.send(f"❌ invalid type: `{val}`", delete_after=5)
-            cfg = load_rpc_config()
-            cfg["type"] = val
-            save_rpc_config(cfg)
+                return await message.channel.send(ansi(f"{RD}✗  invalid: {val}{R}"), delete_after=5)
+            cfg = load_rpc_config(); cfg["type"] = val; save_rpc_config(cfg)
             await update_rpc()
-            await message.channel.send(f"✅ type → `{val}`", delete_after=5)
+            await message.channel.send(ansi(f"{GR}✓ type{R}  {WH}{val}{R}"), delete_after=5)
 
         elif sub in ("name", "details", "state", "large_image", "large_text",
                      "small_image", "small_text", "url"):
             await message.delete()
-            prompts = {
-                "name": "Enter RPC name:",
-                "details": "Enter details (line 2):",
-                "state": "Enter state (line 3):",
-                "large_image": "Enter large image key/URL:",
-                "large_text": "Enter large image hover text:",
-                "small_image": "Enter small image key/URL:",
-                "small_text": "Enter small image hover text:",
-                "url": "Enter streaming URL (twitch):",
-            }
-            val = await rpc_prompt(message.channel, message.author, prompts[sub])
-            if val == "__TIMEOUT__":
-                return
-            cfg = load_rpc_config()
-            cfg[sub] = val
-            save_rpc_config(cfg)
+            val = await rpc_prompt(message.channel, message.author, sub)
+            if val == "__TIMEOUT__": return
+            cfg = load_rpc_config(); cfg[sub] = val; save_rpc_config(cfg)
             await update_rpc()
-            await message.channel.send(f"✅ {sub} → `{val or 'cleared'}`", delete_after=5)
+            await message.channel.send(ansi(f"{GR}✓ {sub}{R}  {WH}{val or 'cleared'}{R}"), delete_after=5)
 
         elif sub in ("start", "end"):
             await message.delete()
             key = "start_timestamp" if sub == "start" else "end_timestamp"
-            val = await rpc_prompt(message.channel, message.author,
-                f"Enter {sub} timestamp (unix / MM:SS / none to clear):")
-            if val == "__TIMEOUT__":
-                return
+            val = await rpc_prompt(message.channel, message.author, f"{sub} timestamp  (unix / MM:SS / none)")
+            if val == "__TIMEOUT__": return
             cfg = load_rpc_config()
             cfg[key] = None if (val is None or (val and val.lower() == "none")) else val
-            save_rpc_config(cfg)
-            await update_rpc()
-            await message.channel.send(f"✅ {sub} timestamp set", delete_after=5)
+            save_rpc_config(cfg); await update_rpc()
+            await message.channel.send(ansi(f"{GR}✓ {sub} timestamp set{R}"), delete_after=5)
 
-        elif sub in ("button1_name", "button1_url", "button2_name", "button2_url"):
+        elif sub in ("button1_name","button1_url","button2_name","button2_url"):
             await message.delete()
             idx = 0 if sub.startswith("button1") else 1
             field = "label" if sub.endswith("name") else "url"
-            label = f"Button {idx + 1} {'label' if field == 'label' else 'URL'}"
-            val = await rpc_prompt(message.channel, message.author, f"Enter {label}:")
-            if val == "__TIMEOUT__":
-                return
-            cfg = load_rpc_config()
-            cfg["buttons"][idx][field] = val or ""
-            save_rpc_config(cfg)
+            val = await rpc_prompt(message.channel, message.author, f"button {idx+1} {field}")
+            if val == "__TIMEOUT__": return
+            cfg = load_rpc_config(); cfg["buttons"][idx][field] = val or ""; save_rpc_config(cfg)
             await update_rpc()
-            await message.channel.send(f"✅ {label} set", delete_after=5)
+            await message.channel.send(ansi(f"{GR}✓ button {idx+1} {field} set{R}"), delete_after=5)
 
         elif sub == "party":
             option = args[2].lower() if len(args) > 2 else ""
             cfg = load_rpc_config()
             if option == "enable":
-                cfg["party"]["enabled"] = True
-                save_rpc_config(cfg)
-                await update_rpc()
-                await message.edit(content="✅ party enabled")
+                cfg["party"]["enabled"] = True; save_rpc_config(cfg); await update_rpc()
+                await message.edit(content=ansi(f"{GR}✓ party enabled{R}"))
             elif option == "disable":
-                cfg["party"]["enabled"] = False
-                save_rpc_config(cfg)
-                await update_rpc()
-                await message.edit(content="❌ party disabled")
+                cfg["party"]["enabled"] = False; save_rpc_config(cfg); await update_rpc()
+                await message.edit(content=ansi(f"{RD}✗ party disabled{R}"))
             elif option in ("current", "max"):
                 await message.delete()
-                val = await rpc_prompt(message.channel, message.author,
-                    f"Enter party {option} (integer):")
-                if val == "__TIMEOUT__":
-                    return
+                val = await rpc_prompt(message.channel, message.author, f"party {option}  (integer)")
+                if val == "__TIMEOUT__": return
                 try:
-                    cfg["party"][option] = int(val)
-                    save_rpc_config(cfg)
-                    await update_rpc()
-                    await message.channel.send(f"✅ party {option} → `{int(val)}`", delete_after=5)
+                    cfg["party"][option] = int(val); save_rpc_config(cfg); await update_rpc()
+                    await message.channel.send(ansi(f"{GR}✓ party {option}{R}  {WH}{int(val)}{R}"), delete_after=5)
                 except (ValueError, TypeError):
-                    await message.channel.send("❌ must be an integer", delete_after=5)
+                    await message.channel.send(ansi(f"{RD}✗  must be integer{R}"), delete_after=5)
             else:
-                await message.edit(content="usage: `.rpc party enable/disable/current/max`")
-
+                await message.edit(content=ansi(f"{RD}✗  usage: {PREFIX}rpc party enable/disable/current/max{R}"))
         else:
-            await message.edit(content=f"unknown rpc subcommand: `{sub}` — use `.rpc help`")
-
-    elif cmd == "help":
-        await message.edit(content=(
-            f"**── selfbot `{PREFIX}` ──**\n"
-            f"`ping` `purge <n>` `say <text>` `spam <n> <text>`\n"
-            f"`status <text>` `clear` `info` `copycat <id>`\n"
-            f"`sniper on/off` `logger on/off` `readlog <n>`\n"
-            f"`ar add/remove/list`\n"
-            f"**── quests ──**\n"
-            f"`quest` `questrun <i>` `questall`\n"
-            f"`autoquest on/off` `orbbadge`\n"
-            f"**── rpc ──**\n"
-            f"`rpc help`"
-        ))
+            await message.edit(content=ansi(f"{RD}✗  unknown subcommand: {sub}  —  use {PREFIX}rpc help{R}"))
 
 @client.event
 async def on_message_delete(message):
-    if not LOGGER_ENABLED or message.author.id == client.user.id:
-        return
+    if not LOGGER_ENABLED or message.author.id == client.user.id: return
     try:
-        log_message("DELETE",
-            f"{message.author} in #{getattr(message.channel, 'name', 'DM')}: {message.content}")
-    except Exception:
-        pass
+        log_message("DELETE", f"{message.author} in #{getattr(message.channel, 'name', 'DM')}: {message.content}")
+    except Exception: pass
 
 @client.event
 async def on_message_edit(before, after):
-    if not LOGGER_ENABLED or before.author.id == client.user.id:
-        return
-    if before.content == after.content:
-        return
+    if not LOGGER_ENABLED or before.author.id == client.user.id: return
+    if before.content == after.content: return
     try:
         log_message("EDIT", f"{before.author}: '{before.content}' → '{after.content}'")
-    except Exception:
-        pass
+    except Exception: pass
 
 # ─────────────────────────────────────────────
 # RUN
 # ─────────────────────────────────────────────
 
-print(f"[selfbot] starting with prefix '{PREFIX}'")
+print(f"[selfbot] starting — prefix '{PREFIX}'")
 try:
-    client.run(TOKEN)
+    client.run(TOKEN, bot=False)
 except discord.LoginFailure as e:
-    print(f"[FATAL] Login failed: {e}")
-    print("[FATAL] Check your token. Make sure TOKEN env var or config.json is correct.")
-    raise SystemExit(1)
+    print(f"[FATAL] login failed: {e}")
+    sys.exit(1)
 except Exception as e:
-    print(f"[FATAL] Unexpected error: {e}")
+    print(f"[FATAL] {e}")
     raise
