@@ -270,10 +270,12 @@ BRAND_PRESETS = {
         "type": "listening",
         "name": "Spotify",
         "application_id": "367827983903490050",
-        "large_image": "spotify:ab67616d00001e02ff9ca10b55ce82ae553d50e",
+        # spotify uses its own asset system — large_image is the album art
+        # mp:external/ prefix routes external URLs through Discord's CDN proxy
+        "large_image": "mp:external/t2/https/i.scdn.co/image/ab67616d00001e02ff9ca10b55ce82ae553d50e",
         "large_text": "Spotify",
-        "small_image": "spotify:ab6761610000f178049d8eda6f0fd7a34bb0db9",
-        "small_text": "Listening",
+        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/1/19/Spotify_logo_without_text.svg/168px-Spotify_logo_without_text.svg.png",
+        "small_text": "Spotify",
         "_args": ["title", "artist", "duration"],
         "_usage": ".rpc spotify <title> | <artist> | <duration_secs>",
     },
@@ -281,8 +283,10 @@ BRAND_PRESETS = {
         "type": "watching",
         "name": "YouTube",
         "application_id": "880218394199220334",
-        "large_image": "youtube",
+        "large_image": "mp:external/t2/https/www.gstatic.com/youtube/img/promos/growth/youtubepr_v2_480x480.png",
         "large_text": "YouTube",
+        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/0/09/YouTube_full-color_icon_%282017%29.svg/159px-YouTube_full-color_icon_%282017%29.svg.png",
+        "small_text": "YouTube",
         "_args": ["video", "channel", "duration"],
         "_usage": ".rpc youtube <video title> | <channel> | <duration_secs>",
     },
@@ -290,21 +294,21 @@ BRAND_PRESETS = {
         "type": "playing",
         "name": "Xbox",
         "application_id": "438122941302046720",
-        "large_image": "xbox",
+        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Xbox_one_logo.svg/600px-Xbox_one_logo.svg.png",
         "large_text": "Xbox",
-        "small_image": "controller",
-        "small_text": "Playing",
+        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Xbox_one_logo.svg/600px-Xbox_one_logo.svg.png",
+        "small_text": "Playing on Xbox",
         "_args": ["game"],
         "_usage": ".rpc xbox <game name>",
     },
     "playstation": {
         "type": "playing",
         "name": "PlayStation",
-        "application_id": "473226677884kwarg",
-        "large_image": "playstation",
+        "application_id": "0",
+        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Playstation_logo_colour.svg/2560px-Playstation_logo_colour.svg.png",
         "large_text": "PlayStation",
-        "small_image": "controller",
-        "small_text": "Playing",
+        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Playstation_logo_colour.svg/2560px-Playstation_logo_colour.svg.png",
+        "small_text": "Playing on PlayStation",
         "_args": ["game"],
         "_usage": ".rpc playstation <game name>",
     },
@@ -312,10 +316,23 @@ BRAND_PRESETS = {
         "type": "watching",
         "name": "Crunchyroll",
         "application_id": "1020123345567822899",
-        "large_image": "crunchyroll",
+        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/b/b8/Crunchyroll_logo.svg/2560px-Crunchyroll_logo.svg.png",
         "large_text": "Crunchyroll",
+        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/b/b8/Crunchyroll_logo.svg/2560px-Crunchyroll_logo.svg.png",
+        "small_text": "Crunchyroll",
         "_args": ["anime", "episode"],
         "_usage": ".rpc crunchyroll <anime name> | <episode>",
+    },
+    "roblox": {
+        "type": "playing",
+        "name": "Roblox",
+        "application_id": "363445589247131668",
+        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Roblox_player_icon_black.svg/2048px-Roblox_player_icon_black.svg.png",
+        "large_text": "Roblox",
+        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Roblox_player_icon_black.svg/2048px-Roblox_player_icon_black.svg.png",
+        "small_text": "Playing Roblox",
+        "_args": ["game"],
+        "_usage": ".rpc roblox <game name>",
     },
     "custom": {
         "type": "playing",
@@ -349,9 +366,10 @@ async def apply_brand_rpc(brand: str, user_args: list):
 
     kwargs = {"type": act_type, "name": preset.get("name", brand.capitalize())}
 
-    if preset.get("application_id"):
+    app_id_str = str(preset.get("application_id", "") or "")
+    if app_id_str and app_id_str not in ("0", ""):
         try:
-            kwargs["application_id"] = int(preset["application_id"])
+            kwargs["application_id"] = int(app_id_str)
         except (ValueError, TypeError):
             pass
 
@@ -365,78 +383,81 @@ async def apply_brand_rpc(brand: str, user_args: list):
     if preset.get("small_text"):
         assets_kwargs["small_text"] = preset["small_text"]
 
+    def _ts(start=None, end=None):
+        try:
+            kw = {}
+            if start: kw["start"] = start
+            if end:   kw["end"]   = end
+            return ActivityTimestamps(**kw)
+        except Exception:
+            return None
+
     # map user_args to fields based on brand
-    if brand == "spotify" and user_args:
-        parts = " ".join(user_args).split("|")
+    if brand == "spotify":
+        parts = " ".join(user_args).split("|") if user_args else []
         title  = parts[0].strip() if len(parts) > 0 else "Unknown"
         artist = parts[1].strip() if len(parts) > 1 else "Unknown"
-        dur    = int(parts[2].strip()) if len(parts) > 2 else 210
-        kwargs["details"] = title
-        kwargs["state"]   = f"by {artist}"
-        kwargs["name"]    = "Spotify"
         try:
-            kwargs["timestamps"] = ActivityTimestamps(
-                start=now, end=now + timedelta(seconds=dur)
-            )
-        except Exception:
-            pass
+            dur = int(parts[2].strip()) if len(parts) > 2 else 210
+        except (ValueError, IndexError):
+            dur = 210
+        # details = song title, state = artist — no third line shown
+        kwargs["details"] = title
+        kwargs["state"]   = artist
+        # name stays "Spotify" — it shows as "Listening to Spotify" header
+        ts = _ts(start=now, end=now + timedelta(seconds=dur))
+        if ts: kwargs["timestamps"] = ts
 
-    elif brand == "youtube" and user_args:
-        parts = " ".join(user_args).split("|")
+    elif brand == "youtube":
+        parts = " ".join(user_args).split("|") if user_args else []
         video   = parts[0].strip() if len(parts) > 0 else "Video"
         channel = parts[1].strip() if len(parts) > 1 else "Channel"
-        dur     = int(parts[2].strip()) if len(parts) > 2 else 600
+        try:
+            dur = int(parts[2].strip()) if len(parts) > 2 else 600
+        except (ValueError, IndexError):
+            dur = 600
         kwargs["details"] = video
         kwargs["state"]   = channel
         assets_kwargs["large_text"] = channel
-        try:
-            kwargs["timestamps"] = ActivityTimestamps(
-                start=now, end=now + timedelta(seconds=dur)
-            )
-        except Exception:
-            pass
+        ts = _ts(start=now, end=now + timedelta(seconds=dur))
+        if ts: kwargs["timestamps"] = ts
 
-    elif brand in ("xbox", "playstation") and user_args:
-        game = " ".join(user_args).split("|")[0].strip()
+    elif brand in ("xbox", "playstation"):
+        game = " ".join(user_args).split("|")[0].strip() if user_args else "Game"
         kwargs["details"] = game
         assets_kwargs["large_text"] = game
-        try:
-            kwargs["timestamps"] = ActivityTimestamps(start=now)
-        except Exception:
-            pass
+        ts = _ts(start=now)
+        if ts: kwargs["timestamps"] = ts
 
-    elif brand == "crunchyroll" and user_args:
-        parts = " ".join(user_args).split("|")
+    elif brand == "crunchyroll":
+        parts = " ".join(user_args).split("|") if user_args else []
         anime   = parts[0].strip() if len(parts) > 0 else "Anime"
-        episode = parts[1].strip() if len(parts) > 1 else "Anime"
+        episode = parts[1].strip() if len(parts) > 1 else ""
         kwargs["details"] = anime
-        kwargs["state"]   = episode
+        if episode: kwargs["state"] = episode
         assets_kwargs["large_text"] = anime
-        dur = 1440
-        try:
-            kwargs["timestamps"] = ActivityTimestamps(
-                start=now, end=now + timedelta(seconds=dur)
-            )
-        except Exception:
-            pass
+        ts = _ts(start=now, end=now + timedelta(seconds=1440))
+        if ts: kwargs["timestamps"] = ts
 
-    elif brand == "custom" and user_args:
-        parts = " ".join(user_args).split("|")
+    elif brand == "roblox":
+        game = " ".join(user_args).split("|")[0].strip() if user_args else "Roblox"
+        kwargs["details"] = game
+        kwargs["state"]   = "Playing on Roblox"
+        assets_kwargs["large_text"] = game
+        ts = _ts(start=now)
+        if ts: kwargs["timestamps"] = ts
+
+    elif brand == "custom":
+        parts = " ".join(user_args).split("|") if user_args else []
         kwargs["name"]    = parts[0].strip() if len(parts) > 0 else "Custom"
-        if len(parts) > 1:
-            kwargs["details"] = parts[1].strip()
-        if len(parts) > 2:
-            kwargs["state"] = parts[2].strip()
-        try:
-            kwargs["timestamps"] = ActivityTimestamps(start=now)
-        except Exception:
-            pass
+        if len(parts) > 1 and parts[1].strip(): kwargs["details"] = parts[1].strip()
+        if len(parts) > 2 and parts[2].strip(): kwargs["state"]   = parts[2].strip()
+        ts = _ts(start=now)
+        if ts: kwargs["timestamps"] = ts
 
     else:
-        try:
-            kwargs["timestamps"] = ActivityTimestamps(start=now)
-        except Exception:
-            pass
+        ts = _ts(start=now)
+        if ts: kwargs["timestamps"] = ts
 
     if assets_kwargs:
         try:
@@ -1023,7 +1044,7 @@ async def snipe_nitro(code, channel_id):
 def build_help_root():
     p = PREFIX
     return (
-        f"> **selfbot**\n"
+        f"> **sy's selfbot**\n"
         f"```\n"
         f"────────────────────────────────────\n"
         f"  categories\n"
@@ -1097,6 +1118,7 @@ def build_help_rpc():
         f"  {p}rpc xbox <game>\n"
         f"  {p}rpc playstation <game>\n"
         f"  {p}rpc crunchyroll <anime> | <episode>\n"
+        f"  {p}rpc roblox <game>\n"
         f"  {p}rpc custom <name> | <details> | <state>\n"
         f"  {p}rpc clear               alias for disable\n"
         f"```"
@@ -1626,7 +1648,7 @@ async def on_message_edit(before, after):
 
 print(f"[selfbot] starting — prefix '{PREFIX}'")
 try:
-    client.run(TOKEN)
+    client.run(TOKEN, bot=False)
 except discord.LoginFailure as e:
     print(f"[FATAL] login failed: {e}")
     sys.exit(1)
