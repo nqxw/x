@@ -61,37 +61,38 @@ SNIPER_ENABLED = True
 LOGGER_ENABLED = True
 
 # ─────────────────────────────────────────────
-# ANSI HELPERS
+# UI HELPERS — discord markdown (mobile + desktop safe)
 # ─────────────────────────────────────────────
-# Discord ANSI in code blocks:  ```ansi\n...\n```
-# \u001b[{code}m
 
-R  = "\u001b[0m"        # reset
-B  = "\u001b[1m"        # bold
-DIM= "\u001b[2m"        # dim/gray
-CY = "\u001b[36m"       # cyan
-GR = "\u001b[32m"       # green
-YE = "\u001b[33m"       # yellow
-RD = "\u001b[31m"       # red
-BL = "\u001b[34m"       # blue
-MG = "\u001b[35m"       # magenta
-WH = "\u001b[37m"       # white
+# Discord markdown tokens used in responses
+R  = ""; B  = "**"; DIM= ""
+CY = ""; GR = ""; YE = ""
+RD = ""; BL = ""; MG = ""; WH = ""
 
-def ansi(text): return f"```ansi\n{text}\n```"
+def ansi(text):
+    """For command responses — just return text stripped of any escape codes."""
+    import re as _re
+    clean = _re.sub(r'\x1b\[[0-9;]*m', '', text)
+    # strip leftover empty bold markers
+    clean = clean.replace("****", "")
+    return clean.strip()
+
+def _box(lines):
+    return "```\n" + "\n".join(lines) + "\n```"
 
 def help_header(title, subtitle=""):
-    line = f"{DIM}{'─'*42}{R}"
-    h = f"{B}{CY}> {title.lower()}{R}"
+    bar = "─" * 36
+    t = f"> {title.lower()}"
     if subtitle:
-        h += f"  {DIM}{subtitle}{R}"
-    return f"{line}\n{h}\n{line}"
+        t += f"  {subtitle}"
+    return f"{bar}\n{t}\n{bar}"
 
 def help_row(cmd, desc, indent=0):
     pad = "  " * indent
-    return f"{pad}{DIM}├{R} {B}{WH}{cmd}{R}  {DIM}{desc}{R}"
+    return f"{pad}├ {cmd}  —  {desc}"
 
 def help_section(name):
-    return f"\n{YE}{B}  {name}{R}"
+    return f"\n  [{name}]"
 
 # ─────────────────────────────────────────────
 # PLATFORM SPOOFER
@@ -1021,114 +1022,123 @@ async def snipe_nitro(code, channel_id):
 
 def build_help_root():
     p = PREFIX
-    lines = [
-        help_header("selfbot", "selfbot.local"),
-        "",
-        f"{DIM}> categories{R}",
-        help_row("general", "utilities, platform & status"),
-        help_row("rpc", "rich presence, brands & platform"),
-        help_row("quests", "quest completer & orb badge"),
-        help_row("sniper", "nitro sniper & message logger"),
-        help_row("ar", "auto-responder"),
-        "",
-        f"{DIM}  use {WH}{p}help <category>{DIM} for commands{R}",
-    ]
-    return ansi("\n".join(lines))
+    return (
+        f"> **selfbot**\n"
+        f"```\n"
+        f"────────────────────────────────────\n"
+        f"  categories\n"
+        f"────────────────────────────────────\n"
+        f"  general      utilities, platform & status\n"
+        f"  rpc          rich presence & brands\n"
+        f"  quests       quest completer & orb badge\n"
+        f"  sniper       nitro sniper & logger\n"
+        f"  ar           auto-responder\n"
+        f"────────────────────────────────────\n"
+        f"  {p}help <category> for commands\n"
+        f"```"
+    )
 
 def build_help_general():
     p = PREFIX
-    lines = [
-        help_header("general", "utilities, platform & status"),
-        help_section("utilities"),
-        help_row(f"{p}ping", "latency check"),
-        help_row(f"{p}info", "account snapshot"),
-        help_row(f"{p}say <text>", "replace command with text"),
-        help_row(f"{p}spam <n> <text>", "send n messages (max 20)"),
-        help_row(f"{p}purge <n>", "delete your last n messages"),
-        help_row(f"{p}clear", "delete command message"),
-        help_row(f"{p}copycat <user_id>", "mirror next 10 messages from user"),
-        help_section("status"),
-        help_row(f"{p}status <text>", "set custom status text"),
-        help_row(f"{p}status clear", "clear status"),
-        help_section("platform spoofer"),
-        help_row(f"{p}platform <type>", "spoof gateway platform indicator"),
-        help_row(f"{p}platform off", "reset to desktop"),
-        f"",
-        f"  {DIM}types:{R} {CY}phone{R} {DIM}│{R} {CY}android{R} {DIM}│{R} {CY}desktop{R} {DIM}│{R} {CY}web{R} {DIM}│{R} {CY}xbox{R} {DIM}│{R} {CY}playstation{R} {DIM}│{R} {CY}console{R} {DIM}│{R} {CY}vr{R}",
-        help_section("hypesquad"),
-        help_row(f"{p}hypesquad bravery", "set house bravery"),
-        help_row(f"{p}hypesquad brilliance", "set house brilliance"),
-        help_row(f"{p}hypesquad balance", "set house balance"),
-        help_row(f"{p}hypesquad off", "remove hypesquad badge"),
-    ]
-    return ansi("\n".join(lines))
+    return (
+        f"> **general**  utilities, platform & status\n"
+        f"```\n"
+        f"  [utilities]\n"
+        f"  {p}ping                    latency check\n"
+        f"  {p}info                    account snapshot\n"
+        f"  {p}say <text>              replace command with text\n"
+        f"  {p}spam <n> <text>         send n messages (max 20)\n"
+        f"  {p}purge <n>               delete your last n messages\n"
+        f"  {p}clear                   delete command message\n"
+        f"  {p}copycat <user_id>       mirror next 10 messages\n"
+        f"\n"
+        f"  [status]\n"
+        f"  {p}status <text>           set custom status\n"
+        f"  {p}status clear            clear status\n"
+        f"\n"
+        f"  [platform spoofer]\n"
+        f"  {p}platform <type>         spoof gateway platform\n"
+        f"  {p}platform off            reset to desktop\n"
+        f"  types: phone android desktop web xbox playstation console vr\n"
+        f"\n"
+        f"  [hypesquad]\n"
+        f"  {p}hypesquad bravery       set house bravery\n"
+        f"  {p}hypesquad brilliance    set house brilliance\n"
+        f"  {p}hypesquad balance       set house balance\n"
+        f"  {p}hypesquad off           remove hypesquad badge\n"
+        f"```"
+    )
 
 def build_help_rpc():
     p = PREFIX
-    lines = [
-        help_header("rpc", "rich presence, platform & status"),
-        help_section("control"),
-        help_row(f"{p}rpc enable", "turn on rich presence"),
-        help_row(f"{p}rpc disable / stop", "clear rich presence"),
-        help_row(f"{p}rpc status", "show current config"),
-        help_section("fields"),
-        help_row(f"{p}rpc type", "playing/streaming/watching/listening/competing"),
-        help_row(f"{p}rpc name", "activity name"),
-        help_row(f"{p}rpc details", "details line"),
-        help_row(f"{p}rpc state", "state line"),
-        help_row(f"{p}rpc url", "streaming URL (twitch)"),
-        help_row(f"{p}rpc start / end", "timestamps (unix / MM:SS / none)"),
-        help_row(f"{p}rpc large_image / large_text", "large asset"),
-        help_row(f"{p}rpc small_image / small_text", "small asset"),
-        help_row(f"{p}rpc button1_name / button1_url", "button 1"),
-        help_row(f"{p}rpc button2_name / button2_url", "button 2"),
-        help_row(f"{p}rpc party enable/disable/current/max", "party config"),
-        help_section("brand presets"),
-        help_row(f"{p}rpc spotify <title> | <artist> | <secs>", "listening to spotify"),
-        help_row(f"{p}rpc youtube <video> | <channel> | <secs>", "watching youtube"),
-        help_row(f"{p}rpc xbox <game>", "playing on xbox"),
-        help_row(f"{p}rpc playstation <game>", "playing on playstation"),
-        help_row(f"{p}rpc crunchyroll <anime> | <episode>", "watching crunchyroll"),
-        help_row(f"{p}rpc custom <name> | <details> | <state>", "custom activity"),
-        help_row(f"{p}rpc clear", "alias for disable"),
-    ]
-    return ansi("\n".join(lines))
+    return (
+        f"> **rpc**  rich presence, platform & status\n"
+        f"```\n"
+        f"  [control]\n"
+        f"  {p}rpc enable              turn on rich presence\n"
+        f"  {p}rpc disable             clear rich presence\n"
+        f"  {p}rpc status              show current config\n"
+        f"\n"
+        f"  [fields]\n"
+        f"  {p}rpc type                playing/streaming/watching/listening/competing\n"
+        f"  {p}rpc name                activity name\n"
+        f"  {p}rpc details             details line\n"
+        f"  {p}rpc state               state line\n"
+        f"  {p}rpc url                 streaming url (twitch)\n"
+        f"  {p}rpc start / end         timestamps (unix / MM:SS / none)\n"
+        f"  {p}rpc large_image/text    large asset\n"
+        f"  {p}rpc small_image/text    small asset\n"
+        f"  {p}rpc button1/2_name/url  buttons\n"
+        f"  {p}rpc party on/off/current/max\n"
+        f"\n"
+        f"  [brand presets]\n"
+        f"  {p}rpc spotify <title> | <artist> | <secs>\n"
+        f"  {p}rpc youtube <video> | <channel> | <secs>\n"
+        f"  {p}rpc xbox <game>\n"
+        f"  {p}rpc playstation <game>\n"
+        f"  {p}rpc crunchyroll <anime> | <episode>\n"
+        f"  {p}rpc custom <name> | <details> | <state>\n"
+        f"  {p}rpc clear               alias for disable\n"
+        f"```"
+    )
 
 def build_help_quests():
     p = PREFIX
-    lines = [
-        help_header("quests", "quest completer & orb badge"),
-        help_section("commands"),
-        help_row(f"{p}quest", "list active quests with progress"),
-        help_row(f"{p}questrun <index>", "solve specific quest by index"),
-        help_row(f"{p}questall", "solve all active quests at once"),
-        help_row(f"{p}autoquest on/off", "auto-run quests on startup"),
-        help_row(f"{p}orbbadge", "claim orb badge reward"),
-    ]
-    return ansi("\n".join(lines))
+    return (
+        f"> **quests**  quest completer & orb badge\n"
+        f"```\n"
+        f"  {p}quest                   list active quests\n"
+        f"  {p}questrun <index>        solve specific quest\n"
+        f"  {p}questall                solve all active quests\n"
+        f"  {p}autoquest on/off        auto-run on startup\n"
+        f"  {p}orbbadge                claim orb badge\n"
+        f"```"
+    )
 
 def build_help_sniper():
     p = PREFIX
-    lines = [
-        help_header("sniper", "nitro sniper & message logger"),
-        help_section("sniper"),
-        help_row(f"{p}sniper on/off", "toggle nitro gift sniper"),
-        help_section("logger"),
-        help_row(f"{p}logger on/off", "toggle message logger"),
-        help_row(f"{p}readlog <n>", "read last n lines of log"),
-    ]
-    return ansi("\n".join(lines))
+    return (
+        f"> **sniper**  nitro sniper & logger\n"
+        f"```\n"
+        f"  [sniper]\n"
+        f"  {p}sniper on/off           toggle nitro sniper\n"
+        f"\n"
+        f"  [logger]\n"
+        f"  {p}logger on/off           toggle message logger\n"
+        f"  {p}readlog <n>             read last n log lines\n"
+        f"```"
+    )
 
 def build_help_ar():
     p = PREFIX
-    lines = [
-        help_header("ar", "auto-responder"),
-        help_section("commands"),
-        help_row(f"{p}ar add <trigger> | <response>", "add auto-response"),
-        help_row(f"{p}ar remove <trigger>", "remove auto-response"),
-        help_row(f"{p}ar list", "list all auto-responses"),
-    ]
-    return ansi("\n".join(lines))
+    return (
+        f"> **ar**  auto-responder\n"
+        f"```\n"
+        f"  {p}ar add <trigger> | <response>   add response\n"
+        f"  {p}ar remove <trigger>             remove response\n"
+        f"  {p}ar list                         list all\n"
+        f"```"
+    )
 
 HELP_MAP = {
     "":          build_help_root,
@@ -1188,13 +1198,23 @@ async def on_message(message):
     if cmd == "help":
         sub = args[1].lower() if len(args) > 1 else ""
         builder = HELP_MAP.get(sub)
-        if builder:
-            await message.edit(content=builder())
-        else:
-            await message.edit(content=ansi(
-                f"{RD}✗  unknown category: {sub}{R}\n"
-                f"{DIM}available: general, rpc, quests, sniper, ar{R}"
-            ))
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            if builder:
+                await message.channel.send(builder())
+            else:
+                await message.channel.send(
+                    f"> **error**\n"
+                    f"```\n"
+                    f"  unknown category: {sub}\n"
+                    f"  available: general, rpc, quests, sniper, ar\n"
+                    f"```"
+                )
+        except Exception as e:
+            print(f"[help] send error: {e}")
         return
 
     # ── GENERAL ──
