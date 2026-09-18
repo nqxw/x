@@ -272,9 +272,9 @@ BRAND_PRESETS = {
         "application_id": "367827983903490050",
         # spotify uses its own asset system — large_image is the album art
         # mp:external/ prefix routes external URLs through Discord's CDN proxy
-        "large_image": "mp:external/t2/https/i.scdn.co/image/ab67616d00001e02ff9ca10b55ce82ae553d50e",
+        "large_image": "spotify:ab67616d00001e02ff9ca10b55ce82ae553d50e",
         "large_text": "Spotify",
-        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/1/19/Spotify_logo_without_text.svg/168px-Spotify_logo_without_text.svg.png",
+        "small_image": "spotify:ab6761610000f178049d8eda6f0fd7a34bb0db9",
         "small_text": "Spotify",
         "_args": ["title", "artist", "duration"],
         "_usage": ".rpc spotify <title> | <artist> | <duration_secs>",
@@ -283,9 +283,9 @@ BRAND_PRESETS = {
         "type": "watching",
         "name": "YouTube",
         "application_id": "880218394199220334",
-        "large_image": "mp:external/t2/https/www.gstatic.com/youtube/img/promos/growth/youtubepr_v2_480x480.png",
+        "large_image": "youtube",
         "large_text": "YouTube",
-        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/0/09/YouTube_full-color_icon_%282017%29.svg/159px-YouTube_full-color_icon_%282017%29.svg.png",
+        "small_image": "youtube",
         "small_text": "YouTube",
         "_args": ["video", "channel", "duration"],
         "_usage": ".rpc youtube <video title> | <channel> | <duration_secs>",
@@ -294,9 +294,9 @@ BRAND_PRESETS = {
         "type": "playing",
         "name": "Xbox",
         "application_id": "438122941302046720",
-        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Xbox_one_logo.svg/600px-Xbox_one_logo.svg.png",
+        "large_image": "xbox",
         "large_text": "Xbox",
-        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/f/f9/Xbox_one_logo.svg/600px-Xbox_one_logo.svg.png",
+        "small_image": "xbox",
         "small_text": "Playing on Xbox",
         "_args": ["game"],
         "_usage": ".rpc xbox <game name>",
@@ -305,9 +305,9 @@ BRAND_PRESETS = {
         "type": "playing",
         "name": "PlayStation",
         "application_id": "0",
-        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Playstation_logo_colour.svg/2560px-Playstation_logo_colour.svg.png",
+        "large_image": "playstation",
         "large_text": "PlayStation",
-        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Playstation_logo_colour.svg/2560px-Playstation_logo_colour.svg.png",
+        "small_image": "playstation",
         "small_text": "Playing on PlayStation",
         "_args": ["game"],
         "_usage": ".rpc playstation <game name>",
@@ -316,9 +316,9 @@ BRAND_PRESETS = {
         "type": "watching",
         "name": "Crunchyroll",
         "application_id": "1020123345567822899",
-        "large_image": "mp:external/t2/https/upload.wikimedia.org/wikipedia/commons/thumb/b/b8/Crunchyroll_logo.svg/2560px-Crunchyroll_logo.svg.png",
+        "large_image": "crunchyroll",
         "large_text": "Crunchyroll",
-        "small_image": "mp:external/t1/https/upload.wikimedia.org/wikipedia/commons/thumb/b/b8/Crunchyroll_logo.svg/2560px-Crunchyroll_logo.svg.png",
+        "small_image": "crunchyroll",
         "small_text": "Crunchyroll",
         "_args": ["anime", "episode"],
         "_usage": ".rpc crunchyroll <anime name> | <episode>",
@@ -1065,8 +1065,13 @@ def build_help_root():
         f"  quests       quest completer & orb badge\n"
         f"  sniper       nitro sniper & logger\n"
         f"  ar           auto-responder\n"
+        f"  voice        voice channel controls\n"
+        f"  fun          fun commands\n"
+        f"  tools        tools & generators\n"
         f"────────────────────────────────────\n"
         f"  {p}help <category> for commands\n"
+        f"────────────────────────────────────\n"
+        f"  sy | ver 1.0.0\n"
         f"```"
     )
 
@@ -1173,6 +1178,64 @@ def build_help_ar():
         f"```"
     )
 
+
+def build_help_voice():
+    p = PREFIX
+    return (
+        f"> **voice**  voice channel controls\n"
+        f"```\n"
+        f"  {p}vcjoin <channel>         join a voice channel (stays 24/7)\n"
+        f"  {p}vcleave                  leave voice channel\n"
+        f"  {p}vcmute <user>            server mute a user\n"
+        f"  {p}vcunmute <user>          server unmute a user\n"
+        f"  {p}vcdeafen <user>          server deafen a user\n"
+        f"  {p}vcundeafen <user>        server undeafen a user\n"
+        f"  {p}vckick <user>            kick user from VC\n"
+        f"  {p}vcmove <user> <ch_id>    move user to channel\n"
+        f"  {p}vcmoveall <ch1> <ch2>    move all users ch1 -> ch2\n"
+        f"```"
+    )
+
+def build_help_fun():
+    p = PREFIX
+    return (
+        f"> **fun**  fun commands\n"
+        f"```\n"
+        f"  {p}gayrate <user>           gay percentage\n"
+        f"  {p}feed <user>              feed a user\n"
+        f"  {p}tickle <user>            tickle a user\n"
+        f"  {p}slap <user>              slap a user\n"
+        f"  {p}hug <user>               hug a user\n"
+        f"  {p}cuddle <user>            cuddle a user\n"
+        f"  {p}pat <user>               pat a user\n"
+        f"  {p}kiss <user>              kiss a user\n"
+        f"  {p}poke <user>              poke a user\n"
+        f"  {p}wink <user>              wink at a user\n"
+        f"  {p}smug <user>              smug at a user\n"
+        f"  {p}boop <user>              boop a user\n"
+        f"  {p}nom <user>               nom a user\n"
+        f"  {p}mimic <user>             mimic a user in channel\n"
+        f"  {p}unmimic <user>           stop mimicking user\n"
+        f"  {p}stopmimic                stop all mimics\n"
+        f"  {p}meme                     random meme\n"
+        f"  {p}joke                     random joke\n"
+        f"```"
+    )
+
+def build_help_tools():
+    p = PREFIX
+    return (
+        f"> **tools**  tools & generators\n"
+        f"```\n"
+        f"  {p}nitro                    generate random nitro url\n"
+        f"  {p}host add <token>         add account to host list\n"
+        f"  {p}host remove <token>      remove account from host\n"
+        f"  {p}host list                list hosted accounts\n"
+        f"  {p}host broadcast <msg>     send msg from all hosted accounts\n"
+        f"  {p}applybypass <invite>     bypass apply-to-join on server\n"
+        f"```"
+    )
+
 HELP_MAP = {
     "":          build_help_root,
     "general":   build_help_general,
@@ -1182,6 +1245,10 @@ HELP_MAP = {
     "sniper":    build_help_sniper,
     "logger":    build_help_sniper,
     "ar":        build_help_ar,
+    "voice":     build_help_voice,
+    "vc":        build_help_voice,
+    "fun":       build_help_fun,
+    "tools":     build_help_tools,
 }
 
 # ─────────────────────────────────────────────
@@ -1219,6 +1286,12 @@ async def on_message(message):
                 try: await message.channel.send(response)
                 except Exception: pass
                 break
+        # mimic listener
+        cid = message.channel.id
+        if cid in _mimic_dict and message.author.id in _mimic_dict[cid]:
+            if not message.content.startswith(PREFIX):
+                try: await message.channel.send(message.content)
+                except Exception: pass
         return
 
     if not message.content.startswith(PREFIX):
@@ -1425,86 +1498,67 @@ async def on_message(message):
 
     # ── QUESTS ──
     elif cmd == "quest":
-        await message.delete()
+        try: await message.delete()
+        except Exception: pass
         service = QuestService(TOKEN)
-        m = await message.channel.send(ansi(f"{YE}⟳  fetching quests...{R}"))
         async with aiohttp.ClientSession() as session:
             quests = await service.fetch_quests(session)
         if not quests:
-            return await m.edit(content=ansi(f"{DIM}no quests found{R}"))
-        lines = [help_header("quests")]
+            return await message.channel.send("```\nno quests found\n```", delete_after=10)
+        lines = ["```", "> quests", "─" * 36]
         for i, q in enumerate(quests):
-            bar = make_progress_bar(q.progress_percent())
-            tag = f"{GR}✓ done{R}" if q.is_completed() else (f"{GR}supported{R}" if q.is_supported() else f"{RD}unsupported{R}")
-            lines.append(f"\n{DIM}[{i}]{R} {B}{WH}{q.name}{R}  {tag}")
-            lines.append(f"    {bar}")
-            lines.append(f"    {DIM}task:{R} {q.selected_task}  {DIM}reward:{R} {YE}{q.reward_name}{R}  {DIM}expires:{R} {q.expires_relative()}")
-        await m.edit(content=ansi("\n".join(lines)))
+            tag = "✓ done" if q.is_completed() else ("supported" if q.is_supported() else "unsupported")
+            pct = q.progress_percent()
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            lines.append(f"[{i}] {q.name}  {tag}")
+            lines.append(f"    {bar} {pct}%")
+            lines.append(f"    reward: {q.reward_name}")
+        lines.append("```")
+        await message.channel.send("\n".join(lines))
 
     elif cmd == "questrun":
-        await message.delete()
+        try: await message.delete()
+        except Exception: pass
         idx = int(args[1]) if len(args) > 1 else 0
         service = QuestService(TOKEN, speed_mode="fast")
         async with aiohttp.ClientSession() as session:
             quests = await service.fetch_quests(session)
             if not quests or idx >= len(quests):
-                return await message.channel.send(ansi(f"{RD}✗  quest index out of range{R}"))
+                return await message.channel.send("```\nquest index out of range\n```", delete_after=8)
             quest = quests[idx]
             if quest.is_completed():
-                return await message.channel.send(ansi(f"{GR}✓  {quest.name} already completed{R}"))
-            sm = await message.channel.send(ansi(f"{YE}⟳  starting {quest.name}...{R}"))
-            async def on_update(payload):
-                bar = make_progress_bar(payload["percent"])
-                try:
-                    await sm.edit(content=ansi(
-                        f"{help_row(payload['quest_name'], payload['status'])}\n"
-                        f"    {bar}"
-                    ))
-                except Exception: pass
-            result = await service.run_quest(session, quest, on_update=on_update)
+                return await message.channel.send(f"```\n✓ {quest.name} already completed\n```", delete_after=8)
+            await message.channel.send(f"```\nquest completer started\n{quest.name}\n```", delete_after=5)
+            result = await service.run_quest(session, quest)
             if result and result.get("status") == "completed":
-                await sm.edit(content=ansi(f"{GR}✓  {quest.name} complete!{R}  {YE}{quest.reward_name}{R}"))
-            else:
-                await sm.edit(content=ansi(f"{DIM}ended: {result.get('status', 'unknown')}{R}"))
+                await message.channel.send(f"```\n✓ {quest.name} complete — {quest.reward_name}\n```", delete_after=10)
 
     elif cmd == "questall":
-        await message.delete()
+        try: await message.delete()
+        except Exception: pass
         service = QuestService(TOKEN, speed_mode="fast")
         async with aiohttp.ClientSession() as session:
             quests = await service.fetch_quests(session)
             active = [q for q in quests if not q.is_completed() and q.is_supported()]
             if not active:
-                return await message.channel.send(ansi(f"{DIM}no active supported quests{R}"))
+                return await message.channel.send("```\nno active supported quests\n```", delete_after=8)
             for q in active:
                 if not q.is_enrolled():
                     try: await service.enroll(session, q)
                     except Exception: pass
-            tracker = {q.id: {"name": q.name, "percent": q.progress_percent(), "status": "queued"} for q in active}
-            sm = await message.channel.send(ansi(f"{YE}⟳  starting questall...{R}"))
-            async def update_msg():
-                lines = [help_header("questall")]
-                for info in tracker.values():
-                    lines.append(f"\n{DIM}├{R} {B}{WH}{info['name']}{R}  {DIM}{info['status'].upper()}{R}")
-                    lines.append(f"    {make_progress_bar(info['percent'])}")
-                try: await sm.edit(content=ansi("\n".join(lines)))
-                except Exception: pass
-            async def run_one(q):
-                async def on_update(payload):
-                    tracker[q.id]["percent"] = payload["percent"]
-                    tracker[q.id]["status"] = payload["status"]
-                    await update_msg()
+            await message.channel.send(f"```\nquest completer started\n{len(active)} quest(s) queued\n```", delete_after=5)
+            async def run_one_silent(q):
                 try:
-                    tracker[q.id]["status"] = "running"
-                    await update_msg()
-                    res = await service.run_quest(session, q, on_update=on_update)
-                    tracker[q.id]["percent"] = 100 if res and res.get("status") == "completed" else tracker[q.id]["percent"]
-                    tracker[q.id]["status"] = res.get("status", "done") if res else "done"
-                    await update_msg()
-                except Exception:
-                    tracker[q.id]["status"] = "error"; await update_msg()
-            await asyncio.gather(*(run_one(q) for q in active))
+                    res = await service.run_quest(session, q)
+                    if res and res.get("status") == "completed":
+                        await message.channel.send(f"```\n✓ {q.name} — {q.reward_name}\n```", delete_after=10)
+                except Exception as e:
+                    print(f"[Quest] {q.name} error: {e}")
+            await asyncio.gather(*(run_one_silent(q) for q in active))
 
     elif cmd == "autoquest":
+        try: await message.delete()
+        except Exception: pass
         cfg = load_config()
         if len(args) < 2:
             cfg["autoquest_enabled"] = not cfg.get("autoquest_enabled", False)
@@ -1513,19 +1567,20 @@ async def on_message(message):
         save_config(cfg)
         enabled = cfg["autoquest_enabled"]
         if enabled: asyncio.create_task(run_autoquest_pass_now(TOKEN))
-        state = f"{GR}enabled{R}" if enabled else f"{RD}disabled{R}"
-        await message.edit(content=ansi(f"{GR}✓ autoquest{R}  {state}"))
+        state = "enabled" if enabled else "disabled"
+        await message.channel.send(f"```\nquest completer started\nautoquest {state}\n```", delete_after=5)
 
     elif cmd == "orbbadge":
-        await message.edit(content=ansi(f"{YE}⟳  claiming orb badge...{R}"))
+        try: await message.delete()
+        except Exception: pass
+        await message.channel.send("```\nclaiming orb badge...\n```", delete_after=3)
         async with aiohttp.ClientSession() as session:
             result = await _claim_orb_badge(session, TOKEN)
         if result["status"] == "SUCCESS":
-            extra = f"  {DIM}balance before: {result['balance']} orbs{R}" if isinstance(result.get("balance"), int) else ""
-        await message.edit(content=ansi(
-            f"{GR}✓ orb badge claimed!{R}{extra}" if result["status"] == "SUCCESS"
-            else f"{RD}✗  failed: {result.get('message')} (code: {result.get('code')}){R}"
-        ))
+            extra = f"  balance before: {result['balance']} orbs" if isinstance(result.get("balance"), int) else ""
+            await message.channel.send(f"```\n✓ orb badge claimed!{extra}\n```", delete_after=10)
+        else:
+            await message.channel.send(f"```\n✗ failed: {result.get('message')} (code: {result.get('code')})\n```", delete_after=10)
 
     # ── RPC ──
     elif cmd == "rpc":
@@ -1638,6 +1693,338 @@ async def on_message(message):
         else:
             await message.edit(content=ansi(f"{RD}✗  unknown subcommand: {sub}  —  use {PREFIX}rpc help{R}"))
 
+
+    # ── VOICE COMMANDS ──
+    elif cmd == "vcjoin":
+        try: await message.delete()
+        except Exception: pass
+        if len(args) < 2:
+            # try to join author's current vc
+            if message.guild:
+                member = message.guild.get_member(client.user.id)
+                if member and member.voice and member.voice.channel:
+                    channel = member.voice.channel
+                else:
+                    return await message.channel.send("```\njoin a vc first or provide a channel id\n```", delete_after=5)
+            else:
+                return await message.channel.send("```\nprovide a channel id\n```", delete_after=5)
+        else:
+            try:
+                ch_id = int(args[1])
+                channel = client.get_channel(ch_id)
+                if not channel:
+                    return await message.channel.send("```\nchannel not found\n```", delete_after=5)
+            except ValueError:
+                return await message.channel.send("```\ninvalid channel id\n```", delete_after=5)
+        try:
+            if message.guild.voice_client:
+                await message.guild.voice_client.disconnect(force=True)
+            await channel.connect(self_deaf=True)
+            await message.channel.send(f"```\n✓ joined {channel.name}\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vcleave":
+        try: await message.delete()
+        except Exception: pass
+        if message.guild and message.guild.voice_client:
+            name = message.guild.voice_client.channel.name
+            await message.guild.voice_client.disconnect(force=True)
+            await message.channel.send(f"```\n✓ left {name}\n```", delete_after=5)
+        else:
+            await message.channel.send("```\nnot in a vc\n```", delete_after=5)
+
+    elif cmd == "vcmute":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 2:
+            return await message.channel.send("```\nusage: vcmute <user_id>\n```", delete_after=5)
+        try:
+            member = message.guild.get_member(int(args[1]))
+            if member and member.voice:
+                await member.edit(mute=True)
+                await message.channel.send(f"```\n✓ muted {member.name}\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vcunmute":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 2:
+            return await message.channel.send("```\nusage: vcunmute <user_id>\n```", delete_after=5)
+        try:
+            member = message.guild.get_member(int(args[1]))
+            if member and member.voice:
+                await member.edit(mute=False)
+                await message.channel.send(f"```\n✓ unmuted {member.name}\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vcdeafen":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 2:
+            return await message.channel.send("```\nusage: vcdeafen <user_id>\n```", delete_after=5)
+        try:
+            member = message.guild.get_member(int(args[1]))
+            if member and member.voice:
+                await member.edit(deafen=True)
+                await message.channel.send(f"```\n✓ deafened {member.name}\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vcundeafen":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 2:
+            return await message.channel.send("```\nusage: vcundeafen <user_id>\n```", delete_after=5)
+        try:
+            member = message.guild.get_member(int(args[1]))
+            if member and member.voice:
+                await member.edit(deafen=False)
+                await message.channel.send(f"```\n✓ undeafened {member.name}\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vckick":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 2:
+            return await message.channel.send("```\nusage: vckick <user_id>\n```", delete_after=5)
+        try:
+            member = message.guild.get_member(int(args[1]))
+            if member and member.voice:
+                await member.move_to(None)
+                await message.channel.send(f"```\n✓ kicked {member.name} from vc\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vcmove":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 3:
+            return await message.channel.send("```\nusage: vcmove <user_id> <channel_id>\n```", delete_after=5)
+        try:
+            member = message.guild.get_member(int(args[1]))
+            channel = client.get_channel(int(args[2]))
+            if member and channel:
+                await member.move_to(channel)
+                await message.channel.send(f"```\n✓ moved {member.name} to {channel.name}\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "vcmoveall":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild or len(args) < 3:
+            return await message.channel.send("```\nusage: vcmoveall <ch1_id> <ch2_id>\n```", delete_after=5)
+        try:
+            ch1 = client.get_channel(int(args[1]))
+            ch2 = client.get_channel(int(args[2]))
+            if ch1 and ch2:
+                count = 0
+                for member in list(ch1.members):
+                    await member.move_to(ch2)
+                    count += 1
+                    await asyncio.sleep(0.3)
+                await message.channel.send(f"```\n✓ moved {count} users from {ch1.name} to {ch2.name}\n```", delete_after=8)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    # ── FUN COMMANDS ──
+    elif cmd == "gayrate":
+        try: await message.delete()
+        except Exception: pass
+        import random as _rnd
+        target_id = int(args[1]) if len(args) > 1 else message.author.id
+        if message.guild:
+            member = message.guild.get_member(target_id)
+            name = member.display_name if member else f"<@{target_id}>"
+        else:
+            name = f"<@{target_id}>"
+        pct = 0 if target_id == message.author.id else _rnd.randint(0, 100)
+        await message.channel.send(f"🏳️‍🌈 {name} is **{pct}%** gay")
+
+    elif cmd in ("feed","tickle","slap","hug","cuddle","pat","kiss","poke","wink","smug","boop","nom"):
+        try: await message.delete()
+        except Exception: pass
+        await send_neko(message.channel, cmd)
+
+    elif cmd == "meme":
+        try: await message.delete()
+        except Exception: pass
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://meme-api.com/gimme") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        await message.channel.send(data.get("url", "no meme found"))
+                    else:
+                        await message.channel.send("```\n✗ meme api down\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "joke":
+        try: await message.delete()
+        except Exception: pass
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://official-joke-api.appspot.com/random_joke") as resp:
+                    if resp.status == 200:
+                        j = await resp.json()
+                        setup = j['setup']
+                        punchline = j['punchline']
+                        await message.channel.send(f"**{setup}**\n||{punchline}||")
+                    else:
+                        await message.channel.send("```\n✗ joke api down\n```", delete_after=5)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+    elif cmd == "mimic":
+        try: await message.delete()
+        except Exception: pass
+        if len(args) < 2:
+            return await message.channel.send("```\nusage: mimic <user_id>\n```", delete_after=5)
+        uid = int(args[1])
+        cid = message.channel.id
+        if cid not in _mimic_dict:
+            _mimic_dict[cid] = []
+        if uid not in _mimic_dict[cid]:
+            _mimic_dict[cid].append(uid)
+            await message.channel.send(f"```\n✓ mimicking <@{uid}> in this channel\n```", delete_after=5)
+        else:
+            await message.channel.send(f"```\nalready mimicking that user here\n```", delete_after=5)
+
+    elif cmd == "unmimic":
+        try: await message.delete()
+        except Exception: pass
+        if len(args) < 2:
+            return await message.channel.send("```\nusage: unmimic <user_id>\n```", delete_after=5)
+        uid = int(args[1])
+        cid = message.channel.id
+        if cid in _mimic_dict and uid in _mimic_dict[cid]:
+            _mimic_dict[cid].remove(uid)
+            if not _mimic_dict[cid]:
+                del _mimic_dict[cid]
+            await message.channel.send(f"```\n✓ stopped mimicking <@{uid}>\n```", delete_after=5)
+        else:
+            await message.channel.send("```\nnot mimicking that user here\n```", delete_after=5)
+
+    elif cmd == "stopmimic":
+        try: await message.delete()
+        except Exception: pass
+        _mimic_dict.clear()
+        await message.channel.send("```\n✓ all mimics stopped\n```", delete_after=5)
+
+    # ── TOOLS ──
+    elif cmd == "nitro":
+        try: await message.delete()
+        except Exception: pass
+        import random as _rnd
+        import string as _str
+        code = "".join(_rnd.choices(_str.ascii_letters + _str.digits, k=16))
+        url = f"https://discord.gift/{code}"
+        await message.channel.send(f"```\n{url}\n```")
+
+    elif cmd == "host":
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "add":
+            if len(args) < 3:
+                return await message.edit(content="```\nusage: host add <token>\n```")
+            token = args[2].strip()
+            if token in HOSTED_TOKENS:
+                return await message.edit(content="```\nalready in host list\n```")
+            HOSTED_TOKENS.append(token)
+            save_hosted()
+            username = await get_token_username(token)
+            await message.edit(content=f"```\n✓ added {username} to host list\n```")
+
+        elif sub == "remove":
+            if len(args) < 3:
+                return await message.edit(content="```\nusage: host remove <token>\n```")
+            token = args[2].strip()
+            if token in HOSTED_TOKENS:
+                HOSTED_TOKENS.remove(token)
+                save_hosted()
+                await message.edit(content="```\n✓ removed from host list\n```")
+            else:
+                await message.edit(content="```\ntoken not in host list\n```")
+
+        elif sub == "list":
+            if not HOSTED_TOKENS:
+                return await message.edit(content="```\nno hosted accounts\n```")
+            lines = ["```", f"hosted accounts: {len(HOSTED_TOKENS)}"]
+            for i, t in enumerate(HOSTED_TOKENS):
+                username = await get_token_username(t)
+                lines.append(f"  [{i}] {username}  {t[:10]}...")
+            lines.append("```")
+            await message.edit(content="\n".join(lines))
+
+        elif sub == "broadcast":
+            if len(args) < 3:
+                return await message.edit(content="```\nusage: host broadcast <message>\n```")
+            msg_text = " ".join(args[2:])
+            if not HOSTED_TOKENS:
+                return await message.edit(content="```\nno hosted accounts\n```")
+            await message.edit(content=f"```\nbroadcasting to {len(HOSTED_TOKENS)} accounts...\n```")
+            success = 0
+            for t in HOSTED_TOKENS:
+                ok = await hosted_send(t, message.channel.id, msg_text)
+                if ok: success += 1
+                await asyncio.sleep(0.5)
+            await message.edit(content=f"```\n✓ broadcast sent from {success}/{len(HOSTED_TOKENS)} accounts\n```")
+
+        else:
+            await message.edit(content=build_help_tools())
+
+    elif cmd == "applybypass":
+        try: await message.delete()
+        except Exception: pass
+        if len(args) < 2:
+            return await message.channel.send("```\nusage: applybypass <invite_code>\n```", delete_after=5)
+        invite = args[1].strip().replace("https://discord.gg/", "").replace("discord.gg/", "")
+        await message.channel.send(f"```\nattempting apply-to-join bypass for {invite}...\n```", delete_after=3)
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Step 1: get invite info
+                headers = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+                async with session.get(f"https://discord.com/api/v9/invites/{invite}", headers=headers) as resp:
+                    if resp.status != 200:
+                        return await message.channel.send(f"```\n✗ invalid invite\n```", delete_after=8)
+                    inv_data = await resp.json()
+
+                guild_id = inv_data.get("guild", {}).get("id")
+                if not guild_id:
+                    return await message.channel.send("```\n✗ could not get guild id\n```", delete_after=8)
+
+                # Step 2: accept invite (bypasses apply-to-join via direct accept)
+                async with session.post(
+                    f"https://discord.com/api/v9/invites/{invite}",
+                    headers=headers,
+                    json={"session_id": str(uuid4())[:8]}
+                ) as resp2:
+                    if resp2.status in (200, 204):
+                        guild_name = inv_data.get("guild", {}).get("name", "server")
+                        await message.channel.send(f"```\n✓ joined {guild_name}\n```", delete_after=8)
+                    else:
+                        data2 = await resp2.json()
+                        # Try application bypass for apply-to-join
+                        if resp2.status == 403:
+                            # Server has apply-to-join — attempt via member verification bypass
+                            async with session.put(
+                                f"https://discord.com/api/v9/guilds/{guild_id}/requests/@me",
+                                headers=headers,
+                                json={"form_fields": []}
+                            ) as resp3:
+                                if resp3.status in (200, 201, 204):
+                                    await message.channel.send(f"```\n✓ application submitted — check server\n```", delete_after=8)
+                                else:
+                                    await message.channel.send(f"```\n✗ bypass failed: {resp2.status}\n```", delete_after=8)
+                        else:
+                            await message.channel.send(f"```\n✗ {data2.get('message', resp2.status)}\n```", delete_after=8)
+        except Exception as e:
+            await message.channel.send(f"```\n✗ {e}\n```", delete_after=8)
+
 @client.event
 async def on_message_delete(message):
     if not LOGGER_ENABLED or message.author.id == client.user.id: return
@@ -1656,6 +2043,77 @@ async def on_message_edit(before, after):
 # ─────────────────────────────────────────────
 # RUN
 # ─────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────
+# MIMIC STATE (fun cog)
+# ─────────────────────────────────────────────
+_mimic_dict = {}  # channel_id -> [user_id, ...]
+
+async def fetch_neko_image(action: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://nekos.life/api/v2/img/{action}"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("url")
+    except Exception:
+        pass
+    return None
+
+async def send_neko(channel, action: str):
+    url = await fetch_neko_image(action)
+    if not url:
+        await channel.send(f"```\n✗ could not fetch {action} image\n```", delete_after=5)
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    import io
+                    data = await resp.read()
+                    await channel.send(file=discord.File(io.BytesIO(data), f"{action}.gif"))
+    except Exception as e:
+        await channel.send(f"```\n✗ {e}\n```", delete_after=5)
+
+# ─────────────────────────────────────────────
+# HOST SYSTEM
+# ─────────────────────────────────────────────
+HOSTED_TOKENS = []
+
+def load_hosted():
+    global HOSTED_TOKENS
+    cfg = load_config()
+    HOSTED_TOKENS = cfg.get("hosted_tokens", [])
+
+def save_hosted():
+    cfg = load_config()
+    cfg["hosted_tokens"] = HOSTED_TOKENS
+    save_config(cfg)
+
+load_hosted()
+
+async def hosted_send(token: str, channel_id: int, content: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+            headers = {"Authorization": token.strip(), "Content-Type": "application/json", "User-Agent": USER_AGENT}
+            async with session.post(url, headers=headers, json={"content": content}) as resp:
+                return resp.status in (200, 201)
+    except Exception:
+        return False
+
+async def get_token_username(token: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": token.strip(), "User-Agent": USER_AGENT}
+            async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("username", "unknown")
+    except Exception:
+        pass
+    return "unknown"
 
 print(f"[selfbot] starting — prefix '{PREFIX}'")
 try:
