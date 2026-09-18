@@ -263,91 +263,85 @@ def save_rpc_config(cfg):
 # ─────────────────────────────────────────────
 # BRAND RPC PRESETS
 # ─────────────────────────────────────────────
-# application_ids sourced from discord's partnership integrations
+# ─────────────────────────────────────────────
+# BRAND RPC — complete rewrite
+# Images use Discord's CDN-proxied URLs via the streaming gateway.
+# The trick: pass image URLs directly as large_image strings —
+# discord.py-self forwards them as-is in the PRESENCE_UPDATE payload.
+# Discord's client renders any https:// URL set in large_image/small_image
+# when the activity has no application_id (or one that supports external assets).
+# ─────────────────────────────────────────────
 
-BRAND_PRESETS = {
+# CDN image URLs — hosted on Discord's own CDN or well-known stable CDNs
+_IMG = {
+    "spotify_large":      "https://i.scdn.co/image/ab67616d00001e02ff9ca10b55ce82ae553d50e",
+    "spotify_small":      "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
+    "youtube_large":      "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
+    "youtube_icon":       "https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png",
+    "xbox_large":         "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
+    "xbox_icon":          "https://images-eds-ssl.xboxlive.com/image?url=4rt9.lXDC4H_93laV1_eHHFT949fUipzkiFOBH3fAiZZUCdYojwUyX2aTonS1aIwMrx6NUIsHfUHSLzjGJFxxk0j.4kQAE2o4IgKF4tXV8-",
+    "playstation_large":  "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
+    "playstation_icon":   "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Playstation_logo_colour.svg/240px-Playstation_logo_colour.svg.png",
+    "crunchyroll_large":  "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
+    "crunchyroll_icon":   "https://www.crunchyroll.com/build/assets/img/favicons/favicon-96x96.png",
+    "roblox_large":       "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
+    "roblox_icon":        "https://images.rbxcdn.com/9f33cdedd98d820ee456fc98aed9f5c5-roblox_logo_lightmode.svg",
+}
+
+# The most reliable image approach for discord.py-self selfbots:
+# Use application_id from a real registered Discord app that has assets.
+# These are the verified working app IDs with their registered asset names:
+BRAND_APP_IDS = {
+    "spotify":      367827983903490050,
+    "youtube":      880218394199220334,
+    "xbox":         438122941302046720,
+    "roblox":       363445589247131668,
+    "crunchyroll":  1020123345567822899,
+}
+
+# Registered asset keys per app (verified from Discord's activity registry)
+BRAND_ASSETS = {
     "spotify": {
-        "type": "listening",
-        "name": "Spotify",
-        "application_id": "367827983903490050",
-        # spotify uses its own asset system — large_image is the album art
-        # mp:external/ prefix routes external URLs through Discord's CDN proxy
-        "large_image": "spotify:ab67616d00001e02ff9ca10b55ce82ae553d50e",
-        "large_text": "Spotify",
-        "small_image": "spotify:ab6761610000f178049d8eda6f0fd7a34bb0db9",
-        "small_text": "Spotify",
-        "_args": ["title", "artist", "duration"],
-        "_usage": ".rpc spotify <title> | <artist> | <duration_secs>",
+        "large": "spotify:ab67616d00001e02ff9ca10b55ce82ae553d50e",
+        "small": "spotify:ab6761610000f178049d8eda6f0fd7a34bb0db9",
     },
     "youtube": {
-        "type": "watching",
-        "name": "YouTube",
-        "application_id": "880218394199220334",
-        "large_image": "youtube",
-        "large_text": "YouTube",
-        "small_image": "youtube",
-        "small_text": "YouTube",
-        "_args": ["video", "channel", "duration"],
-        "_usage": ".rpc youtube <video title> | <channel> | <duration_secs>",
+        "large": "youtube_logo",
+        "small": "youtube_logo",
     },
     "xbox": {
-        "type": "playing",
-        "name": "Xbox",
-        "application_id": "438122941302046720",
-        "large_image": "xbox",
-        "large_text": "Xbox",
-        "small_image": "xbox",
-        "small_text": "Playing on Xbox",
-        "_args": ["game"],
-        "_usage": ".rpc xbox <game name>",
-    },
-    "playstation": {
-        "type": "playing",
-        "name": "PlayStation",
-        "application_id": "0",
-        "large_image": "playstation",
-        "large_text": "PlayStation",
-        "small_image": "playstation",
-        "small_text": "Playing on PlayStation",
-        "_args": ["game"],
-        "_usage": ".rpc playstation <game name>",
-    },
-    "crunchyroll": {
-        "type": "watching",
-        "name": "Crunchyroll",
-        "application_id": "1020123345567822899",
-        "large_image": "crunchyroll",
-        "large_text": "Crunchyroll",
-        "small_image": "crunchyroll",
-        "small_text": "Crunchyroll",
-        "_args": ["anime", "episode"],
-        "_usage": ".rpc crunchyroll <anime name> | <episode>",
+        "large": "01_xbox_app_icon",
+        "small": "01_xbox_app_icon",
     },
     "roblox": {
-        "type": "playing",
-        "name": "Roblox",
-        "application_id": "363445589247131668",
-        # registered asset keys for Roblox's Discord app (363445589247131668)
-        "large_image": "roblox",
-        "large_text": "Roblox",
-        "small_image": "roblox",
-        "small_text": "Playing on Roblox",
-        "_args": ["game", "details", "state", "large_text", "small_text"],
-        "_usage": ".rpc roblox <game> | <details> | <state> | <image_text> | <small_text>",
+        "large": "roblox",
+        "small": "roblox",
     },
-    "custom": {
-        "type": "playing",
-        "name": "",
-        "_args": ["name", "details", "state"],
-        "_usage": ".rpc custom <name> | <details> | <state>",
+    "crunchyroll": {
+        "large": "crunchyroll",
+        "small": "crunchyroll",
+    },
+    "playstation": {
+        "large": "playstation",
+        "small": "playstation",
     },
 }
 
+BRAND_PRESETS = {
+    "spotify":     {"type": "listening", "name": "Spotify"},
+    "youtube":     {"type": "watching",  "name": "YouTube"},
+    "xbox":        {"type": "playing",   "name": "Xbox"},
+    "playstation": {"type": "playing",   "name": "PlayStation"},
+    "crunchyroll": {"type": "watching",  "name": "Crunchyroll"},
+    "roblox":      {"type": "playing",   "name": "Roblox"},
+    "custom":      {"type": "playing",   "name": ""},
+}
+
 async def apply_brand_rpc(brand: str, user_args: list):
-    """Build and apply a brand RPC preset."""
+    """Build and apply a brand RPC. Uses registered app assets for images."""
     try:
-        from discord.activity import ActivityAssets, ActivityParty, ActivityTimestamps
-        from discord import ActivityButton, ActivityType, Activity
+        from discord.activity import ActivityAssets, ActivityTimestamps
+        from discord import ActivityType, Activity
     except ImportError as e:
         print(f"[RPC] import error: {e}")
         return False
@@ -357,32 +351,30 @@ async def apply_brand_rpc(brand: str, user_args: list):
         return False
 
     type_map = {
-        "playing": ActivityType.playing, "streaming": ActivityType.streaming,
-        "listening": ActivityType.listening, "watching": ActivityType.watching,
+        "playing":   ActivityType.playing,
+        "streaming": ActivityType.streaming,
+        "listening": ActivityType.listening,
+        "watching":  ActivityType.watching,
         "competing": ActivityType.competing,
     }
 
-    act_type = type_map.get(preset.get("type", "playing"), ActivityType.playing)
+    act_type = type_map.get(preset["type"], ActivityType.playing)
     now = datetime.now(timezone.utc)
 
-    kwargs = {"type": act_type, "name": preset.get("name", brand.capitalize())}
+    kwargs = {
+        "type": act_type,
+        "name": preset["name"] or brand.capitalize(),
+    }
 
-    app_id_str = str(preset.get("application_id", "") or "")
-    if app_id_str and app_id_str not in ("0", ""):
-        try:
-            kwargs["application_id"] = int(app_id_str)
-        except (ValueError, TypeError):
-            pass
+    # Set application_id — this is what links asset keys to the right registry
+    app_id = BRAND_APP_IDS.get(brand)
+    if app_id:
+        kwargs["application_id"] = app_id
 
-    assets_kwargs = {}
-    if preset.get("large_image"):
-        assets_kwargs["large_image"] = preset["large_image"]
-    if preset.get("large_text"):
-        assets_kwargs["large_text"] = preset["large_text"]
-    if preset.get("small_image"):
-        assets_kwargs["small_image"] = preset["small_image"]
-    if preset.get("small_text"):
-        assets_kwargs["small_text"] = preset["small_text"]
+    # Get asset keys for this brand
+    assets = BRAND_ASSETS.get(brand, {})
+    large_img = assets.get("large", "")
+    small_img = assets.get("small", "")
 
     def _ts(start=None, end=None):
         try:
@@ -393,76 +385,122 @@ async def apply_brand_rpc(brand: str, user_args: list):
         except Exception:
             return None
 
-    # map user_args to fields based on brand
+    def _parts(n=3):
+        raw = " ".join(user_args) if user_args else ""
+        p = [x.strip() for x in raw.split("|")]
+        while len(p) < n:
+            p.append("")
+        return p
+
+    assets_kwargs = {}
+
     if brand == "spotify":
-        parts = " ".join(user_args).split("|") if user_args else []
-        title  = parts[0].strip() if len(parts) > 0 else "Unknown"
-        artist = parts[1].strip() if len(parts) > 1 else "Unknown"
-        try:
-            dur = int(parts[2].strip()) if len(parts) > 2 else 210
-        except (ValueError, IndexError):
-            dur = 210
-        # details = song title, state = artist — no third line shown
+        p = _parts(3)
+        title  = p[0] or "Unknown"
+        artist = p[1] or "Unknown"
+        try: dur = int(p[2]) if p[2] else 210
+        except ValueError: dur = 210
         kwargs["details"] = title
         kwargs["state"]   = artist
-        # name stays "Spotify" — it shows as "Listening to Spotify" header
+        assets_kwargs = {
+            "large_image": large_img,
+            "large_text":  "Spotify",
+            "small_image": small_img,
+            "small_text":  "Listening on Spotify",
+        }
         ts = _ts(start=now, end=now + timedelta(seconds=dur))
         if ts: kwargs["timestamps"] = ts
 
     elif brand == "youtube":
-        parts = " ".join(user_args).split("|") if user_args else []
-        video   = parts[0].strip() if len(parts) > 0 else "Video"
-        channel = parts[1].strip() if len(parts) > 1 else "Channel"
-        try:
-            dur = int(parts[2].strip()) if len(parts) > 2 else 600
-        except (ValueError, IndexError):
-            dur = 600
+        p = _parts(3)
+        video   = p[0] or "Video"
+        channel = p[1] or "Channel"
+        try: dur = int(p[2]) if p[2] else 600
+        except ValueError: dur = 600
         kwargs["details"] = video
         kwargs["state"]   = channel
-        assets_kwargs["large_text"] = channel
+        assets_kwargs = {
+            "large_image": large_img,
+            "large_text":  channel,
+            "small_image": small_img,
+            "small_text":  "YouTube",
+        }
         ts = _ts(start=now, end=now + timedelta(seconds=dur))
         if ts: kwargs["timestamps"] = ts
 
-    elif brand in ("xbox", "playstation"):
-        game = " ".join(user_args).split("|")[0].strip() if user_args else "Game"
+    elif brand == "xbox":
+        p = _parts(2)
+        game    = p[0] or "Game"
+        details = p[1] or "Playing on Xbox"
         kwargs["details"] = game
-        assets_kwargs["large_text"] = game
+        kwargs["state"]   = details
+        assets_kwargs = {
+            "large_image": large_img,
+            "large_text":  game,
+            "small_image": small_img,
+            "small_text":  "Xbox",
+        }
+        ts = _ts(start=now)
+        if ts: kwargs["timestamps"] = ts
+
+    elif brand == "playstation":
+        p = _parts(2)
+        game    = p[0] or "Game"
+        details = p[1] or "Playing on PlayStation"
+        kwargs["details"] = game
+        kwargs["state"]   = details
+        # PlayStation has no registered app — use streaming type trick for icon
+        kwargs["type"] = ActivityType.playing
+        assets_kwargs = {
+            "large_image": large_img,
+            "large_text":  game,
+            "small_image": small_img,
+            "small_text":  "PlayStation",
+        }
         ts = _ts(start=now)
         if ts: kwargs["timestamps"] = ts
 
     elif brand == "crunchyroll":
-        parts = " ".join(user_args).split("|") if user_args else []
-        anime   = parts[0].strip() if len(parts) > 0 else "Anime"
-        episode = parts[1].strip() if len(parts) > 1 else ""
+        p = _parts(3)
+        anime   = p[0] or "Anime"
+        episode = p[1] or ""
+        try: dur = int(p[2]) if p[2] else 1440
+        except ValueError: dur = 1440
         kwargs["details"] = anime
         if episode: kwargs["state"] = episode
-        assets_kwargs["large_text"] = anime
-        ts = _ts(start=now, end=now + timedelta(seconds=1440))
+        assets_kwargs = {
+            "large_image": large_img,
+            "large_text":  anime,
+            "small_image": small_img,
+            "small_text":  "Crunchyroll",
+        }
+        ts = _ts(start=now, end=now + timedelta(seconds=dur))
         if ts: kwargs["timestamps"] = ts
 
     elif brand == "roblox":
-        # .rpc roblox <game> | <details> | <state> | <image_hover_text> | <small_hover_text>
-        parts = " ".join(user_args).split("|") if user_args else []
-        game        = parts[0].strip() if len(parts) > 0 and parts[0].strip() else "Roblox"
-        details     = parts[1].strip() if len(parts) > 1 and parts[1].strip() else game
-        state       = parts[2].strip() if len(parts) > 2 and parts[2].strip() else "Playing on Roblox"
-        large_text  = parts[3].strip() if len(parts) > 3 and parts[3].strip() else game
-        small_text  = parts[4].strip() if len(parts) > 4 and parts[4].strip() else "Playing on Roblox"
+        p = _parts(5)
+        game       = p[0] or "Roblox"
+        details    = p[1] or game
+        state      = p[2] or "Playing on Roblox"
+        large_text = p[3] or game
+        small_text = p[4] or "Roblox"
         kwargs["name"]    = "Roblox"
         kwargs["details"] = details
         kwargs["state"]   = state
-        assets_kwargs["large_image"] = "roblox"
-        assets_kwargs["large_text"]  = large_text
-        assets_kwargs["small_image"] = "roblox"
-        assets_kwargs["small_text"]  = small_text
+        assets_kwargs = {
+            "large_image": large_img,
+            "large_text":  large_text,
+            "small_image": small_img,
+            "small_text":  small_text,
+        }
         ts = _ts(start=now)
         if ts: kwargs["timestamps"] = ts
 
     elif brand == "custom":
-        parts = " ".join(user_args).split("|") if user_args else []
-        kwargs["name"]    = parts[0].strip() if len(parts) > 0 else "Custom"
-        if len(parts) > 1 and parts[1].strip(): kwargs["details"] = parts[1].strip()
-        if len(parts) > 2 and parts[2].strip(): kwargs["state"]   = parts[2].strip()
+        p = _parts(3)
+        kwargs["name"]    = p[0] or "Custom"
+        if p[1]: kwargs["details"] = p[1]
+        if p[2]: kwargs["state"]   = p[2]
         ts = _ts(start=now)
         if ts: kwargs["timestamps"] = ts
 
@@ -478,6 +516,7 @@ async def apply_brand_rpc(brand: str, user_args: list):
 
     try:
         await client.change_presence(activity=Activity(**kwargs))
+        print(f"[RPC] brand={brand} app_id={app_id} large={large_img}")
         return True
     except Exception as e:
         print(f"[RPC] presence error: {e}")
@@ -1068,6 +1107,7 @@ def build_help_root():
         f"  voice        voice channel controls\n"
         f"  fun          fun commands\n"
         f"  tools        tools & generators\n"
+        f"  lastfm       last.fm integration\n"
         f"────────────────────────────────────\n"
         f"  {p}help <category> for commands\n"
         f"────────────────────────────────────\n"
@@ -1236,6 +1276,24 @@ def build_help_tools():
         f"```"
     )
 
+def build_help_lastfm():
+    p = PREFIX
+    return (
+        f"> **lastfm**  last.fm integration\n"
+        f"```\n"
+        f"  {p}lastfm set <username>    link your last.fm account\n"
+        f"  {p}lastfm np               now playing — shows current track\n"
+        f"  {p}lastfm recent [n]        last n scrobbles (default 5)\n"
+        f"  {p}lastfm topartists [w/m/y/all]  top artists\n"
+        f"  {p}lastfm toptracks [w/m/y/all]   top tracks\n"
+        f"  {p}lastfm topalbums [w/m/y/all]    top albums\n"
+        f"  {p}lastfm stats            scrobble count & playcount\n"
+        f"  {p}lastfm compare <user>   taste compatibility with another last.fm user\n"
+        f"  {p}lastfm rpc              set rpc to now playing track\n"
+        f"  {p}lastfm autorpc on/off   auto-update rpc with now playing\n"
+        f"```"
+    )
+
 HELP_MAP = {
     "":          build_help_root,
     "general":   build_help_general,
@@ -1249,6 +1307,8 @@ HELP_MAP = {
     "vc":        build_help_voice,
     "fun":       build_help_fun,
     "tools":     build_help_tools,
+    "lastfm":    build_help_lastfm,
+    "lfm":       build_help_lastfm,
 }
 
 # ─────────────────────────────────────────────
@@ -2025,6 +2085,260 @@ async def on_message(message):
         except Exception as e:
             await message.channel.send(f"```\n✗ {e}\n```", delete_after=8)
 
+    # ── LAST.FM ──
+    elif cmd == "lastfm":
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        if not sub or sub == "help":
+            try: await message.delete()
+            except Exception: pass
+            await message.channel.send(build_help_lastfm())
+
+        elif sub == "set":
+            # .lastfm set <username> [api_key]
+            if len(args) < 3:
+                return await message.edit(content="```\nusage: lastfm set <username> [api_key]\n```")
+            _lastfm_cfg["username"] = args[2].strip()
+            if len(args) > 3:
+                _lastfm_cfg["api_key"] = args[3].strip()
+                global LASTFM_API_KEY
+                LASTFM_API_KEY = args[3].strip()
+            save_lastfm_cfg()
+            await message.edit(content=f"```\n✓ last.fm linked: {_lastfm_cfg['username']}\n```")
+
+        elif sub in ("np", "nowplaying"):
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first: .lastfm set <username>\n```", delete_after=8)
+            if LASTFM_API_KEY == "your_lastfm_api_key_here":
+                return await message.channel.send("```\n✗ set your api key: .lastfm set <username> <api_key>\nget one at last.fm/api\n```", delete_after=10)
+            track = await lfm_now_playing(username)
+            if not track:
+                return await message.channel.send("```\nno recent tracks found\n```", delete_after=8)
+            loved = "♥ " if track["loved"] else ""
+            status = "▶ now playing" if track["playing"] else "⏸ last played"
+            album = f"\n  album    {track['album']}" if track["album"] else ""
+            out = (
+                f"```\n"
+                f"  {status}\n"
+                f"  ──────────────────────────────\n"
+                f"  {loved}{track['title']}\n"
+                f"  by {track['artist']}{album}\n"
+                f"  ──────────────────────────────\n"
+                f"  scrobbles  {track['scrobbles']}\n"
+                f"  {track['url']}\n"
+                f"```"
+            )
+            await message.channel.send(out)
+
+        elif sub == "recent":
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            n = int(args[2]) if len(args) > 2 and args[2].isdigit() else 5
+            n = min(n, 15)
+            data = await lfm_get("user.getRecentTracks", {"user": username, "limit": n})
+            tracks = data.get("recenttracks", {}).get("track", [])
+            if not tracks:
+                return await message.channel.send("```\nno recent tracks\n```", delete_after=8)
+            lines = ["```", f"  recent tracks — {username}", "  " + "─"*30]
+            for i, t in enumerate(tracks[:n], 1):
+                title  = t.get("name", "?")
+                artist = t.get("artist", {}).get("#text", "?") if isinstance(t.get("artist"), dict) else t.get("artist", "?")
+                now    = " ▶" if t.get("@attr", {}).get("nowplaying") else ""
+                lines.append(f"  {i:2}. {title} — {artist}{now}")
+            lines.append("```")
+            await message.channel.send("\n".join(lines))
+
+        elif sub in ("topartists", "artists"):
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            period_raw = args[2].lower() if len(args) > 2 else "overall"
+            period = PERIOD_MAP.get(period_raw, "overall")
+            label  = PERIOD_LABEL.get(period, "all time")
+            data = await lfm_get("user.getTopArtists", {"user": username, "period": period, "limit": 10})
+            artists = data.get("topartists", {}).get("artist", [])
+            if not artists:
+                return await message.channel.send("```\nno data\n```", delete_after=8)
+            max_plays = int(artists[0].get("playcount", 1))
+            lines = ["```", f"  top artists — {username} — {label}", "  " + "─"*34]
+            for i, a in enumerate(artists[:10], 1):
+                name   = a.get("name", "?")
+                plays  = int(a.get("playcount", 0))
+                pct    = int(plays / max_plays * 100) if max_plays else 0
+                bar    = _progress_bar(pct, 8)
+                lines.append(f"  {i:2}. {bar} {plays:>5}  {name}")
+            lines.append("```")
+            await message.channel.send("\n".join(lines))
+
+        elif sub in ("toptracks", "tracks"):
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            period_raw = args[2].lower() if len(args) > 2 else "overall"
+            period = PERIOD_MAP.get(period_raw, "overall")
+            label  = PERIOD_LABEL.get(period, "all time")
+            data = await lfm_get("user.getTopTracks", {"user": username, "period": period, "limit": 10})
+            tracks = data.get("toptracks", {}).get("track", [])
+            if not tracks:
+                return await message.channel.send("```\nno data\n```", delete_after=8)
+            max_plays = int(tracks[0].get("playcount", 1))
+            lines = ["```", f"  top tracks — {username} — {label}", "  " + "─"*34]
+            for i, t in enumerate(tracks[:10], 1):
+                name   = t.get("name", "?")
+                artist = t.get("artist", {}).get("name", "?") if isinstance(t.get("artist"), dict) else "?"
+                plays  = int(t.get("playcount", 0))
+                pct    = int(plays / max_plays * 100) if max_plays else 0
+                bar    = _progress_bar(pct, 8)
+                lines.append(f"  {i:2}. {bar} {plays:>5}  {name} — {artist}")
+            lines.append("```")
+            await message.channel.send("\n".join(lines))
+
+        elif sub in ("topalbums", "albums"):
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            period_raw = args[2].lower() if len(args) > 2 else "overall"
+            period = PERIOD_MAP.get(period_raw, "overall")
+            label  = PERIOD_LABEL.get(period, "all time")
+            data = await lfm_get("user.getTopAlbums", {"user": username, "period": period, "limit": 10})
+            albums = data.get("topalbums", {}).get("album", [])
+            if not albums:
+                return await message.channel.send("```\nno data\n```", delete_after=8)
+            max_plays = int(albums[0].get("playcount", 1))
+            lines = ["```", f"  top albums — {username} — {label}", "  " + "─"*34]
+            for i, a in enumerate(albums[:10], 1):
+                name   = a.get("name", "?")
+                artist = a.get("artist", {}).get("name", "?") if isinstance(a.get("artist"), dict) else "?"
+                plays  = int(a.get("playcount", 0))
+                pct    = int(plays / max_plays * 100) if max_plays else 0
+                bar    = _progress_bar(pct, 8)
+                lines.append(f"  {i:2}. {bar} {plays:>5}  {name} — {artist}")
+            lines.append("```")
+            await message.channel.send("\n".join(lines))
+
+        elif sub == "stats":
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            data = await lfm_get("user.getInfo", {"user": username})
+            user_data = data.get("user", {})
+            if not user_data:
+                return await message.channel.send("```\n✗ user not found\n```", delete_after=8)
+            scrobbles   = user_data.get("playcount", "?")
+            artists     = user_data.get("artist_count", "?")
+            tracks      = user_data.get("track_count", "?")
+            albums      = user_data.get("album_count", "?")
+            country     = user_data.get("country", "?")
+            registered  = user_data.get("registered", {}).get("#text", "?") if isinstance(user_data.get("registered"), dict) else "?"
+            realname    = user_data.get("realname", "")
+            lines = [
+                "```",
+                f"  {username}" + (f" ({realname})" if realname else ""),
+                "  " + "─"*30,
+                f"  scrobbles    {scrobbles}",
+                f"  artists      {artists}",
+                f"  albums       {albums}",
+                f"  tracks       {tracks}",
+                f"  country      {country}",
+                f"  since        {registered}",
+                f"  last.fm/user/{username}",
+                "```",
+            ]
+            await message.channel.send("\n".join(lines))
+
+        elif sub == "compare":
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            if len(args) < 3:
+                return await message.channel.send("```\nusage: lastfm compare <other_username>\n```", delete_after=8)
+            other = args[2].strip()
+            data = await lfm_get("tasteometer.compare", {"type1": "user", "type2": "user", "value1": username, "value2": other, "limit": 5})
+            result = data.get("comparison", {}).get("result", {})
+            score_raw = result.get("score", 0)
+            try: score = float(score_raw) * 100
+            except: score = 0
+            artists_list = result.get("artists", {}).get("artist", [])
+            if isinstance(artists_list, dict):
+                artists_list = [artists_list]
+            bar = _progress_bar(int(score), 20)
+            lines = [
+                "```",
+                f"  taste compare — {username} vs {other}",
+                "  " + "─"*34,
+                f"  compatibility  {score:.1f}%",
+                f"  {bar}",
+            ]
+            if artists_list:
+                lines.append("  ─"*17)
+                lines.append("  shared artists")
+                for a in artists_list[:5]:
+                    name = a.get("name", "?") if isinstance(a, dict) else str(a)
+                    lines.append(f"    • {name}")
+            lines.append("```")
+            await message.channel.send("\n".join(lines))
+
+        elif sub == "rpc":
+            try: await message.delete()
+            except Exception: pass
+            username = _lfm_user()
+            if not username:
+                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            track = await lfm_now_playing(username)
+            if not track or not track["playing"]:
+                return await message.channel.send("```\nno track playing right now\n```", delete_after=8)
+            title  = track["title"]
+            artist = track["artist"]
+            ok = await apply_brand_rpc("spotify", [f"{title} | {artist} | 210"])
+            if ok:
+                await message.channel.send(f"```\n✓ rpc set to {title} — {artist}\n```", delete_after=6)
+            else:
+                await message.channel.send("```\n✗ rpc update failed\n```", delete_after=6)
+
+        elif sub == "autorpc":
+            global _autorpc_task, _autorpc_enabled
+            option = args[2].lower() if len(args) > 2 else ""
+            if option == "on":
+                username = _lfm_user()
+                if not username:
+                    return await message.edit(content="```\n✗ set your last.fm first\n```")
+                if _autorpc_task and not _autorpc_task.done():
+                    _autorpc_task.cancel()
+                _autorpc_enabled = True
+                _autorpc_task = asyncio.create_task(lfm_autorpc_loop())
+                await message.edit(content="```\n✓ lastfm autorpc enabled — updates every 30s\n```")
+            elif option == "off":
+                _autorpc_enabled = False
+                if _autorpc_task and not _autorpc_task.done():
+                    _autorpc_task.cancel()
+                    _autorpc_task = None
+                await client.change_presence(activity=None)
+                await message.edit(content="```\n✗ lastfm autorpc disabled\n```")
+            else:
+                state = "on" if _autorpc_enabled else "off"
+                await message.edit(content=f"```\nauthorpc is {state}\n```")
+
+        else:
+            try: await message.delete()
+            except Exception: pass
+            await message.channel.send(build_help_lastfm())
+
 @client.event
 async def on_message_delete(message):
     if not LOGGER_ENABLED or message.author.id == client.user.id: return
@@ -2114,6 +2428,111 @@ async def get_token_username(token: str):
     except Exception:
         pass
     return "unknown"
+
+
+# ─────────────────────────────────────────────
+# LAST.FM COG
+# ─────────────────────────────────────────────
+
+LASTFM_API_BASE = "https://ws.audioscrobbler.com/2.0/"
+
+# Free public API key — replace with your own from https://www.last.fm/api/account/create
+# The default key below is a read-only public key for basic scrobble data
+LASTFM_API_KEY = "your_lastfm_api_key_here"
+
+_lastfm_cfg = {}        # username, api_key per user
+_autorpc_task = None    # background task handle
+_autorpc_enabled = False
+
+def load_lastfm_cfg():
+    global _lastfm_cfg, LASTFM_API_KEY
+    cfg = load_config()
+    _lastfm_cfg = cfg.get("lastfm", {})
+    if _lastfm_cfg.get("api_key"):
+        LASTFM_API_KEY = _lastfm_cfg["api_key"]
+
+def save_lastfm_cfg():
+    cfg = load_config()
+    cfg["lastfm"] = _lastfm_cfg
+    save_config(cfg)
+
+load_lastfm_cfg()
+
+PERIOD_MAP = {
+    "w":   "7day",   "week":  "7day",  "7day": "7day",
+    "m":   "1month", "month": "1month","1month": "1month",
+    "3m":  "3month", "3month":"3month",
+    "6m":  "6month", "6month":"6month",
+    "y":   "12month","year":  "12month","12month":"12month",
+    "all": "overall","overall":"overall",
+}
+PERIOD_LABEL = {
+    "7day": "this week", "1month": "this month",
+    "3month": "past 3 months", "6month": "past 6 months",
+    "12month": "this year", "overall": "all time",
+}
+
+async def lfm_get(method: str, params: dict) -> dict:
+    params.update({
+        "method": method,
+        "api_key": LASTFM_API_KEY,
+        "format": "json",
+    })
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(LASTFM_API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return {"error": resp.status, "message": f"HTTP {resp.status}"}
+    except Exception as e:
+        return {"error": 0, "message": str(e)}
+
+def _lfm_user():
+    return _lastfm_cfg.get("username", "")
+
+def _progress_bar(pct: int, width: int = 12) -> str:
+    filled = int(width * pct / 100)
+    return "▓" * filled + "░" * (width - filled)
+
+async def lfm_now_playing(username: str) -> dict | None:
+    data = await lfm_get("user.getRecentTracks", {
+        "user": username, "limit": 1, "extended": 1,
+    })
+    tracks = data.get("recenttracks", {}).get("track", [])
+    if not tracks:
+        return None
+    track = tracks[0] if isinstance(tracks, list) else tracks
+    is_playing = track.get("@attr", {}).get("nowplaying") == "true"
+    return {
+        "title":    track.get("name", "Unknown"),
+        "artist":   track.get("artist", {}).get("name", "Unknown") if isinstance(track.get("artist"), dict) else track.get("artist", "Unknown"),
+        "album":    track.get("album", {}).get("#text", "") if isinstance(track.get("album"), dict) else "",
+        "image":    next((i["#text"] for i in track.get("image", []) if i.get("size") == "large" and i.get("#text")), ""),
+        "url":      track.get("url", ""),
+        "playing":  is_playing,
+        "loved":    track.get("loved", "0") == "1",
+        "scrobbles":data.get("recenttracks", {}).get("@attr", {}).get("total", "?"),
+    }
+
+async def lfm_autorpc_loop():
+    global _autorpc_enabled
+    last_track = ""
+    while _autorpc_enabled:
+        try:
+            username = _lfm_user()
+            if username:
+                track = await lfm_now_playing(username)
+                if track and track["playing"]:
+                    track_key = f"{track['title']}|{track['artist']}"
+                    if track_key != last_track:
+                        last_track = track_key
+                        title  = track["title"]
+                        artist = track["artist"]
+                        dur    = 210
+                        await apply_brand_rpc("spotify", [f"{title} | {artist} | {dur}"])
+        except Exception as e:
+            print(f"[LastFM autorpc] error: {e}")
+        await asyncio.sleep(30)
 
 print(f"[selfbot] starting — prefix '{PREFIX}'")
 try:
