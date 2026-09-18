@@ -58,7 +58,7 @@ AUTOQUEST_ENABLED = (
 LOG_FILE       = "message_log.txt"
 AUTO_RESPONSES = {}
 SNIPER_ENABLED = True
-LOGGER_ENABLED = False
+LOGGER_ENABLED = True
 
 # ─────────────────────────────────────────────
 # UI HELPERS — discord markdown (mobile + desktop safe)
