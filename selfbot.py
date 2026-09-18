@@ -1408,9 +1408,25 @@ async def on_message(message):
         count = min(int(args[1]), 20)
         text = " ".join(args[2:])
         await message.delete()
+
+        async def _send():
+            while True:
+                try:
+                    await message.channel.send(text)
+                    return
+                except discord.HTTPException as e:
+                    if getattr(e, 'status', None) == 429:
+                        # Wait exactly as long as Discord asks, then retry this message
+                        await asyncio.sleep(getattr(e, 'retry_after', 2.0))
+                        continue
+                    # Any other HTTP error: bail out so we don't infinite-loop
+                    return
+                except Exception:
+                    return
+
         for _ in range(count):
-            await message.channel.send(text)
-            await asyncio.sleep(1)
+            await _send()
+            await asyncio.sleep(0.3)
 
     elif cmd == "purge":
         limit = int(args[1]) if len(args) > 1 else 5
