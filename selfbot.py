@@ -58,7 +58,7 @@ AUTOQUEST_ENABLED = (
 LOG_FILE       = "message_log.txt"
 AUTO_RESPONSES = {}
 SNIPER_ENABLED = True
-LOGGER_ENABLED = True
+LOGGER_ENABLED = False
 
 # ─────────────────────────────────────────────
 # UI HELPERS — discord markdown (mobile + desktop safe)
@@ -1094,7 +1094,7 @@ async def snipe_nitro(code, channel_id):
 def build_help_root():
     p = PREFIX
     return (
-        f"> **sy's selfbot**\n"
+        f"> **Lunar X selfbot**\n"
         f"```\n"
         f"────────────────────────────────────\n"
         f"  categories\n"
@@ -1111,7 +1111,7 @@ def build_help_root():
         f"────────────────────────────────────\n"
         f"  {p}help <category> for commands\n"
         f"────────────────────────────────────\n"
-        f"  sy | ver 1.0.0\n"
+        f"  Hade&Sy | ver 1.0.0\n"
         f"```"
     )
 
@@ -1145,6 +1145,8 @@ def build_help_general():
         f"  {p}hypesquad off           remove hypesquad badge\n"
         f"```"
     )
+
+
 
 def build_help_rpc():
     p = PREFIX
@@ -1426,7 +1428,7 @@ async def on_message(message):
 
         for _ in range(count):
             await _send()
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
 
     elif cmd == "purge":
         limit = int(args[1]) if len(args) > 1 else 5
@@ -1571,6 +1573,7 @@ async def on_message(message):
             await message.edit(content=ansi("\n".join(lines)))
         else:
             await message.edit(content=ansi(f"{RD}✗  unknown subcommand: {sub}{R}"))
+    
 
     # ── QUESTS ──
     elif cmd == "quest":
