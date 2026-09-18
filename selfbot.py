@@ -1,4 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
+# sy's selfbot — full rewrite
 
 import discord
 import asyncio
@@ -8,8 +9,13 @@ import os
 import sys
 import re
 import base64
-import datetime as dt
+import io
+import math
+import random
+import string
+import hashlib
 import configparser
+import datetime as dt
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
@@ -37,615 +43,595 @@ def save_config(cfg):
         print(f"[Config] save error: {e}")
 
 _cfg = load_config()
+
 TOKEN = (
     os.environ.get("TOKEN", "").strip()
     or os.environ.get("DISCORD_TOKEN", "").strip()
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[selfbot] token loaded: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else '(short)'}")
+print(f"[selfbot] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
-    print("[FATAL] No token found. Set TOKEN env var or put it in config.json")
+    print("[FATAL] No token. Set TOKEN env var or config.json")
     sys.exit(1)
 
-PREFIX         = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-AUTOQUEST_ENABLED = (
-    os.environ.get("AUTOQUEST", "").lower() in ("1", "true", "yes")
-    or _cfg.get("autoquest_enabled", False)
-)
-
-LOG_FILE       = "message_log.txt"
-AUTO_RESPONSES = {}
-SNIPER_ENABLED = True
-LOGGER_ENABLED = True
+PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
+VERSION = "1.0.0"
+LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
-# UI HELPERS — discord markdown (mobile + desktop safe)
+# UI HELPER — ascii_helper style > ```ansi blocks
 # ─────────────────────────────────────────────
 
-# Discord markdown tokens used in responses
-R  = ""; B  = "**"; DIM= ""
-CY = ""; GR = ""; YE = ""
-RD = ""; BL = ""; MG = ""; WH = ""
+ESC = "\x1b"
+RESET   = f"{ESC}[0m"
+GREY    = f"{ESC}[2;37m"
+WHITE   = f"{ESC}[1;37m"
+CYAN    = f"{ESC}[36m"
+GREEN   = f"{ESC}[32m"
+YELLOW  = f"{ESC}[33m"
+RED     = f"{ESC}[31m"
+BLUE    = f"{ESC}[34m"
+MAGENTA = f"{ESC}[35m"
+DIM     = f"{ESC}[2m"
 
-def ansi(text):
-    """For command responses — just return text stripped of any escape codes."""
-    import re as _re
-    clean = _re.sub(r'\x1b\[[0-9;]*m', '', text)
-    # strip leftover empty bold markers
-    clean = clean.replace("****", "")
-    return clean.strip()
+def _ansi_block(lines: list[str]) -> str:
+    result = "> ```ansi\n"
+    for line in lines:
+        if line.strip() == "":
+            result += "> \n"
+        else:
+            result += f"> {line}\n"
+    result += "> ```"
+    # clean empty quote lines
+    cleaned = []
+    for l in result.split("\n"):
+        if re.match(r'^>\s*$', l):
+            continue
+        cleaned.append(l)
+    return "\n".join(cleaned)
 
-def _box(lines):
-    return "```\n" + "\n".join(lines) + "\n```"
+def ui_box(title: str, rows: list[str], footer: str = "") -> str:
+    bar = f"{GREY}{'─' * 40}{RESET}"
+    lines = [bar, f"{WHITE}{title}{RESET}", bar]
+    for row in rows:
+        lines.append(row)
+    if footer:
+        lines.append(bar)
+        lines.append(f"{GREY}{footer}{RESET}")
+    lines.append(bar)
+    return _ansi_block(lines)
 
-def help_header(title, subtitle=""):
-    bar = "─" * 36
-    t = f"> {title.lower()}"
-    if subtitle:
-        t += f"  {subtitle}"
-    return f"{bar}\n{t}\n{bar}"
+def ui_row(cmd: str, desc: str) -> str:
+    return f"  {GREY}├{RESET} {WHITE}{cmd}{RESET}  {DIM}{desc}{RESET}"
 
-def help_row(cmd, desc, indent=0):
-    pad = "  " * indent
-    return f"{pad}├ {cmd}  —  {desc}"
+def ui_section(name: str) -> str:
+    return f"\n  {YELLOW}[{name}]{RESET}"
 
-def help_section(name):
-    return f"\n  [{name}]"
+def ui_ok(msg: str) -> str:
+    return _ansi_block([f"  {GREEN}✓{RESET}  {msg}"])
+
+def ui_err(msg: str) -> str:
+    return _ansi_block([f"  {RED}✗{RESET}  {msg}"])
+
+def ui_info(msg: str) -> str:
+    return _ansi_block([f"  {CYAN}•{RESET}  {msg}"])
+
+def ui_warn(msg: str) -> str:
+    return _ansi_block([f"  {YELLOW}!{RESET}  {msg}"])
+
+def ui_progress(label: str, pct: int) -> str:
+    filled = int(pct / 10)
+    bar = f"{GREEN}{'█' * filled}{GREY}{'░' * (10 - filled)}{RESET}"
+    return f"  {bar} {WHITE}{pct}%{RESET}  {DIM}{label}{RESET}"
 
 # ─────────────────────────────────────────────
-# PLATFORM SPOOFER
+# PAGINATED HELP SYSTEM
 # ─────────────────────────────────────────────
 
-PLATFORM_MAP = {
-    "phone":     {"os": "iOS", "browser": "Discord iOS"},
-    "android":   {"os": "Android", "browser": "Discord Android"},
-    "desktop":   {"os": "Windows", "browser": "Discord Client"},
-    "web":       {"os": "Windows", "browser": "Chrome"},
-    "console":   {"os": "PlayStation 4", "browser": "Discord Embedded"},
-    "xbox":      {"os": "Xbox One", "browser": "Discord Embedded"},
-    "playstation": {"os": "PlayStation 4", "browser": "Discord Embedded"},
-    "vr":        {"os": "Windows", "browser": "Discord Embedded"},
+PAGE_SIZE = 8   # rows per help page
+
+def _paginate(title: str, subtitle: str, rows: list[str], page: int = 1) -> str:
+    total_pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * PAGE_SIZE
+    chunk = rows[start:start + PAGE_SIZE]
+    bar = f"{GREY}{'─' * 40}{RESET}"
+    header = f"{WHITE}> {title}{RESET}  {DIM}{subtitle}{RESET}"
+    footer = f"{DIM}page {page}/{total_pages}  •  {PREFIX}help {title.lower()} {page + 1 if page < total_pages else 1} to flip{RESET}"
+    lines = [bar, header, bar, *chunk, bar, footer, bar]
+    return _ansi_block(lines)
+
+# All help sections: name → list of (cmd, desc)
+HELP_DATA: dict[str, list[tuple]] = {
+    "general": [
+        ("ping",              "latency check"),
+        ("info",              "account snapshot"),
+        ("say <text>",        "replace command with text"),
+        ("spam <n> <text>",   "blast n messages fast"),
+        ("purge [n]",         "delete your last n messages"),
+        ("clear",             "delete command message"),
+        ("copycat <id>",      "mirror next 10 msgs from user"),
+        ("status <text>",     "set custom status"),
+        ("status clear",      "clear status"),
+        ("platform <type>",   "spoof gateway platform"),
+        ("platform off",      "reset platform to desktop"),
+        ("hypesquad <house>", "set hypesquad house"),
+        ("hypesquad off",     "remove hypesquad badge"),
+    ],
+    "rpc": [
+        ("rpc enable",                        "turn on rich presence"),
+        ("rpc disable / stop / clear",        "clear rich presence"),
+        ("rpc status",                        "show current rpc config"),
+        ("rpc type",                          "playing/streaming/watching/listening/competing"),
+        ("rpc name",                          "activity name"),
+        ("rpc details",                       "details line"),
+        ("rpc state",                         "state line"),
+        ("rpc url",                           "streaming url"),
+        ("rpc start / end",                   "timestamps (unix/MM:SS/none)"),
+        ("rpc large_image <url>",             "large image (discord cdn url)"),
+        ("rpc large_text",                    "large image hover text"),
+        ("rpc small_image <url>",             "small image (discord cdn url)"),
+        ("rpc small_text",                    "small image hover text"),
+        ("rpc button1/2_name/url",            "rpc buttons"),
+        ("rpc party enable/disable/current/max", "party config"),
+        ("rpc spotify <title> | <artist> | <secs>", "spotify brand rpc"),
+        ("rpc youtube <video> | <channel> | <secs>", "youtube brand rpc"),
+        ("rpc xbox <game>",                   "xbox brand rpc"),
+        ("rpc playstation <game>",            "playstation brand rpc"),
+        ("rpc crunchyroll <anime> | <ep>",    "crunchyroll brand rpc"),
+        ("rpc roblox <game> | <details>",     "roblox brand rpc"),
+        ("rpc custom <name> | <details> | <state>", "custom rpc"),
+    ],
+    "quests": [
+        ("quest",               "list active quests + progress"),
+        ("questrun <index>",    "solve specific quest"),
+        ("questall",            "solve all quests at once (fast)"),
+        ("autoquest on/off",    "auto-run quests on startup"),
+        ("autoclaim on/off",    "auto-claim completed quests"),
+        ("orbbadge",            "claim orb badge"),
+        ("captcha set <key>",   "set 2captcha api key"),
+    ],
+    "sniper": [
+        ("sniper on/off",   "toggle nitro gift sniper"),
+        ("logger on/off",   "toggle message logger"),
+        ("readlog [n]",     "read last n log lines"),
+    ],
+    "ar": [
+        ("ar add <trigger> | <response>", "add auto-response"),
+        ("ar remove <trigger>",           "remove auto-response"),
+        ("ar list",                       "list all auto-responses"),
+    ],
+    "voice": [
+        ("vcjoin [ch_id]",           "join a voice channel"),
+        ("vcleave",                  "leave voice channel"),
+        ("vcmute <user_id>",         "server mute user"),
+        ("vcunmute <user_id>",       "server unmute user"),
+        ("vcdeafen <user_id>",       "server deafen user"),
+        ("vcundeafen <user_id>",     "server undeafen user"),
+        ("vckick <user_id>",         "kick user from vc"),
+        ("vcmove <user> <ch_id>",    "move user to channel"),
+        ("vcmoveall <ch1> <ch2>",    "move all users ch1 → ch2"),
+    ],
+    "fun": [
+        ("gayrate [user_id]",     "gay percentage"),
+        ("feed <user_id>",        "feed a user"),
+        ("tickle <user_id>",      "tickle a user"),
+        ("slap <user_id>",        "slap a user"),
+        ("hug <user_id>",         "hug a user"),
+        ("cuddle <user_id>",      "cuddle a user"),
+        ("pat <user_id>",         "pat a user"),
+        ("kiss <user_id>",        "kiss a user"),
+        ("poke <user_id>",        "poke a user"),
+        ("wink <user_id>",        "wink at a user"),
+        ("smug <user_id>",        "smug at a user"),
+        ("boop <user_id>",        "boop a user"),
+        ("nom <user_id>",         "nom a user"),
+        ("mimic <user_id>",       "mirror user's messages"),
+        ("unmimic <user_id>",     "stop mimicking user"),
+        ("stopmimic",             "stop all mimics"),
+        ("meme",                  "random meme"),
+        ("joke",                  "random joke"),
+    ],
+    "tools": [
+        ("nitro",                "generate random nitro url"),
+        ("applybypass <invite>", "bypass apply-to-join"),
+        ("tokeninfo <token>",    "decode a discord token"),
+        ("calculate <expr>",     "evaluate math expression"),
+        ("fact",                 "random useless fact"),
+        ("fetchlyrics <artist - title>", "fetch song lyrics"),
+        ("robuxtax <amount>",    "roblox marketplace fee calc"),
+        ("archivechannel [ch_id]", "save channel messages to txt"),
+    ],
+    "host": [
+        ("host add <token>",        "add account to host list"),
+        ("host remove <token>",     "remove from host list"),
+        ("host list",               "list hosted accounts"),
+        ("host broadcast <msg>",    "send msg from all hosted accounts"),
+        ("host say <idx> <msg>",    "force hosted account to say something"),
+    ],
+    "lastfm": [
+        ("lastfm set <user> [key]",       "link your last.fm account"),
+        ("lastfm np",                     "now playing track"),
+        ("lastfm recent [n]",             "last n scrobbles"),
+        ("lastfm topartists [w/m/y/all]", "top artists"),
+        ("lastfm toptracks [w/m/y/all]",  "top tracks"),
+        ("lastfm topalbums [w/m/y/all]",  "top albums"),
+        ("lastfm stats",                  "scrobble count & stats"),
+        ("lastfm compare <user>",         "taste compatibility"),
+        ("lastfm rpc",                    "set rpc to now playing"),
+        ("lastfm autorpc on/off",         "auto-update rpc with scrobbles"),
+    ],
+    "settings": [
+        ("prefix <new>",         "change command prefix"),
+        ("version",              "show selfbot version"),
+        ("reload",               "reload config from disk"),
+    ],
+    "developer": [
+        ("host say <idx> <msg>",     "force hosted account to say"),
+        ("host broadcast <msg>",     "broadcast from all accounts"),
+        ("logs [n]",                 "tail railway / selfbot console"),
+        ("eval <code>",              "evaluate python code"),
+        ("restart",                  "restart the selfbot process"),
+    ],
+    "server": [
+        ("serverinfo",               "current server info"),
+        ("members [n]",              "list server members"),
+        ("channels",                 "list server channels"),
+        ("roles",                    "list server roles"),
+        ("ban <user_id> [reason]",   "ban a user"),
+        ("kick <user_id> [reason]",  "kick a user"),
+        ("mute <user_id>",           "timeout a user (10 min)"),
+        ("unmute <user_id>",         "remove timeout"),
+        ("createrole <name>",        "create a role"),
+        ("delrole <role_id>",        "delete a role"),
+        ("createchannel <name>",     "create a text channel"),
+        ("deletechannel <ch_id>",    "delete a channel"),
+        ("setnick <user> <nick>",    "set a member's nickname"),
+        ("topic <text>",             "set channel topic"),
+        ("slowmode <seconds>",       "set channel slowmode"),
+    ],
+    "information": [
+        ("userinfo [user_id]",      "discord user lookup"),
+        ("avatar [user_id]",        "get user avatar"),
+        ("serverinfo",              "server details"),
+        ("channelinfo [ch_id]",     "channel details"),
+        ("roleinfo <role_id>",      "role details"),
+        ("checkname <username>",    "check if discord username is taken"),
+        ("whois <user_id>",         "full user profile dump"),
+    ],
+    "groupchat": [
+        ("gclist",                      "list your group DMs"),
+        ("gccreate <user1> [user2...]", "create a group DM"),
+        ("gcrename <name>",             "rename current group DM"),
+        ("gcicon <url>",                "set group DM icon"),
+        ("gcleave",                     "leave current group DM"),
+        ("gcadd <user_id>",             "add user to group DM"),
+        ("gcremove <user_id>",          "remove user from group DM"),
+        ("agc on/off",                  "anti gc-trap toggle"),
+        ("agc block on/off",            "auto-block gc-trap owner"),
+        ("agc msg <text>",              "set leave message"),
+        ("agc name <text>",             "set gc rename on trap"),
+        ("agc icon <url>",              "set gc icon on trap"),
+        ("agc webhook <url>",           "set webhook for trap alerts"),
+        ("agc whitelist <user_id>",     "whitelist a user from agc"),
+        ("agc unwhitelist <user_id>",   "remove from agc whitelist"),
+        ("agc wllist",                  "show agc whitelist"),
+    ],
+    "utility": [
+        ("uwuify <text>",           "uwuify text"),
+        ("owoify <text>",           "owoify text"),
+        ("mock <text>",             "spongebob mock case"),
+        ("reverse <text>",          "reverse text"),
+        ("aesthetic <text>",        "full-width text"),
+        ("clap <text>",             "👏 add 👏 claps"),
+        ("animatetype <text>",      "type message character-by-character"),
+        ("checkname <username>",    "check if username is available"),
+        ("autoreact <emoji>",       "auto-react to your own messages"),
+        ("autoreactstop",           "stop auto-reacting"),
+        ("typing",                  "start continuous typing indicator"),
+        ("typingstop",              "stop typing indicator"),
+        ("afk [msg]",               "set AFK auto-reply"),
+        ("afkstop",                 "disable AFK"),
+        ("translate <lang> <text>", "translate text"),
+        ("ghostping <user_id>",     "ghost ping a user"),
+        ("pin <msg_id>",            "pin a message"),
+        ("unpin <msg_id>",          "unpin a message"),
+        ("therapy",                 "random therapy response"),
+        ("ragebait",                "random ragebait"),
+        ("purgeall",                "delete all your msgs in channel"),
+        ("firstmessage",            "get first message in channel"),
+    ],
+    "tracking": [
+        ("track <user_id>",       "track a user's messages in channel"),
+        ("untrack <user_id>",     "stop tracking user"),
+        ("tracklist",             "list tracked users"),
+        ("history <user_id>",     "show tracked message history"),
+    ],
+    "downloads": [
+        ("yt <url>",             "download youtube video"),
+        ("ytaudio <url>",        "download youtube audio"),
+        ("tiktok <url>",         "download tiktok video"),
+        ("instagram <url>",      "download instagram post"),
+    ],
+    "social": [
+        ("addfriend <user_id>",      "send friend request"),
+        ("removefriend <user_id>",   "remove friend"),
+        ("block <user_id>",          "block user"),
+        ("unblock <user_id>",        "unblock user"),
+        ("friends",                  "list all friends"),
+        ("blocked",                  "list blocked users"),
+        ("pending",                  "show pending friend requests"),
+        ("clearincoming",            "decline all incoming requests"),
+        ("clearoutgoing",            "cancel all outgoing requests"),
+        ("friendcount",              "friend / block / pending counts"),
+        ("closedms",                 "close all DM channels"),
+        ("readdms",                  "mark all DMs as read"),
+        ("note <user_id> <text>",    "set note on user"),
+        ("autoaddback on/off",       "auto-accept friend requests"),
+    ],
+    "auto": [
+        ("giveaway on/off",          "auto-enter giveaways"),
+        ("nitrosniper on/off",       "auto-redeem nitro gift codes"),
+        ("autoreact <emoji>",        "auto-react to your own messages"),
+        ("autoreactstop",            "stop auto-react"),
+        ("autoaddback on/off",       "auto-accept friend requests"),
+        ("vsniper add <code> <gid>", "add vanity url to watch list"),
+        ("vsniper start/stop/list",  "vanity sniper control"),
+    ],
+    "profile": [
+        ("setpfp <url>",         "set profile picture from url"),
+        ("setbio <text>",        "set profile bio"),
+        ("setbanner <url>",      "set profile banner"),
+        ("myprofile",            "show your own profile info"),
+        ("accountbackup",        "backup account to JSON"),
+    ],
+    "status": [
+        ("setstatus <text>",                    "set custom status text"),
+        ("setstatus <emoji>, <text>",           "set status with emoji"),
+        ("setstatus <:name:id>, <text>",        "set status with custom emoji"),
+        ("clearstatus",                         "clear your custom status"),
+        ("stealstatus <user_id>",               "copy a user's custom status"),
+        ("statushistory",                        "show your recent status history"),
+    ],
 }
 
-_current_platform = "desktop"
+def build_help_root(page: int = 1) -> str:
+    categories = list(HELP_DATA.keys())
+    total_pages = max(1, math.ceil(len(categories) / 10))
+    page = max(1, min(page, total_pages))
+    chunk = categories[(page - 1) * 10 : page * 10]
+    bar = f"{GREY}{'─' * 40}{RESET}"
+    lines = [
+        bar,
+        f"{WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}",
+        bar,
+        f"  {GREY}categories{RESET}",
+        bar,
+    ]
+    for cat in chunk:
+        desc_map = {
+            "general": "utilities, platform & status",
+            "rpc": "rich presence & brands",
+            "quests": "quest completer & orb badge",
+            "sniper": "nitro sniper & logger",
+            "ar": "auto-responder",
+            "voice": "voice channel controls",
+            "fun": "fun & roleplay commands",
+            "tools": "tools & generators",
+            "host": "multi-account hosting",
+            "lastfm": "last.fm integration",
+            "settings": "prefix & selfbot config",
+            "developer": "dev tools & console",
+            "server": "server management",
+            "information": "user & server lookup",
+            "groupchat": "group dm & anti-gc",
+            "utility": "uwuify, afk, translate & misc",
+            "tracking": "message & profile tracking",
+            "downloads": "media downloader",
+            "social": "friends & social management",
+            "auto": "automation & snipers",
+            "profile": "account & profile management",
+            "status": "custom status management",
+        }
+        desc = desc_map.get(cat, "commands")
+        lines.append(f"  {CYAN}{cat:<14}{RESET}  {DIM}{desc}{RESET}")
+    lines.append(bar)
+    lines.append(f"  {DIM}{PREFIX}help <category> [page]  •  page {page}/{total_pages}{RESET}")
+    lines.append(f"  {DIM}sy | ver {VERSION}{RESET}")
+    lines.append(bar)
+    return _ansi_block(lines)
+
+def build_help_section(cat: str, page: int = 1) -> str:
+    if cat not in HELP_DATA:
+        return ui_err(f"unknown category: {cat}  —  use {PREFIX}help")
+    rows_raw = HELP_DATA[cat]
+    total_pages = max(1, math.ceil(len(rows_raw) / PAGE_SIZE))
+    page = max(1, min(page, total_pages))
+    chunk = rows_raw[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
+    bar = f"{GREY}{'─' * 40}{RESET}"
+    lines = [
+        bar,
+        f"{WHITE}> {cat}{RESET}  {DIM}{HELP_DATA[cat][0][1] if HELP_DATA[cat] else ''}{RESET}",
+        bar,
+    ]
+    for cmd, desc in chunk:
+        lines.append(f"  {GREY}├{RESET} {WHITE}{PREFIX}{cmd}{RESET}  {DIM}{desc}{RESET}")
+    lines.append(bar)
+    lines.append(f"  {DIM}page {page}/{total_pages}  •  {PREFIX}h {cat} {(page % total_pages) + 1}{RESET}")
+    lines.append(bar)
+    return _ansi_block(lines)
 
 # ─────────────────────────────────────────────
-# HYPESQUAD
+# STATE / GLOBALS
 # ─────────────────────────────────────────────
 
-HOUSE_NAMES = {1: "Bravery", 2: "Brilliance", 3: "Balance"}
-HOUSE_IDS   = {"bravery": 1, "brilliance": 2, "balance": 3}
+client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
 
-async def change_hypesquad(session, token, house_id):
-    url = "https://discord.com/api/v9/hypesquad/online"
-    headers = {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    try:
-        async with session.post(url, headers=headers, json={"house_id": house_id}) as resp:
-            if resp.status in (200, 201, 204):
-                return True, HOUSE_NAMES[house_id]
-            text = await resp.text()
-            try:
-                data = json.loads(text)
-                return False, data.get("message", f"HTTP {resp.status}")
-            except Exception:
-                return False, f"HTTP {resp.status}"
-    except Exception as e:
-        return False, str(e)
-
-async def remove_hypesquad(session, token):
-    url = "https://discord.com/api/v9/hypesquad/online"
-    headers = {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
-    try:
-        async with session.delete(url, headers=headers) as resp:
-            if resp.status in (200, 201, 204):
-                return True, "removed"
-            text = await resp.text()
-            try:
-                data = json.loads(text)
-                return False, data.get("message", f"HTTP {resp.status}")
-            except Exception:
-                return False, f"HTTP {resp.status}"
-    except Exception as e:
-        return False, str(e)
-
-
-async def set_platform(platform: str):
-    """Change the gateway identify properties to spoof platform."""
-    global _current_platform
-    props = PLATFORM_MAP.get(platform.lower())
-    if not props:
-        return False
-
-    _current_platform = platform.lower()
-
-    # discord.py-self exposes the websocket; patch the identify properties
-    try:
-        ws = client.ws
-        if ws and hasattr(ws, '_identify'):
-            # Force a re-identify by closing and reconnecting
-            # The properties are baked at IDENTIFY time so we need reconnect
-            pass
-        # Patch the internal identify data on the connection
-        conn = client._connection
-        if hasattr(conn, '_identify'):
-            conn._identify['properties']['$os'] = props['os']
-            conn._identify['properties']['$browser'] = props['browser']
-            conn._identify['properties']['$device'] = props['browser']
-    except Exception as e:
-        print(f"[Platform] patch error: {e}")
-
-    # Easiest reliable method: change presence which re-sends gateway data
-    # The platform indicator is set in the IDENTIFY payload on reconnect
-    # We store it and reconnect the ws
-    try:
-        if client.ws:
-            await client.ws.close(code=4000)  # triggers auto-reconnect with new identify
-    except Exception as e:
-        print(f"[Platform] reconnect error: {e}")
-
-    return True
-
-# Patch the identify payload before connection
-_original_identify = None
-
-async def patched_identify(self, *, resume=False, reconnect=True):
-    global _current_platform
-    props = PLATFORM_MAP.get(_current_platform, PLATFORM_MAP["desktop"])
-    try:
-        data = self._identify if hasattr(self, '_identify') else {}
-        if 'properties' in data:
-            data['properties']['$os'] = props['os']
-            data['properties']['$browser'] = props['browser']
-            data['properties']['$device'] = props['browser']
-    except Exception:
-        pass
-    if _original_identify:
-        return await _original_identify(self, resume=resume, reconnect=reconnect)
+AUTO_RESPONSES:  dict[str, str] = {}
+SNIPER_ENABLED  = True
+LOGGER_ENABLED  = True
+_mimic_dict:    dict[int, list[int]] = {}   # channel_id -> [user_ids]
+_tracking:      dict[int, list[dict]] = {}  # user_id -> [{time, content, channel}]
+_tracked_users: set[int] = set()
+_afk_msg:       str | None = None
+_afk_enabled   = False
+_typing_tasks:  dict[int, asyncio.Task] = {}
+_autoreact_emoji: str | None = None
+_autoaddback   = False
+_giveaway_enabled = False
+_nitrosniper_enabled = True
+_autorpc_enabled = False
+_autorpc_task:  asyncio.Task | None = None
+_captcha_key:   str = ""
+_autoclaim_enabled = False
+_speak_lang:    str | None = None   # auto-translate outgoing
+_vsniper_list:  list[dict] = []     # [{code, guild_id}]
+_vsniper_task:  asyncio.Task | None = None
 
 # ─────────────────────────────────────────────
-# CLIENT
+# AGC STATE (anti group-chat trap)
 # ─────────────────────────────────────────────
 
-client = discord.Client(
-    chunk_guilds_at_startup=False,
-    request_guilds=True,
-)
+_agc_state = {
+    "enabled":     False,
+    "block":       False,
+    "leave_msg":   "lol nice try",
+    "gc_name":     "trap detected",
+    "gc_icon_url": None,
+    "webhook_url": None,
+}
+_agc_whitelist: set[str] = set()
 
-# ─────────────────────────────────────────────
-# RPC CONFIG
-# ─────────────────────────────────────────────
-
-def load_rpc_config():
-    path = "config/rpc_config.json"
-    default = {
-        "enabled": False, "type": "playing", "name": "selfbot",
-        "state": "running", "details": "", "url": "https://twitch.tv/discord",
-        "application_id": None, "large_image": "", "large_text": "",
-        "small_image": "", "small_text": "", "start_timestamp": None,
-        "end_timestamp": None,
-        "party": {"enabled": False, "current": 1, "max": 5},
-        "buttons": [{"label": "", "url": ""}, {"label": "", "url": ""}],
-    }
-    if not os.path.exists(path):
+def _agc_load_wl():
+    global _agc_whitelist
+    path = "config/agc_whitelist.json"
+    if os.path.exists(path):
         try:
-            with open(path, "w") as f:
-                json.dump(default, f, indent=4)
+            with open(path) as f:
+                _agc_whitelist = set(json.load(f))
         except Exception:
-            pass
-        return default
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        for k, v in default.items():
-            if k not in data:
-                data[k] = v
-        return data
-    except Exception:
-        return default
+            _agc_whitelist = set()
 
-def save_rpc_config(cfg):
-    try:
-        with open("config/rpc_config.json", "w") as f:
-            json.dump(cfg, f, indent=4)
-    except Exception as e:
-        print(f"[RPC] save error: {e}")
+def _agc_save_wl():
+    with open("config/agc_whitelist.json", "w") as f:
+        json.dump(list(_agc_whitelist), f)
+
+_agc_load_wl()
 
 # ─────────────────────────────────────────────
-# BRAND RPC PRESETS
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# BRAND RPC — complete rewrite
-# Images use Discord's CDN-proxied URLs via the streaming gateway.
-# The trick: pass image URLs directly as large_image strings —
-# discord.py-self forwards them as-is in the PRESENCE_UPDATE payload.
-# Discord's client renders any https:// URL set in large_image/small_image
-# when the activity has no application_id (or one that supports external assets).
+# HOSTED ACCOUNTS
 # ─────────────────────────────────────────────
 
-# CDN image URLs — hosted on Discord's own CDN or well-known stable CDNs
-_IMG = {
-    "spotify_large":      "https://i.scdn.co/image/ab67616d00001e02ff9ca10b55ce82ae553d50e",
-    "spotify_small":      "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
-    "youtube_large":      "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
-    "youtube_icon":       "https://www.youtube.com/s/desktop/d743f786/img/favicon_144x144.png",
-    "xbox_large":         "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
-    "xbox_icon":          "https://images-eds-ssl.xboxlive.com/image?url=4rt9.lXDC4H_93laV1_eHHFT949fUipzkiFOBH3fAiZZUCdYojwUyX2aTonS1aIwMrx6NUIsHfUHSLzjGJFxxk0j.4kQAE2o4IgKF4tXV8-",
-    "playstation_large":  "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
-    "playstation_icon":   "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Playstation_logo_colour.svg/240px-Playstation_logo_colour.svg.png",
-    "crunchyroll_large":  "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
-    "crunchyroll_icon":   "https://www.crunchyroll.com/build/assets/img/favicons/favicon-96x96.png",
-    "roblox_large":       "https://cdn.discordapp.com/emojis/1090318861818400919.webp?size=96",
-    "roblox_icon":        "https://images.rbxcdn.com/9f33cdedd98d820ee456fc98aed9f5c5-roblox_logo_lightmode.svg",
-}
+HOSTED_TOKENS: list[str] = list(_cfg.get("hosted_tokens", []))
 
-# The most reliable image approach for discord.py-self selfbots:
-# Use application_id from a real registered Discord app that has assets.
-# These are the verified working app IDs with their registered asset names:
-BRAND_APP_IDS = {
-    "spotify":      367827983903490050,
-    "youtube":      880218394199220334,
-    "xbox":         438122941302046720,
-    "roblox":       363445589247131668,
-    "crunchyroll":  1020123345567822899,
-}
+def save_hosted():
+    cfg = load_config()
+    cfg["hosted_tokens"] = HOSTED_TOKENS
+    save_config(cfg)
 
-# Registered asset keys per app (verified from Discord's activity registry)
-BRAND_ASSETS = {
-    "spotify": {
-        "large": "spotify:ab67616d00001e02ff9ca10b55ce82ae553d50e",
-        "small": "spotify:ab6761610000f178049d8eda6f0fd7a34bb0db9",
-    },
-    "youtube": {
-        "large": "youtube_logo",
-        "small": "youtube_logo",
-    },
-    "xbox": {
-        "large": "01_xbox_app_icon",
-        "small": "01_xbox_app_icon",
-    },
-    "roblox": {
-        "large": "roblox",
-        "small": "roblox",
-    },
-    "crunchyroll": {
-        "large": "crunchyroll",
-        "small": "crunchyroll",
-    },
-    "playstation": {
-        "large": "playstation",
-        "small": "playstation",
-    },
-}
-
-BRAND_PRESETS = {
-    "spotify":     {"type": "listening", "name": "Spotify"},
-    "youtube":     {"type": "watching",  "name": "YouTube"},
-    "xbox":        {"type": "playing",   "name": "Xbox"},
-    "playstation": {"type": "playing",   "name": "PlayStation"},
-    "crunchyroll": {"type": "watching",  "name": "Crunchyroll"},
-    "roblox":      {"type": "playing",   "name": "Roblox"},
-    "custom":      {"type": "playing",   "name": ""},
-}
-
-async def apply_brand_rpc(brand: str, user_args: list):
-    """Build and apply a brand RPC. Uses registered app assets for images."""
-    try:
-        from discord.activity import ActivityAssets, ActivityTimestamps
-        from discord import ActivityType, Activity
-    except ImportError as e:
-        print(f"[RPC] import error: {e}")
-        return False
-
-    preset = BRAND_PRESETS.get(brand)
-    if not preset:
-        return False
-
-    type_map = {
-        "playing":   ActivityType.playing,
-        "streaming": ActivityType.streaming,
-        "listening": ActivityType.listening,
-        "watching":  ActivityType.watching,
-        "competing": ActivityType.competing,
-    }
-
-    act_type = type_map.get(preset["type"], ActivityType.playing)
-    now = datetime.now(timezone.utc)
-
-    kwargs = {
-        "type": act_type,
-        "name": preset["name"] or brand.capitalize(),
-    }
-
-    # Set application_id — this is what links asset keys to the right registry
-    app_id = BRAND_APP_IDS.get(brand)
-    if app_id:
-        kwargs["application_id"] = app_id
-
-    # Get asset keys for this brand
-    assets = BRAND_ASSETS.get(brand, {})
-    large_img = assets.get("large", "")
-    small_img = assets.get("small", "")
-
-    def _ts(start=None, end=None):
-        try:
-            kw = {}
-            if start: kw["start"] = start
-            if end:   kw["end"]   = end
-            return ActivityTimestamps(**kw)
-        except Exception:
-            return None
-
-    def _parts(n=3):
-        raw = " ".join(user_args) if user_args else ""
-        p = [x.strip() for x in raw.split("|")]
-        while len(p) < n:
-            p.append("")
-        return p
-
-    assets_kwargs = {}
-
-    if brand == "spotify":
-        p = _parts(3)
-        title  = p[0] or "Unknown"
-        artist = p[1] or "Unknown"
-        try: dur = int(p[2]) if p[2] else 210
-        except ValueError: dur = 210
-        kwargs["details"] = title
-        kwargs["state"]   = artist
-        assets_kwargs = {
-            "large_image": large_img,
-            "large_text":  "Spotify",
-            "small_image": small_img,
-            "small_text":  "Listening on Spotify",
-        }
-        ts = _ts(start=now, end=now + timedelta(seconds=dur))
-        if ts: kwargs["timestamps"] = ts
-
-    elif brand == "youtube":
-        p = _parts(3)
-        video   = p[0] or "Video"
-        channel = p[1] or "Channel"
-        try: dur = int(p[2]) if p[2] else 600
-        except ValueError: dur = 600
-        kwargs["details"] = video
-        kwargs["state"]   = channel
-        assets_kwargs = {
-            "large_image": large_img,
-            "large_text":  channel,
-            "small_image": small_img,
-            "small_text":  "YouTube",
-        }
-        ts = _ts(start=now, end=now + timedelta(seconds=dur))
-        if ts: kwargs["timestamps"] = ts
-
-    elif brand == "xbox":
-        p = _parts(2)
-        game    = p[0] or "Game"
-        details = p[1] or "Playing on Xbox"
-        kwargs["details"] = game
-        kwargs["state"]   = details
-        assets_kwargs = {
-            "large_image": large_img,
-            "large_text":  game,
-            "small_image": small_img,
-            "small_text":  "Xbox",
-        }
-        ts = _ts(start=now)
-        if ts: kwargs["timestamps"] = ts
-
-    elif brand == "playstation":
-        p = _parts(2)
-        game    = p[0] or "Game"
-        details = p[1] or "Playing on PlayStation"
-        kwargs["details"] = game
-        kwargs["state"]   = details
-        # PlayStation has no registered app — use streaming type trick for icon
-        kwargs["type"] = ActivityType.playing
-        assets_kwargs = {
-            "large_image": large_img,
-            "large_text":  game,
-            "small_image": small_img,
-            "small_text":  "PlayStation",
-        }
-        ts = _ts(start=now)
-        if ts: kwargs["timestamps"] = ts
-
-    elif brand == "crunchyroll":
-        p = _parts(3)
-        anime   = p[0] or "Anime"
-        episode = p[1] or ""
-        try: dur = int(p[2]) if p[2] else 1440
-        except ValueError: dur = 1440
-        kwargs["details"] = anime
-        if episode: kwargs["state"] = episode
-        assets_kwargs = {
-            "large_image": large_img,
-            "large_text":  anime,
-            "small_image": small_img,
-            "small_text":  "Crunchyroll",
-        }
-        ts = _ts(start=now, end=now + timedelta(seconds=dur))
-        if ts: kwargs["timestamps"] = ts
-
-    elif brand == "roblox":
-        p = _parts(5)
-        game       = p[0] or "Roblox"
-        details    = p[1] or game
-        state      = p[2] or "Playing on Roblox"
-        large_text = p[3] or game
-        small_text = p[4] or "Roblox"
-        kwargs["name"]    = "Roblox"
-        kwargs["details"] = details
-        kwargs["state"]   = state
-        assets_kwargs = {
-            "large_image": large_img,
-            "large_text":  large_text,
-            "small_image": small_img,
-            "small_text":  small_text,
-        }
-        ts = _ts(start=now)
-        if ts: kwargs["timestamps"] = ts
-
-    elif brand == "custom":
-        p = _parts(3)
-        kwargs["name"]    = p[0] or "Custom"
-        if p[1]: kwargs["details"] = p[1]
-        if p[2]: kwargs["state"]   = p[2]
-        ts = _ts(start=now)
-        if ts: kwargs["timestamps"] = ts
-
-    else:
-        ts = _ts(start=now)
-        if ts: kwargs["timestamps"] = ts
-
-    if assets_kwargs:
-        try:
-            kwargs["assets"] = ActivityAssets(**assets_kwargs)
-        except Exception as e:
-            print(f"[RPC] assets error: {e}")
-
-    try:
-        await client.change_presence(activity=Activity(**kwargs))
-        print(f"[RPC] brand={brand} app_id={app_id} large={large_img}")
-        return True
-    except Exception as e:
-        print(f"[RPC] presence error: {e}")
-        return False
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
+    "Electron/28.2.10 Safari/537.36"
+)
 
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
 
-def log_message(tag: str, content: str):
+def log_msg(tag: str, content: str):
     if not LOGGER_ENABLED:
         return
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] [{tag}] {content}\n"
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {content}"
+    print(line)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
+            f.write(line + "\n")
     except Exception:
         pass
-    print(line, end="")
 
 # ─────────────────────────────────────────────
-# RPC ENGINE
+# RPC CONFIG
 # ─────────────────────────────────────────────
 
-def parse_timestamp(value, is_end=False):
-    if not value:
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(value, tz=timezone.utc)
-        except Exception:
-            return None
-    if isinstance(value, str):
-        value = value.strip()
-        if value.lower() in ("none", ""):
-            return None
-        if value.isdigit():
-            try:
-                return datetime.fromtimestamp(float(value), tz=timezone.utc)
-            except Exception:
-                return None
-        if ":" in value:
-            parts = value.split(":")
-            if len(parts) in (2, 3):
-                try:
-                    delta = (int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])) if len(parts) == 3 else int(parts[0]) * 60 + int(parts[1])
-                    now = datetime.now(timezone.utc)
-                    return now + timedelta(seconds=delta) if is_end else now - timedelta(seconds=delta)
-                except ValueError:
-                    pass
-    return None
+def load_rpc_cfg():
+    path = "config/rpc_config.json"
+    default = {
+        "enabled": False, "type": "playing", "name": "selfbot",
+        "state": "", "details": "", "url": "", "application_id": None,
+        "large_image": "", "large_text": "", "small_image": "", "small_text": "",
+        "start_timestamp": None, "end_timestamp": None,
+        "party": {"enabled": False, "current": 1, "max": 5},
+        "buttons": [{"label": "", "url": ""}, {"label": "", "url": ""}],
+    }
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            json.dump(default, f, indent=4)
+        return default
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        for k, v in default.items():
+            if k not in d:
+                d[k] = v
+        return d
+    except Exception:
+        return default
+
+def save_rpc_cfg(cfg):
+    with open("config/rpc_config.json", "w") as f:
+        json.dump(cfg, f, indent=4)
 
 async def update_rpc():
     try:
-        cfg = load_rpc_config()
-        if not cfg.get("enabled", False):
+        cfg = load_rpc_cfg()
+        if not cfg.get("enabled"):
             await client.change_presence(activity=None)
             return
-        try:
-            from discord.activity import ActivityAssets, ActivityParty, ActivityTimestamps
-            from discord import ActivityButton, ActivityType, Activity
-        except ImportError as e:
-            print(f"[RPC] import error: {e}")
-            return
-
-        type_map = {
-            "playing": ActivityType.playing, "streaming": ActivityType.streaming,
-            "listening": ActivityType.listening, "watching": ActivityType.watching,
-            "competing": ActivityType.competing,
-        }
-        act_type = type_map.get(str(cfg.get("type", "playing")).lower(), ActivityType.playing)
-        kwargs = {"name": cfg.get("name", "selfbot") or "selfbot", "type": act_type}
-
+        from discord.activity import ActivityAssets, ActivityTimestamps
+        from discord import ActivityType, Activity, ActivityButton
+        t = cfg.get("type", "playing")
+        tmap = {"playing": ActivityType.playing, "streaming": ActivityType.streaming,
+                "listening": ActivityType.listening, "watching": ActivityType.watching,
+                "competing": ActivityType.competing}
+        act_type = tmap.get(t, ActivityType.playing)
+        kw: dict = {"name": cfg.get("name") or "selfbot", "type": act_type}
         if cfg.get("application_id"):
-            try:
-                kwargs["application_id"] = int(cfg["application_id"])
-            except (ValueError, TypeError):
-                pass
-
-        if act_type == ActivityType.streaming:
-            kwargs["url"] = cfg.get("url") or "https://twitch.tv/discord"
-        if cfg.get("state"):   kwargs["state"]   = cfg["state"]
-        if cfg.get("details"): kwargs["details"] = cfg["details"]
-
-        try:
-            ts = {}
-            ps = parse_timestamp(cfg.get("start_timestamp"), is_end=False)
-            ts["start"] = ps if ps else datetime.now(timezone.utc)
-            pe = parse_timestamp(cfg.get("end_timestamp"), is_end=True)
-            if pe: ts["end"] = pe
-            kwargs["timestamps"] = ActivityTimestamps(**ts)
-        except Exception as e:
-            print(f"[RPC] timestamp error: {e}")
-
-        ak = {k: cfg[k] for k in ("large_image","large_text","small_image","small_text") if cfg.get(k)}
+            try: kw["application_id"] = int(cfg["application_id"])
+            except Exception: pass
+        if act_type == ActivityType.streaming and cfg.get("url"):
+            kw["url"] = cfg["url"]
+        if cfg.get("state"):   kw["state"]   = cfg["state"]
+        if cfg.get("details"): kw["details"] = cfg["details"]
+        ak = {}
+        for k in ("large_image", "large_text", "small_image", "small_text"):
+            if cfg.get(k): ak[k] = cfg[k]
         if ak:
-            try: kwargs["assets"] = ActivityAssets(**ak)
+            try: kw["assets"] = ActivityAssets(**ak)
             except Exception: pass
-
-        pc = cfg.get("party", {})
-        if pc.get("enabled"):
+        if cfg.get("start_timestamp"):
             try:
-                kwargs["party"] = ActivityParty(
-                    id="selfbot-party",
-                    current_size=int(pc.get("current", 1)),
-                    max_size=int(pc.get("max", 5)),
-                )
+                ts_kw = {"start": datetime.fromtimestamp(float(cfg["start_timestamp"]), tz=timezone.utc)}
+                if cfg.get("end_timestamp"):
+                    ts_kw["end"] = datetime.fromtimestamp(float(cfg["end_timestamp"]), tz=timezone.utc)
+                kw["timestamps"] = ActivityTimestamps(**ts_kw)
             except Exception: pass
-
-        buttons = [
-            ActivityButton(label=b["label"], url=b["url"])
-            for b in cfg.get("buttons", [])[:2]
-            if b.get("label") and b.get("url")
-        ]
-        if buttons:
-            try: kwargs["buttons"] = buttons
+        btns = [ActivityButton(label=b["label"], url=b["url"])
+                for b in cfg.get("buttons", [])[:2] if b.get("label") and b.get("url")]
+        if btns:
+            try: kw["buttons"] = btns
             except Exception: pass
-
-        await client.change_presence(activity=Activity(**kwargs))
+        await client.change_presence(activity=Activity(**kw))
     except Exception as e:
-        print(f"[RPC] update_rpc error: {e}")
+        print(f"[RPC] {e}")
 
-async def rpc_prompt(channel, author, prompt_text):
-    pm = await channel.send(f"```ansi\n{YE}✏  {prompt_text}{R}\n{DIM}type value — 60s timeout{R}\n```")
-    def check(m):
-        return m.author.id == author.id and m.channel.id == channel.id
+async def rpc_prompt(channel, author, label: str) -> str | None:
+    pm = await channel.send(_ansi_block([f"  {YELLOW}✏  {label}{RESET}", f"  {DIM}type value — 60s — 'none' to clear{RESET}"]))
+    def check(m): return m.author.id == author.id and m.channel.id == channel.id
     try:
-        msg = await client.wait_for("message", check=check, timeout=60.0)
+        msg = await client.wait_for("message", check=check, timeout=60)
         val = msg.content.strip()
         try: await msg.delete()
         except Exception: pass
@@ -655,663 +641,628 @@ async def rpc_prompt(channel, author, prompt_text):
     except asyncio.TimeoutError:
         try: await pm.delete()
         except Exception: pass
-        await channel.send("```ansi\n\u001b[31m✗  timed out\u001b[0m\n```", delete_after=4)
+        await channel.send(ui_err("timed out"), delete_after=4)
         return "__TIMEOUT__"
+
+# ─────────────────────────────────────────────
+# BRAND RPC — Discord CDN images
+# ─────────────────────────────────────────────
+# Using Discord CDN hosted images for brand icons.
+# These are stable Discord-hosted assets that work as large_image values
+# when passed directly to Activity (discord.py-self forwards them as-is).
+
+BRAND_ICONS = {
+    "spotify":     "https://cdn.discordapp.com/app-icons/367827983903490050/c1aac7c70a2df8bf5b50b88e2de36ff2.webp?size=256",
+    "youtube":     "https://cdn.discordapp.com/app-icons/880218394199220334/5c1bbad36e89e14af4a6eb2a73dc26a3.webp?size=256",
+    "xbox":        "https://cdn.discordapp.com/app-icons/438122941302046720/92f4c4e1f4fb1d7c2a69ba8c3e71bf4a.webp?size=256",
+    "roblox":      "https://cdn.discordapp.com/app-icons/363445589247131668/95b28c0f29d0c9d3360d38c4e76c6855.webp?size=256",
+    "crunchyroll": "https://cdn.discordapp.com/app-icons/1020123345567822899/76dac659b13a77e3c79a6e4cc6ab75b2.webp?size=256",
+    "playstation": "https://cdn.discordapp.com/app-icons/473226677884194826/2dd91e54b57ad2cb4949dc4b24feae0d.webp?size=256",
+}
+
+BRAND_APP_IDS = {
+    "spotify":     367827983903490050,
+    "youtube":     880218394199220334,
+    "xbox":        438122941302046720,
+    "roblox":      363445589247131668,
+    "crunchyroll": 1020123345567822899,
+}
+
+async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
+    try:
+        from discord.activity import ActivityAssets, ActivityTimestamps
+        from discord import ActivityType, Activity
+    except ImportError as e:
+        print(f"[RPC] import error: {e}")
+        return False
+
+    type_map = {
+        "playing": ActivityType.playing, "streaming": ActivityType.streaming,
+        "listening": ActivityType.listening, "watching": ActivityType.watching,
+        "competing": ActivityType.competing,
+    }
+    now = datetime.now(timezone.utc)
+
+    def _ts(start=None, end=None):
+        try:
+            kw = {}
+            if start: kw["start"] = start
+            if end:   kw["end"]   = end
+            return ActivityTimestamps(**kw)
+        except Exception: return None
+
+    def _parts(n=3):
+        raw = " ".join(user_args) if user_args else ""
+        p = [x.strip() for x in raw.split("|")]
+        while len(p) < n: p.append("")
+        return p
+
+    icon = BRAND_ICONS.get(brand, "")
+    app_id = BRAND_APP_IDS.get(brand)
+    kw: dict = {}
+    if app_id: kw["application_id"] = app_id
+    ak = {"large_image": icon, "large_text": brand.capitalize(), "small_image": icon, "small_text": brand.capitalize()}
+
+    if brand == "spotify":
+        p = _parts(3)
+        title = p[0] or "Unknown"; artist = p[1] or "Unknown"
+        try: dur = int(p[2]) if p[2] else 210
+        except: dur = 210
+        kw.update({"type": ActivityType.listening, "name": "Spotify",
+                   "details": title, "state": artist})
+        ak["large_text"] = "Spotify"; ak["small_text"] = artist
+        ts = _ts(now, now + timedelta(seconds=dur))
+        if ts: kw["timestamps"] = ts
+
+    elif brand == "youtube":
+        p = _parts(3)
+        video = p[0] or "Video"; channel = p[1] or "Channel"
+        try: dur = int(p[2]) if p[2] else 600
+        except: dur = 600
+        kw.update({"type": ActivityType.watching, "name": "YouTube",
+                   "details": video, "state": channel})
+        ak["large_text"] = channel
+        ts = _ts(now, now + timedelta(seconds=dur))
+        if ts: kw["timestamps"] = ts
+
+    elif brand == "xbox":
+        p = _parts(2)
+        game = p[0] or "Game"; state = p[1] or "Playing on Xbox"
+        kw.update({"type": ActivityType.playing, "name": "Xbox",
+                   "details": game, "state": state})
+        ak["large_text"] = game
+        ts = _ts(now)
+        if ts: kw["timestamps"] = ts
+
+    elif brand == "playstation":
+        p = _parts(2)
+        game = p[0] or "Game"; state = p[1] or "Playing on PlayStation"
+        kw.update({"type": ActivityType.playing, "name": "PlayStation",
+                   "details": game, "state": state})
+        ak["large_text"] = game
+        ts = _ts(now)
+        if ts: kw["timestamps"] = ts
+
+    elif brand == "crunchyroll":
+        p = _parts(3)
+        anime = p[0] or "Anime"; ep = p[1] or ""
+        try: dur = int(p[2]) if p[2] else 1440
+        except: dur = 1440
+        kw.update({"type": ActivityType.watching, "name": "Crunchyroll",
+                   "details": anime})
+        if ep: kw["state"] = ep
+        ak["large_text"] = anime
+        ts = _ts(now, now + timedelta(seconds=dur))
+        if ts: kw["timestamps"] = ts
+
+    elif brand == "roblox":
+        p = _parts(5)
+        game = p[0] or "Roblox"; det = p[1] or game
+        state = p[2] or "Playing on Roblox"
+        lt = p[3] or game; st = p[4] or "Roblox"
+        kw.update({"type": ActivityType.playing, "name": "Roblox",
+                   "details": det, "state": state})
+        ak.update({"large_text": lt, "small_text": st})
+        ts = _ts(now)
+        if ts: kw["timestamps"] = ts
+
+    elif brand == "custom":
+        p = _parts(3)
+        kw.update({"type": ActivityType.playing, "name": p[0] or "Custom"})
+        if p[1]: kw["details"] = p[1]
+        if p[2]: kw["state"]   = p[2]
+        ts = _ts(now)
+        if ts: kw["timestamps"] = ts
+        ak = {}
+
+    else:
+        kw.update({"type": ActivityType.playing, "name": brand.capitalize()})
+        ts = _ts(now)
+        if ts: kw["timestamps"] = ts
+
+    if ak:
+        try:
+            from discord.activity import ActivityAssets
+            kw["assets"] = ActivityAssets(**ak)
+        except Exception as e:
+            print(f"[RPC] assets: {e}")
+
+    try:
+        from discord import Activity
+        await client.change_presence(activity=Activity(**kw))
+        return True
+    except Exception as e:
+        print(f"[RPC] presence: {e}")
+        return False
 
 # ─────────────────────────────────────────────
 # QUEST SYSTEM
 # ─────────────────────────────────────────────
 
-class APIError(Exception):
-    def __init__(self, status, body=None, text=""):
-        super().__init__(f"Discord API error {status}")
-        self.status = status; self.body = body or {}; self.text = text
-
-def clean_token(token):
-    return token.strip().strip('"').strip("'") if token else None
-
-def decode_token_user_id(token):
-    token = clean_token(token)
-    if not token or "." not in token: return None
-    first = token.split(".", 1)[0]
-    padding = "=" * (-len(first) % 4)
-    try: return base64.b64decode(first + padding).decode("utf-8")
+def _b64uid(token):
+    try:
+        first = token.split(".")[0]
+        return base64.b64decode(first + "=" * (-len(first) % 4)).decode()
     except Exception: return None
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
-    "Electron/28.2.10 Safari/537.36"
-)
-CLIENT_BUILD_NUMBER = 971383
-
-def get_super_properties():
-    return {
+def _quest_headers(token):
+    sp = base64.b64encode(json.dumps({
         "os": "Windows", "browser": "Chrome", "device": "",
         "system_locale": "en", "has_client_mods": False,
         "browser_user_agent": USER_AGENT, "browser_version": "142.0.0.0",
-        "os_version": "10", "referrer": "", "referring_domain": "",
-        "referrer_current": "https://discord.com/",
-        "referring_domain_current": "discord.com",
-        "release_channel": "stable",
+        "os_version": "10", "release_channel": "stable",
         "client_launch_id": str(uuid4()),
-        "client_build_number": CLIENT_BUILD_NUMBER,
+        "client_build_number": 971383,
         "client_event_source": None,
-        "launch_signature": str(uuid4()),
-        "client_heartbeat_session_id": str(uuid4()),
-        "client_app_state": "focused",
-    }
-
-def get_headers(token):
-    sp = base64.b64encode(json.dumps(get_super_properties()).encode()).decode()
+    }).encode()).decode()
     return {
-        "authorization": token, "accept": "*/*",
-        "accept-language": "en,en-US;q=0.9",
-        "content-type": "application/json",
-        "user-agent": USER_AGENT,
-        "x-super-properties": sp,
-        "x-discord-locale": "en-US",
-        "x-discord-timezone": "Africa/Algiers",
-        "x-debug-options": "bugReporterEnabled",
-        "origin": "https://discord.com",
-        "referer": "https://discord.com/quest-home",
-        "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin", "priority": "u=1, i",
+        "authorization": token.strip().strip('"').strip("'"),
+        "accept": "*/*", "content-type": "application/json",
+        "user-agent": USER_AGENT, "x-super-properties": sp,
+        "origin": "https://discord.com", "referer": "https://discord.com/quest-home",
     }
 
-async def api_request(session, method, url, headers=None, json_body=None):
-    async with session.request(method, url, headers=headers, json=json_body) as resp:
-        text = await resp.text()
-        body = {}
-        if text:
-            try: body = json.loads(text)
-            except Exception: body = {"raw": text}
-        if resp.status >= 400:
-            raise APIError(resp.status, body, text)
-        return body
+class APIError(Exception):
+    def __init__(self, status, body=None):
+        super().__init__(f"Discord API {status}")
+        self.status = status; self.body = body or {}
 
-async def request_with_retry(session, method, url, headers=None, json_body=None, retries=4):
-    last_error = None
+async def _api(session, method, url, headers=None, json_body=None, retries=3):
+    last = None
     for attempt in range(retries):
         try:
-            return await api_request(session, method, url, headers=headers, json_body=json_body)
-        except APIError as exc:
-            last_error = exc
-            if exc.status == 429 or exc.status >= 500:
-                retry_after = 0.8 * (attempt + 1)
-                if isinstance(exc.body, dict):
-                    try: retry_after = float(exc.body.get("retry_after", retry_after))
-                    except Exception: pass
-                await asyncio.sleep(retry_after)
-                continue
+            async with session.request(method, url, headers=headers, json=json_body) as r:
+                text = await r.text()
+                body = {}
+                try: body = json.loads(text)
+                except Exception: pass
+                if r.status >= 400: raise APIError(r.status, body)
+                return body
+        except APIError as e:
+            last = e
+            if e.status == 429:
+                ra = float(e.body.get("retry_after", 1.0))
+                await asyncio.sleep(ra); continue
+            if e.status >= 500:
+                await asyncio.sleep(0.5 * (attempt + 1)); continue
             raise
-    raise last_error
+    raise last
 
-SUPPORTED_TASKS = (
-    "WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE",
-    "PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2",
-    "PLAY_ACTIVITY", "STREAM_ON_DESKTOP",
-)
+SUPPORTED_TASKS = ("WATCH_VIDEO","WATCH_VIDEO_ON_MOBILE","PLAY_ON_DESKTOP",
+                   "PLAY_ON_DESKTOP_V2","PLAY_ACTIVITY","STREAM_ON_DESKTOP")
 
 class QuestRecord:
     def __init__(self, data):
         self.data = data
-        self.selected_task = self._pick_task()
+        self.selected_task = self._pick()
         self.target = float(self.tasks.get(self.selected_task, {}).get("target", 0) or 0)
 
     @property
     def id(self): return str(self.data.get("id"))
     @property
-    def config(self): return self.data.get("config", {})
+    def cfg(self): return self.data.get("config", {})
     @property
-    def messages(self): return self.config.get("messages", {})
+    def msgs(self): return self.cfg.get("messages", {})
     @property
     def user_status(self): return self.data.get("user_status") or {}
     @property
     def tasks(self):
-        tc = (self.config.get("task_config_v2") or self.config.get("task_config")
-              or self.config.get("taskConfigV2") or self.config.get("taskConfig") or {})
+        tc = (self.cfg.get("task_config_v2") or self.cfg.get("task_config")
+              or self.cfg.get("taskConfigV2") or self.cfg.get("taskConfig") or {})
         return tc.get("tasks", {})
     @property
-    def name(self):
-        return (self.messages.get("quest_name") or self.messages.get("questName")
-                or self.messages.get("game_title") or "Unknown Quest")
+    def name(self): return self.msgs.get("quest_name") or self.msgs.get("game_title") or "Quest"
     @property
-    def reward_name(self):
-        rewards = self.config.get("rewards_config", {}).get("rewards", [])
-        if rewards:
-            m = rewards[0].get("messages", {})
-            return m.get("name") or m.get("name_with_article") or "Unknown Reward"
-        return "Unknown Reward"
+    def reward(self):
+        rw = self.cfg.get("rewards_config", {}).get("rewards", [])
+        if rw: m = rw[0].get("messages", {}); return m.get("name") or "Reward"
+        return "Reward"
     @property
-    def app_id(self): return self.config.get("application", {}).get("id")
+    def app_id(self): return self.cfg.get("application", {}).get("id")
     @property
-    def expires_at(self): return self.config.get("expires_at") or self.config.get("expiresAt")
+    def expires_at(self): return self.cfg.get("expires_at") or ""
 
-    def expires_relative(self):
-        if not self.expires_at: return "unknown"
-        try:
-            parsed = dt.datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
-            return f"<t:{int(parsed.timestamp())}:R>"
-        except Exception: return "unknown"
-
-    def is_expired(self):
-        if not self.expires_at: return False
-        try:
-            parsed = dt.datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
-            return dt.datetime.now(dt.timezone.utc) > parsed
-        except Exception: return False
-
-    def is_completed(self):
-        return bool(self.user_status.get("completed_at") or self.user_status.get("completedAt"))
-    def is_enrolled(self):
-        return bool(self.user_status.get("enrolled_at"))
-    def is_supported(self):
-        return self.selected_task in SUPPORTED_TASKS
+    def is_completed(self): return bool(self.user_status.get("completed_at"))
+    def is_enrolled(self): return bool(self.user_status.get("enrolled_at"))
+    def is_supported(self): return self.selected_task in SUPPORTED_TASKS
     def progress_value(self):
         p = self.user_status.get("progress", {}).get(self.selected_task, {})
         return float(p.get("value", 0) or 0) if p else 0.0
-    def progress_percent(self):
-        return min(100, int((self.progress_value() / self.target) * 100)) if self.target else 0
-    def _pick_task(self):
+    def progress_pct(self):
+        return min(100, int(self.progress_value() / self.target * 100)) if self.target else 0
+    def _pick(self):
         for t in SUPPORTED_TASKS:
             if t in self.tasks: return t
         return next(iter(self.tasks.keys()), "UNKNOWN")
 
 class QuestService:
-    def __init__(self, token, speed_mode="fast"):
-        self.token = clean_token(token)
-        self.speed_mode = speed_mode
-        self.user_id = decode_token_user_id(token)
-        self.headers = get_headers(self.token)
+    def __init__(self, token, speed="fastest"):
+        self.token = token.strip().strip('"').strip("'")
+        self.speed = speed
+        self.uid = _b64uid(token)
+        self.headers = _quest_headers(self.token)
 
-    async def fetch_quests(self, session):
+    async def fetch(self, session):
         try:
-            payload = await request_with_retry(session, "GET",
-                "https://discord.com/api/v9/quests/@me", headers=self.headers)
-            return [QuestRecord(r) for r in payload.get("quests", []) if not QuestRecord(r).is_expired()]
+            d = await _api(session, "GET", "https://discord.com/api/v9/quests/@me", headers=self.headers)
+            out = []
+            for r in d.get("quests", []):
+                q = QuestRecord(r)
+                if q.expires_at:
+                    try:
+                        exp = dt.datetime.fromisoformat(q.expires_at.replace("Z", "+00:00"))
+                        if dt.datetime.now(dt.timezone.utc) > exp: continue
+                    except Exception: pass
+                out.append(q)
+            return out
         except Exception as e:
-            print(f"[Quest] fetch error: {e}")
-            return []
-
-    async def refresh_quest(self, session, quest_id):
-        for q in await self.fetch_quests(session):
-            if q.id == quest_id: return q
-        return None
-
-    async def get_user_status(self, session, quest_id):
-        return await request_with_retry(session, "GET",
-            f"https://discord.com/api/v9/quests/{quest_id}/user-status", headers=self.headers)
+            print(f"[Quest] fetch: {e}"); return []
 
     async def enroll(self, session, quest):
-        payload = await request_with_retry(session, "POST",
+        d = await _api(session, "POST",
             f"https://discord.com/api/v9/quests/{quest.id}/enroll",
             headers=self.headers,
             json_body={"location": 11, "is_targeted": False, "metadata_raw": None})
-        if payload: quest.data["user_status"] = payload
-        return True
+        if d: quest.data["user_status"] = d
 
-    async def run_quest(self, session, quest, on_update=None):
-        while True:
-            try:
-                if not quest.is_enrolled():
-                    await self.enroll(session, quest)
-                    await self._emit(on_update, quest, "enrolled", status="enrolled")
-                if not quest.is_supported():
-                    await self._emit(on_update, quest, "unsupported task", status="unsupported")
-                    return {"status": "unsupported", "quest": quest}
-                result = await self._run_solver(session, quest, on_update)
-                if result["status"] == "completed": return result
-                fresh = await self.refresh_quest(session, quest.id)
-                if fresh and fresh.is_completed():
-                    await self._emit(on_update, fresh, "completed", percent=100, status="completed")
-                    return {"status": "completed", "quest": fresh, "percent": 100}
-                if fresh: quest = fresh
-                await self._emit(on_update, quest, f"recovering from {quest.progress_percent()}%",
-                    percent=quest.progress_percent(), status="recovering")
-                await asyncio.sleep(5.0)
-            except APIError as exc:
-                if exc.status == 404:
-                    fresh = await self.refresh_quest(session, quest.id)
-                    if fresh and fresh.is_completed():
-                        await self._emit(on_update, fresh, "completed", percent=100, status="completed")
-                        return {"status": "completed", "quest": fresh, "percent": 100}
-                    if fresh: quest = fresh
-                    await asyncio.sleep(5.0); continue
-                if exc.status in (401, 403):
-                    msg = f"api error {exc.status}"
-                    await self._emit(on_update, quest, msg, status="failed_unrecoverable")
-                    return {"status": "failed_unrecoverable", "quest": quest, "percent": quest.progress_percent(), "reason": msg}
-                await asyncio.sleep(5.0)
-            except asyncio.CancelledError: raise
-            except Exception as e:
-                print(f"[Quest] run error: {e}")
-                await asyncio.sleep(5.0)
-
-    async def _run_solver(self, session, quest, on_update=None):
+    async def run(self, session, quest):
+        if not quest.is_enrolled():
+            await self.enroll(session, quest)
+        if not quest.is_supported():
+            return "unsupported"
         task = quest.selected_task
-        await self._emit(on_update, quest, "solver active", status="running")
         if task in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
-            return await self._run_video(session, quest, on_update)
-        if task in ("PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2"):
-            payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
-            if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
-            return await self._run_heartbeat(session, quest, payloads, on_update)
+            return await self._video(session, quest)
+        payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
+        if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
         if task == "PLAY_ACTIVITY":
-            uk = self.user_id or quest.id
-            return await self._run_heartbeat(session, quest, [
-                {"stream_key": f"call:{uk}:1", "terminal": False},
-                {"stream_key": f"call:{quest.id}:1", "terminal": False},
-            ], on_update)
-        if task == "STREAM_ON_DESKTOP":
-            return await self._run_heartbeat(session, quest,
-                [{"stream_key": f"call:{quest.id}:1", "terminal": False}], on_update)
-        return {"status": "unsupported", "quest": quest, "percent": quest.progress_percent()}
+            payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
+        return await self._heartbeat(session, quest, payloads)
 
-    async def _run_video(self, session, quest, on_update=None):
-        interval = 5.0 if self.speed_mode == "fast" else 7.5
-        last_good = quest.progress_value()
-        started_at = int(dt.datetime.now(dt.timezone.utc).timestamp()) - int(last_good)
-        try:
-            while last_good < quest.target:
-                ts = min(float(quest.target), float(int(dt.datetime.now(dt.timezone.utc).timestamp()) - started_at))
+    async def _video(self, session, quest):
+        # fastest possible — send progress every 2 seconds
+        interval = 2.0
+        last = quest.progress_value()
+        started = int(datetime.now(timezone.utc).timestamp()) - int(last)
+        while last < quest.target:
+            ts = min(float(quest.target),
+                float(int(datetime.now(timezone.utc).timestamp()) - started))
+            try:
+                d = await _api(session, "POST",
+                    f"https://discord.com/api/v9/quests/{quest.id}/video-progress",
+                    headers=self.headers, json_body={"timestamp": ts}, retries=2)
+                if d: quest.data["user_status"] = d
+                last = max(last, ts, quest.progress_value())
+                if d and d.get("completed_at"): break
+            except APIError as e:
+                if e.status == 400: await asyncio.sleep(1); continue
+                break
+            await asyncio.sleep(interval)
+        return "completed" if quest.is_completed() or quest.progress_value() >= quest.target else "recovering"
+
+    async def _heartbeat(self, session, quest, payloads):
+        # fastest: 15 second intervals
+        interval = 15
+        active = payloads[0]
+        while True:
+            d = None
+            for p in payloads:
                 try:
-                    data = await request_with_retry(session, "POST",
-                        f"https://discord.com/api/v9/quests/{quest.id}/video-progress",
-                        headers=self.headers, json_body={"timestamp": ts}, retries=2)
-                except APIError as exc:
-                    if exc.status == 400:
-                        sd = await self.get_user_status(session, quest.id)
-                        quest.data["user_status"] = sd
-                        last_good = max(last_good, quest.progress_value())
-                        if quest.is_completed():
-                            await self._emit(on_update, quest, "completed", percent=100, status="completed")
-                            return {"status": "completed", "quest": quest, "percent": 100}
-                        await asyncio.sleep(1.1); continue
-                    raise
-                if data: quest.data["user_status"] = data
-                last_good = max(last_good, ts, quest.progress_value())
-                pct = min(100, int((last_good / quest.target) * 100)) if quest.target else 0
-                await self._emit(on_update, quest, f"progressing [{pct}%]", percent=pct, status="running")
-                if data.get("completed_at"):
-                    fresh = await self.get_user_status(session, quest.id)
-                    quest.data["user_status"] = fresh
-                    await self._emit(on_update, quest, "completed", percent=100, status="completed")
-                    return {"status": "completed", "quest": quest, "percent": 100}
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            await self._emit(on_update, quest, "stopped", percent=quest.progress_percent(), status="manually_stopped")
-            raise
-        if quest.is_completed() or quest.progress_value() >= quest.target:
-            await self._emit(on_update, quest, "completed", percent=100, status="completed")
-            return {"status": "completed", "quest": quest, "percent": 100}
-        return {"status": "recovering", "quest": quest, "percent": quest.progress_percent()}
-
-    async def _run_heartbeat(self, session, quest, payloads, on_update=None):
-        interval = 30 if self.speed_mode == "fast" else 40
-        active_payload = payloads[0]; last_percent = -1
+                    d = await _api(session, "POST",
+                        f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                        headers=self.headers, json_body=p, retries=2)
+                    active = p; break
+                except APIError: continue
+            if d: quest.data["user_status"] = d
+            if quest.is_completed() or quest.progress_value() >= quest.target:
+                break
+            await asyncio.sleep(interval)
+        # send terminal
         try:
-            while True:
-                data = None
-                for payload in payloads:
-                    try:
-                        data = await request_with_retry(session, "POST",
-                            f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
-                            headers=self.headers, json_body=payload, retries=2)
-                        active_payload = payload; break
-                    except APIError: continue
-                if data is None:
-                    try:
-                        sd = await self.get_user_status(session, quest.id)
-                        quest.data["user_status"] = sd
-                    except APIError as exc:
-                        if exc.status == 404: await asyncio.sleep(2.0); continue
-                        raise
-                else: quest.data["user_status"] = data
-                pct = quest.progress_percent()
-                if pct != last_percent:
-                    await self._emit(on_update, quest, f"progressing [{pct}%]", percent=pct, status="running")
-                    last_percent = pct
-                if quest.is_completed() or quest.progress_value() >= quest.target: break
-                await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            await self._send_terminal(session, quest.id, active_payload)
-            await self._emit(on_update, quest, "stopped", percent=quest.progress_percent(), status="manually_stopped")
-            raise
-        await self._send_terminal(session, quest.id, active_payload)
-        if quest.is_completed() or quest.progress_value() >= quest.target:
-            await self._emit(on_update, quest, "completed", percent=100, status="completed")
-            return {"status": "completed", "quest": quest, "percent": 100}
-        return {"status": "recovering", "quest": quest, "percent": quest.progress_percent()}
-
-    async def _send_terminal(self, session, quest_id, payload):
-        try:
-            t = dict(payload); t["terminal"] = True
-            await request_with_retry(session, "POST",
-                f"https://discord.com/api/v9/quests/{quest_id}/heartbeat",
-                headers=self.headers, json_body=t, retries=2)
+            t = dict(active); t["terminal"] = True
+            await _api(session, "POST",
+                f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                headers=self.headers, json_body=t, retries=1)
         except Exception: pass
+        return "completed" if quest.is_completed() else "recovering"
 
-    async def _emit(self, cb, quest, message, percent=None, status=None):
-        if cb is None: return
-        payload = {
-            "quest_id": quest.id, "quest_name": quest.name,
-            "percent": percent if percent is not None else quest.progress_percent(),
-            "status": status or "running", "message": message, "quest": quest,
-        }
-        try:
-            res = cb(payload)
-            if asyncio.iscoroutine(res): await res
-        except Exception: pass
+async def autoquest_run(token):
+    svc = QuestService(token)
+    async with aiohttp.ClientSession() as session:
+        quests = await svc.fetch(session)
+        active = [q for q in quests if not q.is_completed() and q.is_supported()]
+        if not active: return
+        for q in active:
+            print(f"[AutoQuest] {q.name}")
+            await svc.run(session, q)
+            print(f"[AutoQuest] ✓ {q.name}")
 
 # ─────────────────────────────────────────────
 # ORB BADGE
 # ─────────────────────────────────────────────
 
-ORB_BADGE_SKU_ID = "1342211853484429445"
+ORB_SKU = "1342211853484429445"
 
-async def _claim_orb_badge(session, token):
-    headers = {
-        "accept": "*/*", "authorization": token, "content-type": "application/json",
-        "origin": "https://discord.com", "referer": "https://discord.com/shop?tab=orbs",
-        "user-agent": USER_AGENT,
-    }
-    balance = None
-    for url in ["https://discord.com/api/v9/users/@me/orbs/balance",
-                "https://discord.com/api/v9/users/@me/virtual-currency/balance"]:
+async def claim_orb(token):
+    h = {"authorization": token, "content-type": "application/json", "user-agent": USER_AGENT,
+         "origin": "https://discord.com", "referer": "https://discord.com/shop?tab=orbs"}
+    async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status < 400:
-                    body = json.loads(await resp.text()) if await resp.text() else {}
-                    for key in ("balance", "discord_orb", "orbs", "amount", "total"):
-                        val = body.get(key)
-                        if isinstance(val, (int, float)): balance = int(val); break
-        except Exception: pass
-        if balance is not None: break
-    try:
-        url = f"https://discord.com/api/v9/virtual-currency/skus/{ORB_BADGE_SKU_ID}/redeem"
-        async with session.post(url, headers=headers, json={}) as resp:
-            body = json.loads(await resp.text()) if await resp.text() else {}
-            if resp.status in (200, 201, 204):
-                return {"status": "SUCCESS", "balance": balance}
-            return {"status": "FAILED", "code": resp.status, "message": body.get("message", "Redeem failed")}
-    except Exception as e:
-        return {"status": "FAILED", "code": "network", "message": str(e)}
-
-# ─────────────────────────────────────────────
-# AUTOQUEST
-# ─────────────────────────────────────────────
-
-async def run_autoquest_pass_now(token):
-    try:
-        service = QuestService(token, speed_mode="fast")
-        async with aiohttp.ClientSession() as session:
-            quests = await service.fetch_quests(session)
-            active = [q for q in quests if not q.is_completed() and q.is_supported()]
-            if not active:
-                print("[AutoQuest] no active quests."); return
-            for quest in active:
-                print(f"[AutoQuest] running: {quest.name}")
-                result = await service.run_quest(session, quest)
-                if result and result.get("status") == "completed":
-                    print(f"[AutoQuest] ✅ {quest.name} | {quest.reward_name}")
-    except Exception as e:
-        print(f"[AutoQuest] error: {e}")
-
-def make_progress_bar(percent):
-    filled = int(percent / 10)
-    return f"{GR}{'█' * filled}{DIM}{'░' * (10 - filled)}{R} {WH}{percent}%{R}"
+            async with session.post(
+                f"https://discord.com/api/v9/virtual-currency/skus/{ORB_SKU}/redeem",
+                headers=h, json={}) as r:
+                return r.status in (200, 201, 204), await r.text()
+        except Exception as e:
+            return False, str(e)
 
 # ─────────────────────────────────────────────
 # NITRO SNIPER
 # ─────────────────────────────────────────────
 
-GIFT_PATTERN = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
+GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
 
 async def snipe_nitro(code, channel_id):
     try:
         async with aiohttp.ClientSession() as session:
-            url = f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem"
-            headers = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
-            async with session.post(url, headers=headers, json={"channel_id": str(channel_id)}) as r:
-                data = {}
-                try: data = await r.json()
-                except Exception: pass
-                if r.status == 200:
-                    log_message("SNIPER", f"✅ SNIPED: {code}")
-                else:
-                    log_message("SNIPER", f"❌ failed: {code} | {r.status} | {data.get('message', '')}")
+            async with session.post(
+                f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem",
+                headers={"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT},
+                json={"channel_id": str(channel_id)}) as r:
+                log_msg("SNIPER", f"{'✓ SNIPED' if r.status == 200 else '✗ miss'} {code} [{r.status}]")
     except Exception as e:
-        log_message("SNIPER", f"error: {e}")
+        log_msg("SNIPER", f"error: {e}")
 
 # ─────────────────────────────────────────────
-# HELP SYSTEM
+# LAST.FM
 # ─────────────────────────────────────────────
 
-def build_help_root():
-    p = PREFIX
-    return (
-        f"> **Lunar X selfbot**\n"
-        f"```\n"
-        f"────────────────────────────────────\n"
-        f"  categories\n"
-        f"────────────────────────────────────\n"
-        f"  general      utilities, platform & status\n"
-        f"  rpc          rich presence & brands\n"
-        f"  quests       quest completer & orb badge\n"
-        f"  sniper       nitro sniper & logger\n"
-        f"  ar           auto-responder\n"
-        f"  voice        voice channel controls\n"
-        f"  fun          fun commands\n"
-        f"  tools        tools & generators\n"
-        f"  lastfm       last.fm integration\n"
-        f"────────────────────────────────────\n"
-        f"  {p}help <category> for commands\n"
-        f"────────────────────────────────────\n"
-        f"  Hade&Sy | ver 1.0.0\n"
-        f"```"
-    )
+LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
+_lfm: dict = {}
 
-def build_help_general():
-    p = PREFIX
-    return (
-        f"> **general**  utilities, platform & status\n"
-        f"```\n"
-        f"  [utilities]\n"
-        f"  {p}ping                    latency check\n"
-        f"  {p}info                    account snapshot\n"
-        f"  {p}say <text>              replace command with text\n"
-        f"  {p}spam <n> <text>         send n messages (max 20)\n"
-        f"  {p}purge <n>               delete your last n messages\n"
-        f"  {p}clear                   delete command message\n"
-        f"  {p}copycat <user_id>       mirror next 10 messages\n"
-        f"\n"
-        f"  [status]\n"
-        f"  {p}status <text>           set custom status\n"
-        f"  {p}status clear            clear status\n"
-        f"\n"
-        f"  [platform spoofer]\n"
-        f"  {p}platform <type>         spoof gateway platform\n"
-        f"  {p}platform off            reset to desktop\n"
-        f"  types: phone android desktop web xbox playstation console vr\n"
-        f"\n"
-        f"  [hypesquad]\n"
-        f"  {p}hypesquad bravery       set house bravery\n"
-        f"  {p}hypesquad brilliance    set house brilliance\n"
-        f"  {p}hypesquad balance       set house balance\n"
-        f"  {p}hypesquad off           remove hypesquad badge\n"
-        f"```"
-    )
+def _load_lfm():
+    global _lfm
+    _lfm = load_config().get("lastfm", {})
 
+def _save_lfm():
+    cfg = load_config(); cfg["lastfm"] = _lfm; save_config(cfg)
 
+_load_lfm()
 
-def build_help_rpc():
-    p = PREFIX
-    return (
-        f"> **rpc**  rich presence, platform & status\n"
-        f"```\n"
-        f"  [control]\n"
-        f"  {p}rpc enable              turn on rich presence\n"
-        f"  {p}rpc disable             clear rich presence\n"
-        f"  {p}rpc status              show current config\n"
-        f"\n"
-        f"  [fields]\n"
-        f"  {p}rpc type                playing/streaming/watching/listening/competing\n"
-        f"  {p}rpc name                activity name\n"
-        f"  {p}rpc details             details line\n"
-        f"  {p}rpc state               state line\n"
-        f"  {p}rpc url                 streaming url (twitch)\n"
-        f"  {p}rpc start / end         timestamps (unix / MM:SS / none)\n"
-        f"  {p}rpc large_image/text    large asset\n"
-        f"  {p}rpc small_image/text    small asset\n"
-        f"  {p}rpc button1/2_name/url  buttons\n"
-        f"  {p}rpc party on/off/current/max\n"
-        f"\n"
-        f"  [brand presets]\n"
-        f"  {p}rpc spotify <title> | <artist> | <secs>\n"
-        f"  {p}rpc youtube <video> | <channel> | <secs>\n"
-        f"  {p}rpc xbox <game>\n"
-        f"  {p}rpc playstation <game>\n"
-        f"  {p}rpc crunchyroll <anime> | <episode>\n"
-        f"  {p}rpc roblox <game> | <details> | <state> | <img_text> | <small_text>\n"
-        f"  {p}rpc custom <name> | <details> | <state>\n"
-        f"  {p}rpc clear               alias for disable\n"
-        f"```"
-    )
+async def lfm_get(method, params):
+    p = {"method": method, "api_key": _lfm.get("api_key",""), "format": "json", **params}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(LASTFM_BASE, params=p, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                return await r.json() if r.status == 200 else {}
+    except Exception: return {}
 
-def build_help_quests():
-    p = PREFIX
-    return (
-        f"> **quests**  quest completer & orb badge\n"
-        f"```\n"
-        f"  {p}quest                   list active quests\n"
-        f"  {p}questrun <index>        solve specific quest\n"
-        f"  {p}questall                solve all active quests\n"
-        f"  {p}autoquest on/off        auto-run on startup\n"
-        f"  {p}orbbadge                claim orb badge\n"
-        f"```"
-    )
+_PERIOD = {"w":"7day","week":"7day","m":"1month","month":"1month",
+           "3m":"3month","6m":"6month","y":"12month","year":"12month",
+           "all":"overall","overall":"overall"}
+_PLABEL = {"7day":"this week","1month":"this month","3month":"3 months",
+           "6month":"6 months","12month":"this year","overall":"all time"}
 
-def build_help_sniper():
-    p = PREFIX
-    return (
-        f"> **sniper**  nitro sniper & logger\n"
-        f"```\n"
-        f"  [sniper]\n"
-        f"  {p}sniper on/off           toggle nitro sniper\n"
-        f"\n"
-        f"  [logger]\n"
-        f"  {p}logger on/off           toggle message logger\n"
-        f"  {p}readlog <n>             read last n log lines\n"
-        f"```"
-    )
+async def lfm_np(username):
+    d = await lfm_get("user.getRecentTracks", {"user": username, "limit": 1, "extended": 1})
+    tracks = d.get("recenttracks", {}).get("track", [])
+    if not tracks: return None
+    t = tracks[0] if isinstance(tracks, list) else tracks
+    artist = t.get("artist", {})
+    return {
+        "title":   t.get("name", "?"),
+        "artist":  artist.get("name","?") if isinstance(artist, dict) else str(artist),
+        "album":   (t.get("album",{}) or {}).get("#text",""),
+        "playing": t.get("@attr",{}).get("nowplaying") == "true",
+        "loved":   t.get("loved","0") == "1",
+        "total":   d.get("recenttracks",{}).get("@attr",{}).get("total","?"),
+    }
 
-def build_help_ar():
-    p = PREFIX
-    return (
-        f"> **ar**  auto-responder\n"
-        f"```\n"
-        f"  {p}ar add <trigger> | <response>   add response\n"
-        f"  {p}ar remove <trigger>             remove response\n"
-        f"  {p}ar list                         list all\n"
-        f"```"
-    )
+async def lfm_autorpc_loop():
+    last = ""
+    while _autorpc_enabled:
+        try:
+            u = _lfm.get("username","")
+            if u:
+                t = await lfm_np(u)
+                if t and t["playing"]:
+                    key = f"{t['title']}|{t['artist']}"
+                    if key != last:
+                        last = key
+                        await apply_brand_rpc("spotify", [f"{t['title']} | {t['artist']} | 210"])
+        except Exception as e:
+            print(f"[LFMRPC] {e}")
+        await asyncio.sleep(30)
 
+# ─────────────────────────────────────────────
+# HOSTED ACCOUNT HELPERS
+# ─────────────────────────────────────────────
 
-def build_help_voice():
-    p = PREFIX
-    return (
-        f"> **voice**  voice channel controls\n"
-        f"```\n"
-        f"  {p}vcjoin <channel>         join a voice channel (stays 24/7)\n"
-        f"  {p}vcleave                  leave voice channel\n"
-        f"  {p}vcmute <user>            server mute a user\n"
-        f"  {p}vcunmute <user>          server unmute a user\n"
-        f"  {p}vcdeafen <user>          server deafen a user\n"
-        f"  {p}vcundeafen <user>        server undeafen a user\n"
-        f"  {p}vckick <user>            kick user from VC\n"
-        f"  {p}vcmove <user> <ch_id>    move user to channel\n"
-        f"  {p}vcmoveall <ch1> <ch2>    move all users ch1 -> ch2\n"
-        f"```"
-    )
+async def hosted_send(token, channel_id, content):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"https://discord.com/api/v9/channels/{channel_id}/messages",
+                headers={"Authorization": token.strip(), "Content-Type": "application/json", "User-Agent": USER_AGENT},
+                json={"content": content}) as r:
+                return r.status in (200, 201)
+    except Exception: return False
 
-def build_help_fun():
-    p = PREFIX
-    return (
-        f"> **fun**  fun commands\n"
-        f"```\n"
-        f"  {p}gayrate <user>           gay percentage\n"
-        f"  {p}feed <user>              feed a user\n"
-        f"  {p}tickle <user>            tickle a user\n"
-        f"  {p}slap <user>              slap a user\n"
-        f"  {p}hug <user>               hug a user\n"
-        f"  {p}cuddle <user>            cuddle a user\n"
-        f"  {p}pat <user>               pat a user\n"
-        f"  {p}kiss <user>              kiss a user\n"
-        f"  {p}poke <user>              poke a user\n"
-        f"  {p}wink <user>              wink at a user\n"
-        f"  {p}smug <user>              smug at a user\n"
-        f"  {p}boop <user>              boop a user\n"
-        f"  {p}nom <user>               nom a user\n"
-        f"  {p}mimic <user>             mimic a user in channel\n"
-        f"  {p}unmimic <user>           stop mimicking user\n"
-        f"  {p}stopmimic                stop all mimics\n"
-        f"  {p}meme                     random meme\n"
-        f"  {p}joke                     random joke\n"
-        f"```"
-    )
+async def hosted_username(token):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://discord.com/api/v9/users/@me",
+                headers={"Authorization": token.strip(), "User-Agent": USER_AGENT}) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    return d.get("username","?")
+    except Exception: pass
+    return "?"
 
-def build_help_tools():
-    p = PREFIX
-    return (
-        f"> **tools**  tools & generators\n"
-        f"```\n"
-        f"  {p}nitro                    generate random nitro url\n"
-        f"  {p}host add <token>         add account to host list\n"
-        f"  {p}host remove <token>      remove account from host\n"
-        f"  {p}host list                list hosted accounts\n"
-        f"  {p}host broadcast <msg>     send msg from all hosted accounts\n"
-        f"  {p}applybypass <invite>     bypass apply-to-join on server\n"
-        f"```"
-    )
+# ─────────────────────────────────────────────
+# UTILITY HELPERS
+# ─────────────────────────────────────────────
 
-def build_help_lastfm():
-    p = PREFIX
-    return (
-        f"> **lastfm**  last.fm integration\n"
-        f"```\n"
-        f"  {p}lastfm set <username>    link your last.fm account\n"
-        f"  {p}lastfm np               now playing — shows current track\n"
-        f"  {p}lastfm recent [n]        last n scrobbles (default 5)\n"
-        f"  {p}lastfm topartists [w/m/y/all]  top artists\n"
-        f"  {p}lastfm toptracks [w/m/y/all]   top tracks\n"
-        f"  {p}lastfm topalbums [w/m/y/all]    top albums\n"
-        f"  {p}lastfm stats            scrobble count & playcount\n"
-        f"  {p}lastfm compare <user>   taste compatibility with another last.fm user\n"
-        f"  {p}lastfm rpc              set rpc to now playing track\n"
-        f"  {p}lastfm autorpc on/off   auto-update rpc with now playing\n"
-        f"```"
-    )
+def uwuify(text):
+    text = re.sub(r'[rRlL]', 'w', text)
+    text = re.sub(r'n([aeiou])', r'ny\1', text)
+    text = re.sub(r'N([aeiou])', r'Ny\1', text)
+    faces = [" >w<", " uwu", " owo", " >.<", " ^w^"]
+    for p in ".!?":
+        text = text.replace(p, p + random.choice(faces))
+    return text
 
-HELP_MAP = {
-    "":          build_help_root,
-    "general":   build_help_general,
-    "rpc":       build_help_rpc,
-    "quests":    build_help_quests,
-    "quest":     build_help_quests,
-    "sniper":    build_help_sniper,
-    "logger":    build_help_sniper,
-    "ar":        build_help_ar,
-    "voice":     build_help_voice,
-    "vc":        build_help_voice,
-    "fun":       build_help_fun,
-    "tools":     build_help_tools,
-    "lastfm":    build_help_lastfm,
-    "lfm":       build_help_lastfm,
+def owoify(text):
+    subs = [("r","w"),("l","w"),("R","W"),("L","W"),("n","ny"),("N","NY")]
+    for a, b in subs:
+        text = text.replace(a, b)
+    return f"owo {text} owo"
+
+def mock_text(text):
+    return "".join(c.upper() if i % 2 else c.lower() for i, c in enumerate(text))
+
+def aesthetic(text):
+    normal = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    wide   = "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ　ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ０１２３４５６７８９"
+    table = str.maketrans(normal, wide)
+    return text.translate(table)
+
+def clap_text(text):
+    return " 👏 ".join(text.split())
+
+# nekos.life roleplay actions — correct v2 endpoints
+NEKO_ACTIONS = {
+    "feed": "feed", "tickle": "tickle", "slap": "slap", "hug": "hug",
+    "cuddle": "cuddle", "pat": "pat", "kiss": "kiss", "poke": "poke",
+    "wink": "wink", "smug": "smug", "boop": "boop", "nom": "nom",
+    "wave": "wave", "highfive": "highfive", "bite": "bite", "blush": "blush",
+    "dance": "dance", "happy": "happy", "cringe": "cringe",
 }
+
+async def neko_gif(action: str) -> str | None:
+    endpoint = NEKO_ACTIONS.get(action, action)
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://nekos.life/api/v2/img/{endpoint}",
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    return d.get("url")
+    except Exception as e:
+        print(f"[Neko] {e}")
+    return None
+
+# translation helper
+async def translate_text(text: str, target_lang: str) -> str:
+    try:
+        url = f"https://translate.googleapis.com/translate_a/single"
+        params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                d = await r.json()
+                return "".join(p[0] for p in d[0] if p[0])
+    except Exception as e:
+        return f"error: {e}"
+
+# vanity sniper loop
+async def vsniper_loop():
+    while _vsniper_task and not _vsniper_task.cancelled():
+        for entry in list(_vsniper_list):
+            code = entry["code"]; guild_id = entry["guild_id"]
+            try:
+                async with aiohttp.ClientSession() as s:
+                    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+                    async with s.get(f"https://discord.com/api/v9/invites/{code}", headers=h) as r:
+                        if r.status == 404:
+                            # vanity is free — claim it
+                            async with s.patch(
+                                f"https://discord.com/api/v9/guilds/{guild_id}/vanity-url",
+                                headers=h, json={"code": code}) as r2:
+                                if r2.status in (200, 204):
+                                    log_msg("VSNIPER", f"CLAIMED {code} for guild {guild_id}")
+            except Exception: pass
+        await asyncio.sleep(0.5)
+
+# typing loop
+async def typing_loop(channel):
+    while True:
+        try:
+            async with channel.typing():
+                await asyncio.sleep(9)
+        except Exception:
+            await asyncio.sleep(5)
+
+# AGC helpers (ported from agc.py to discord.py-self)
+async def _agc_discord_request(method, path, json_body=None):
+    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+    async with aiohttp.ClientSession() as s:
+        async with s.request(method, f"https://discord.com/api/v9{path}", headers=h, json=json_body) as r:
+            try: return await r.json(), r.status
+            except Exception: return {}, r.status
+
+async def _agc_notify_webhook(channel_id, owner_id, members):
+    url = _agc_state.get("webhook_url")
+    if not url: return
+    body = {"content": f"**AGC Alert**\nowner: `{owner_id}`\nchannel: `{channel_id}`\nmembers: `{', '.join(members)}`"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(url, json=body)
+    except Exception: pass
+
+# ─────────────────────────────────────────────
+# PLATFORM SPOOFER
+# ─────────────────────────────────────────────
+
+PLATFORM_MAP = {
+    "phone": {"os": "iOS", "browser": "Discord iOS"},
+    "android": {"os": "Android", "browser": "Discord Android"},
+    "desktop": {"os": "Windows", "browser": "Discord Client"},
+    "web": {"os": "Windows", "browser": "Chrome"},
+    "console": {"os": "PlayStation 4", "browser": "Discord Embedded"},
+    "xbox": {"os": "Xbox One", "browser": "Discord Embedded"},
+    "playstation": {"os": "PlayStation 4", "browser": "Discord Embedded"},
+    "vr": {"os": "Windows", "browser": "Discord Embedded"},
+}
+_current_platform = "desktop"
+
+# ─────────────────────────────────────────────
+# HYPESQUAD
+# ─────────────────────────────────────────────
+
+HOUSE_IDS = {"bravery": 1, "brilliance": 2, "balance": 3}
+HOUSE_NAMES = {1: "Bravery", 2: "Brilliance", 3: "Balance"}
+
+async def set_hypesquad(house_id):
+    async with aiohttp.ClientSession() as s:
+        async with s.post("https://discord.com/api/v9/hypesquad/online",
+            headers={"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT},
+            json={"house_id": house_id}) as r:
+            return r.status in (200, 201, 204), await r.text()
+
+async def clear_hypesquad():
+    async with aiohttp.ClientSession() as s:
+        async with s.delete("https://discord.com/api/v9/hypesquad/online",
+            headers={"Authorization": TOKEN, "User-Agent": USER_AGENT}) as r:
+            return r.status in (200, 201, 204)
 
 # ─────────────────────────────────────────────
 # EVENTS
@@ -1319,489 +1270,496 @@ HELP_MAP = {
 
 @client.event
 async def on_ready():
-    print(f"[+] {client.user} ({client.user.id})")
-    print(f"[+] prefix: {PREFIX} | servers: {len(client.guilds)}")
+    global _autoreact_emoji
+    print(f"[+] {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
     await update_rpc()
-    if AUTOQUEST_ENABLED:
-        asyncio.create_task(run_autoquest_pass_now(TOKEN))
-        print("[+] autoquest: running pass")
+    cfg = load_config()
+    if cfg.get("autoquest_enabled"):
+        asyncio.create_task(autoquest_run(TOKEN))
+    if cfg.get("autoaddback"):
+        global _autoaddback
+        _autoaddback = True
 
 @client.event
 async def on_message(message):
-    global SNIPER_ENABLED, LOGGER_ENABLED
+    global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
+    global _autoreact_emoji, _autoaddback, _current_platform
 
+    # ── LOGGER ──
     if LOGGER_ENABLED and message.guild:
         try:
-            log_message("MSG",
-                f"{message.guild.name}/#{message.channel.name} | "
-                f"{message.author} ({message.author.id}): {message.content}")
+            log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | {message.author}: {message.content[:100]}")
         except Exception: pass
 
-    if SNIPER_ENABLED and message.author.id != client.user.id:
-        for _, code in GIFT_PATTERN.findall(message.content):
+    # ── NITRO SNIPER ──
+    if _nitrosniper_enabled and message.author.id != client.user.id:
+        for _, code in GIFT_RE.findall(message.content):
             asyncio.create_task(snipe_nitro(code, message.channel.id))
 
+    # ── GIVEAWAY SNIPER ──
+    if _giveaway_enabled and message.author.id != client.user.id:
+        if message.components and "🎉" in message.content:
+            for row in message.components:
+                for btn in getattr(row, "children", []):
+                    if "Enter" in getattr(btn, "label", "") or "🎉" in getattr(btn, "label", ""):
+                        try: await btn.click()
+                        except Exception: pass
+
+    # ── AFK RESPONDER ──
+    if _afk_enabled and client.user in message.mentions and message.author.id != client.user.id:
+        try: await message.reply(_afk_msg or "I'm AFK right now.", mention_author=False)
+        except Exception: pass
+
+    # ── AUTO-RESPONDER ──
     if message.author.id != client.user.id:
         cl = message.content.lower()
-        for trigger, response in AUTO_RESPONSES.items():
-            if trigger.lower() in cl:
-                try: await message.channel.send(response)
+        for trig, resp in AUTO_RESPONSES.items():
+            if trig.lower() in cl:
+                try: await message.channel.send(resp)
                 except Exception: pass
                 break
-        # mimic listener
+
+    # ── MIMIC ──
+    if message.author.id != client.user.id:
         cid = message.channel.id
         if cid in _mimic_dict and message.author.id in _mimic_dict[cid]:
             if not message.content.startswith(PREFIX):
                 try: await message.channel.send(message.content)
                 except Exception: pass
-        return
 
+    # ── TRACKING ──
+    if message.author.id in _tracked_users and message.author.id != client.user.id:
+        if message.author.id not in _tracking:
+            _tracking[message.author.id] = []
+        _tracking[message.author.id].append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "content": message.content,
+            "channel": getattr(message.channel, "name", str(message.channel.id)),
+        })
+        if len(_tracking[message.author.id]) > 200:
+            _tracking[message.author.id] = _tracking[message.author.id][-200:]
+
+    # ── SPEAK / AUTO-TRANSLATE OUTGOING ──
+    if message.author.id == client.user.id and _speak_lang and not message.content.startswith(PREFIX):
+        try:
+            translated = await translate_text(message.content, _speak_lang)
+            if translated and translated != message.content:
+                await asyncio.sleep(0.3)
+                await message.edit(content=translated)
+        except Exception: pass
+
+    # ── AUTO-REACT TO OWN MESSAGES ──
+    if message.author.id == client.user.id and _autoreact_emoji and not message.content.startswith(PREFIX):
+        try: await message.add_reaction(_autoreact_emoji)
+        except Exception: pass
+
+    if message.author.id != client.user.id:
+        return
     if not message.content.startswith(PREFIX):
         return
 
-    args = message.content[len(PREFIX):].split()
-    cmd = args[0].lower() if args else ""
+    raw  = message.content[len(PREFIX):]
+    args = raw.split()
+    cmd  = args[0].lower() if args else ""
 
-    # ── HELP ──
-    if cmd == "help":
-        sub = args[1].lower() if len(args) > 1 else ""
-        builder = HELP_MAP.get(sub)
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        try:
-            if builder:
-                await message.channel.send(builder())
-            else:
-                await message.channel.send(
-                    f"> **error**\n"
-                    f"```\n"
-                    f"  unknown category: {sub}\n"
-                    f"  available: general, rpc, quests, sniper, ar\n"
-                    f"```"
-                )
-        except Exception as e:
-            print(f"[help] send error: {e}")
-        return
+    # ─────────────────────────────────
+    # HELP
+    # ─────────────────────────────────
 
-    # ── GENERAL ──
-    if cmd == "ping":
-        await message.edit(content=ansi(f"{GR}◈ pong{R}  {WH}{round(client.latency * 1000)}ms{R}"))
+    if cmd in ("help", "h"):
+        sub  = args[1].lower() if len(args) > 1 else ""
+        page = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
+        try: await message.delete()
+        except Exception: pass
+        if not sub:
+            await message.channel.send(build_help_root(page))
+        else:
+            await message.channel.send(build_help_section(sub, page))
+
+    # ─────────────────────────────────
+    # SETTINGS
+    # ─────────────────────────────────
+
+    elif cmd == "prefix":
+        global PREFIX
+        if len(args) < 2:
+            return await message.edit(content=ui_info(f"current prefix: {PREFIX}"))
+        PREFIX = args[1]
+        cfg = load_config(); cfg["prefix"] = PREFIX; save_config(cfg)
+        await message.edit(content=ui_ok(f"prefix changed to `{PREFIX}`"))
+
+    elif cmd == "version":
+        await message.edit(content=ui_info(f"sy's selfbot v{VERSION}"))
+
+    elif cmd == "reload":
+        global _cfg
+        _cfg = load_config()
+        await message.edit(content=ui_ok("config reloaded"))
+
+    # ─────────────────────────────────
+    # GENERAL
+    # ─────────────────────────────────
+
+    elif cmd == "ping":
+        await message.edit(content=ui_ok(f"pong — `{round(client.latency * 1000)}ms`"))
 
     elif cmd == "info":
         u = client.user
-        created = u.created_at.strftime("%Y-%m-%d")
-        await message.edit(content=ansi(
-            f"{help_header('account')}\n"
-            f"{help_row('user', f'{u} ({u.id})')}\n"
-            f"{help_row('created', created)}\n"
-            f"{help_row('servers', str(len(client.guilds)))}\n"
-            f"{help_row('prefix', PREFIX)}\n"
-            f"{help_row('platform', _current_platform)}"
-        ))
+        await message.edit(content=ui_box("account", [
+            f"  {DIM}user{RESET}     {WHITE}{u}{RESET}",
+            f"  {DIM}id{RESET}       {u.id}",
+            f"  {DIM}created{RESET}  {u.created_at.strftime('%Y-%m-%d')}",
+            f"  {DIM}servers{RESET}  {len(client.guilds)}",
+            f"  {DIM}prefix{RESET}   {PREFIX}",
+            f"  {DIM}platform{RESET} {_current_platform}",
+        ]))
 
     elif cmd == "say":
         await message.edit(content=" ".join(args[1:]))
 
     elif cmd == "spam":
         if len(args) < 3:
-            return await message.edit(content=ansi(f"{RD}✗  usage: {PREFIX}spam <n> <text>{R}"))
-        count = min(int(args[1]), 20)
+            return await message.edit(content=ui_err("usage: spam <n> <text>"))
+        try: count = int(args[1])
+        except ValueError:
+            return await message.edit(content=ui_err("n must be a number"))
+        count = min(count, 50)
         text = " ".join(args[2:])
-        await message.delete()
-
-        async def _send():
-            while True:
-                try:
-                    await message.channel.send(text)
-                    return
-                except discord.HTTPException as e:
-                    if getattr(e, 'status', None) == 429:
-                        # Wait exactly as long as Discord asks, then retry this message
-                        await asyncio.sleep(getattr(e, 'retry_after', 2.0))
-                        continue
-                    # Any other HTTP error: bail out so we don't infinite-loop
-                    return
-                except Exception:
-                    return
-
-        for _ in range(count):
-            await _send()
-            await asyncio.sleep(0.2)
+        try: await message.delete()
+        except Exception: pass
+        # fastest possible — no sleep, just rapid sends
+        tasks = [message.channel.send(text) for _ in range(count)]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     elif cmd == "purge":
-        limit = int(args[1]) if len(args) > 1 else 5
+        limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
+        try: await message.delete()
+        except Exception: pass
         deleted = 0
-        await message.delete()
-        async for msg in message.channel.history(limit=300):
+        async for msg in message.channel.history(limit=500):
             if msg.author.id == client.user.id:
                 try: await msg.delete()
                 except Exception: pass
                 deleted += 1
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.3)
                 if deleted >= limit: break
 
+    elif cmd == "purgeall":
+        try: await message.delete()
+        except Exception: pass
+        async for msg in message.channel.history(limit=1000):
+            if msg.author.id == client.user.id:
+                try: await msg.delete()
+                except Exception: pass
+                await asyncio.sleep(0.3)
+
     elif cmd == "clear":
-        await message.delete()
+        try: await message.delete()
+        except Exception: pass
 
     elif cmd == "copycat":
         if len(args) < 2:
-            return await message.edit(content=ansi(f"{RD}✗  usage: {PREFIX}copycat <user_id>{R}"))
-        try: target_id = int(args[1])
+            return await message.edit(content=ui_err("usage: copycat <user_id>"))
+        try: uid = int(args[1])
         except ValueError:
-            return await message.edit(content=ansi(f"{RD}✗  invalid user id{R}"))
-        await message.delete()
-        def check(m): return m.author.id == target_id and m.channel.id == message.channel.id
+            return await message.edit(content=ui_err("invalid user id"))
+        try: await message.delete()
+        except Exception: pass
+        def check(m): return m.author.id == uid and m.channel.id == message.channel.id
         for _ in range(10):
             try:
-                msg = await client.wait_for("message", check=check, timeout=60)
-                await message.channel.send(msg.content)
+                m = await client.wait_for("message", check=check, timeout=60)
+                await message.channel.send(m.content)
             except asyncio.TimeoutError: break
 
     elif cmd == "status":
         if len(args) < 2 or args[1].lower() == "clear":
             await client.change_presence(activity=None)
-            await message.edit(content=ansi(f"{GR}✓ status cleared{R}"))
+            await message.edit(content=ui_ok("status cleared"))
         else:
             text = " ".join(args[1:])
             await client.change_presence(activity=discord.CustomActivity(name=text))
-            await message.edit(content=ansi(f"{GR}✓ status{R}  {WH}{text}{R}"))
+            await message.edit(content=ui_ok(f"status set: {text}"))
 
-    # ── PLATFORM ──
     elif cmd == "platform":
         if len(args) < 2:
-            return await message.edit(content=ansi(
-                f"{help_header('platform')}\n"
-                f"{DIM}current: {CY}{_current_platform}{R}\n"
-                f"{DIM}types: phone │ android │ desktop │ web │ xbox │ playstation │ console │ vr │ off{R}"
-            ))
-        plat = args[1].lower()
-        if plat == "off": plat = "desktop"
+            return await message.edit(content=ui_info(f"platform: {_current_platform}\ntypes: {' '.join(PLATFORM_MAP)}"))
+        plat = "desktop" if args[1].lower() == "off" else args[1].lower()
         if plat not in PLATFORM_MAP:
-            return await message.edit(content=ansi(f"{RD}✗  unknown platform: {plat}{R}"))
-        await message.edit(content=ansi(f"{YE}⟳  switching to {plat}...{R}"))
-        ok = await set_platform(plat)
-        if ok:
-            await message.edit(content=ansi(f"{GR}✓ platform{R}  {WH}{plat}{R}\n{DIM}gateway will reconnect{R}"))
-        else:
-            await message.edit(content=ansi(f"{RD}✗  platform switch failed{R}"))
+            return await message.edit(content=ui_err(f"unknown platform: {plat}"))
+        _current_platform = plat
+        await message.edit(content=ui_ok(f"platform → {plat}  (reconnect required)"))
+        try: await client.ws.close(code=4000)
+        except Exception: pass
 
-    # ── HYPESQUAD ──
     elif cmd == "hypesquad":
         if len(args) < 2:
-            return await message.edit(content=ansi(
-                f"{help_header('hypesquad')}\n"
-                f"{help_row(f'{PREFIX}hypesquad bravery', 'set house bravery')}\n"
-                f"{help_row(f'{PREFIX}hypesquad brilliance', 'set house brilliance')}\n"
-                f"{help_row(f'{PREFIX}hypesquad balance', 'set house balance')}\n"
-                f"{help_row(f'{PREFIX}hypesquad off', 'remove hypesquad badge')}"
-            ))
+            return await message.edit(content=ui_err("usage: hypesquad bravery/brilliance/balance/off"))
         sub = args[1].lower()
         if sub == "off":
-            await message.edit(content=ansi(f"{YE}⟳  removing hypesquad badge...{R}"))
-            async with aiohttp.ClientSession() as session:
-                ok, msg = await remove_hypesquad(session, TOKEN)
-            if ok:
-                await message.edit(content=ansi(f"{GR}✓ hypesquad badge removed{R}"))
-            else:
-                await message.edit(content=ansi(f"{RD}✗  failed: {msg}{R}"))
+            ok = await clear_hypesquad()
+            await message.edit(content=ui_ok("hypesquad removed") if ok else ui_err("failed"))
         elif sub in HOUSE_IDS:
-            house_id = HOUSE_IDS[sub]
-            house_name = HOUSE_NAMES[house_id]
-            await message.edit(content=ansi(f"{YE}⟳  setting house {house_name}...{R}"))
-            async with aiohttp.ClientSession() as session:
-                ok, msg = await change_hypesquad(session, TOKEN, house_id)
-            if ok:
-                await message.edit(content=ansi(f"{GR}✓ hypesquad{R}  {WH}House {house_name}{R}"))
-            else:
-                await message.edit(content=ansi(f"{RD}✗  failed: {msg}{R}"))
+            ok, _ = await set_hypesquad(HOUSE_IDS[sub])
+            await message.edit(content=ui_ok(f"house {HOUSE_NAMES[HOUSE_IDS[sub]]}") if ok else ui_err("failed"))
         else:
-            await message.edit(content=ansi(
-                f"{RD}✗  unknown house: {sub}{R}\n"
-                f"{DIM}use: bravery / brilliance / balance / off{R}"
-            ))
+            await message.edit(content=ui_err("unknown house"))
 
-    # ── SNIPER / LOGGER ──
+    # ─────────────────────────────────
+    # SNIPER / LOGGER
+    # ─────────────────────────────────
+
     elif cmd == "sniper":
         SNIPER_ENABLED = len(args) < 2 or args[1].lower() == "on"
-        state = f"{GR}ON{R}" if SNIPER_ENABLED else f"{RD}OFF{R}"
-        await message.edit(content=ansi(f"{GR}✓ sniper{R}  {state}"))
+        await message.edit(content=ui_ok(f"sniper → {'ON' if SNIPER_ENABLED else 'OFF'}"))
 
     elif cmd == "logger":
         LOGGER_ENABLED = len(args) < 2 or args[1].lower() == "on"
-        state = f"{GR}ON{R}" if LOGGER_ENABLED else f"{RD}OFF{R}"
-        await message.edit(content=ansi(f"{GR}✓ logger{R}  {state}"))
+        await message.edit(content=ui_ok(f"logger → {'ON' if LOGGER_ENABLED else 'OFF'}"))
 
     elif cmd == "readlog":
-        n = int(args[1]) if len(args) > 1 else 10
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
         if not os.path.exists(LOG_FILE):
-            return await message.edit(content=ansi(f"{RD}✗  no log file yet{R}"))
+            return await message.edit(content=ui_err("no log file yet"))
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
         tail = "".join(lines[-n:])
         if len(tail) > 1900: tail = tail[-1900:]
         await message.edit(content=f"```\n{tail}\n```")
 
-    # ── AUTO-RESPONDER ──
+    elif cmd == "logs":
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+        if not os.path.exists(LOG_FILE):
+            return await message.edit(content=ui_err("no log yet"))
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        tail = "".join(lines[-n:])
+        if len(tail) > 1900: tail = tail[-1900:]
+        await message.edit(content=f"```\n{tail}\n```")
+
+    # ─────────────────────────────────
+    # AUTO-RESPONDER
+    # ─────────────────────────────────
+
     elif cmd == "ar":
-        if len(args) < 2:
-            return await message.edit(content=ansi(
-                f"{RD}✗  usage:{R}\n"
-                f"{help_row(f'{PREFIX}ar add trigger | response', 'add')}\n"
-                f"{help_row(f'{PREFIX}ar remove trigger', 'remove')}\n"
-                f"{help_row(f'{PREFIX}ar list', 'list all')}"
-            ))
-        sub = args[1].lower()
+        sub = args[1].lower() if len(args) > 1 else ""
         rest = " ".join(args[2:])
         if sub == "add":
             if "|" not in rest:
-                return await message.edit(content=ansi(f"{RD}✗  format: {PREFIX}ar add trigger | response{R}"))
-            trigger, response = rest.split("|", 1)
-            AUTO_RESPONSES[trigger.strip()] = response.strip()
-            await message.edit(content=ansi(f"{GR}✓ added{R}  {WH}{trigger.strip()}{R} {DIM}→{R} {WH}{response.strip()}{R}"))
+                return await message.edit(content=ui_err("format: ar add trigger | response"))
+            trig, resp = rest.split("|", 1)
+            AUTO_RESPONSES[trig.strip()] = resp.strip()
+            await message.edit(content=ui_ok(f"added: `{trig.strip()}`"))
         elif sub == "remove":
-            key = rest.strip()
-            AUTO_RESPONSES.pop(key, None)
-            await message.edit(content=ansi(f"{GR}✓ removed{R}  {WH}{key}{R}"))
+            AUTO_RESPONSES.pop(rest.strip(), None)
+            await message.edit(content=ui_ok(f"removed: `{rest.strip()}`"))
         elif sub == "list":
             if not AUTO_RESPONSES:
-                return await message.edit(content=ansi(f"{DIM}no auto-responses set{R}"))
-            lines = [help_header("auto-responder")]
-            for k, v in AUTO_RESPONSES.items():
-                lines.append(help_row(k, v))
-            await message.edit(content=ansi("\n".join(lines)))
+                return await message.edit(content=ui_info("no auto-responses set"))
+            rows = [f"  {GREY}├{RESET} {k}  {DIM}→ {v}{RESET}" for k, v in list(AUTO_RESPONSES.items())]
+            await message.edit(content=_paginate("ar", "auto-responder", rows))
         else:
-            await message.edit(content=ansi(f"{RD}✗  unknown subcommand: {sub}{R}"))
-    
+            await message.edit(content=ui_err("usage: ar add/remove/list"))
 
-    # ── QUESTS ──
+    # ─────────────────────────────────
+    # QUESTS
+    # ─────────────────────────────────
+
     elif cmd == "quest":
         try: await message.delete()
         except Exception: pass
-        service = QuestService(TOKEN)
+        svc = QuestService(TOKEN)
         async with aiohttp.ClientSession() as session:
-            quests = await service.fetch_quests(session)
+            quests = await svc.fetch(session)
         if not quests:
-            return await message.channel.send("```\nno quests found\n```", delete_after=10)
-        lines = ["```", "> quests", "─" * 36]
+            return await message.channel.send(ui_err("no quests found"), delete_after=8)
+        rows = []
         for i, q in enumerate(quests):
-            tag = "✓ done" if q.is_completed() else ("supported" if q.is_supported() else "unsupported")
-            pct = q.progress_percent()
-            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
-            lines.append(f"[{i}] {q.name}  {tag}")
-            lines.append(f"    {bar} {pct}%")
-            lines.append(f"    reward: {q.reward_name}")
-        lines.append("```")
-        await message.channel.send("\n".join(lines))
+            tag = f"{GREEN}done{RESET}" if q.is_completed() else (f"{CYAN}ok{RESET}" if q.is_supported() else f"{RED}unsupported{RESET}")
+            rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{q.name}{RESET}  {tag}")
+            rows.append(f"       {ui_progress(q.reward, q.progress_pct())}")
+        await message.channel.send(_paginate("quests", "active quests", rows))
 
     elif cmd == "questrun":
         try: await message.delete()
         except Exception: pass
-        idx = int(args[1]) if len(args) > 1 else 0
-        service = QuestService(TOKEN, speed_mode="fast")
+        idx = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
+        svc = QuestService(TOKEN)
         async with aiohttp.ClientSession() as session:
-            quests = await service.fetch_quests(session)
+            quests = await svc.fetch(session)
             if not quests or idx >= len(quests):
-                return await message.channel.send("```\nquest index out of range\n```", delete_after=8)
-            quest = quests[idx]
-            if quest.is_completed():
-                return await message.channel.send(f"```\n✓ {quest.name} already completed\n```", delete_after=8)
-            await message.channel.send(f"```\nquest completer started\n{quest.name}\n```", delete_after=5)
-            result = await service.run_quest(session, quest)
-            if result and result.get("status") == "completed":
-                await message.channel.send(f"```\n✓ {quest.name} complete — {quest.reward_name}\n```", delete_after=10)
+                return await message.channel.send(ui_err("index out of range"), delete_after=6)
+            q = quests[idx]
+            if q.is_completed():
+                return await message.channel.send(ui_ok(f"{q.name} already done"), delete_after=6)
+            await message.channel.send(ui_info(f"quest completer started\n  {q.name}"), delete_after=5)
+            res = await svc.run(session, q)
+            if res == "completed":
+                await message.channel.send(ui_ok(f"{q.name} complete — {q.reward}"), delete_after=10)
 
     elif cmd == "questall":
         try: await message.delete()
         except Exception: pass
-        service = QuestService(TOKEN, speed_mode="fast")
+        svc = QuestService(TOKEN)
         async with aiohttp.ClientSession() as session:
-            quests = await service.fetch_quests(session)
+            quests = await svc.fetch(session)
             active = [q for q in quests if not q.is_completed() and q.is_supported()]
             if not active:
-                return await message.channel.send("```\nno active supported quests\n```", delete_after=8)
+                return await message.channel.send(ui_err("no active quests"), delete_after=6)
             for q in active:
                 if not q.is_enrolled():
-                    try: await service.enroll(session, q)
+                    try: await svc.enroll(session, q)
                     except Exception: pass
-            await message.channel.send(f"```\nquest completer started\n{len(active)} quest(s) queued\n```", delete_after=5)
-            async def run_one_silent(q):
-                try:
-                    res = await service.run_quest(session, q)
-                    if res and res.get("status") == "completed":
-                        await message.channel.send(f"```\n✓ {q.name} — {q.reward_name}\n```", delete_after=10)
-                except Exception as e:
-                    print(f"[Quest] {q.name} error: {e}")
-            await asyncio.gather(*(run_one_silent(q) for q in active))
+            await message.channel.send(ui_info(f"quest completer started\n  {len(active)} quest(s) queued"), delete_after=5)
+            async def _run(q):
+                res = await svc.run(session, q)
+                if res == "completed":
+                    await message.channel.send(ui_ok(f"{q.name} — {q.reward}"), delete_after=10)
+            await asyncio.gather(*[_run(q) for q in active])
 
     elif cmd == "autoquest":
         try: await message.delete()
         except Exception: pass
         cfg = load_config()
-        if len(args) < 2:
-            cfg["autoquest_enabled"] = not cfg.get("autoquest_enabled", False)
-        else:
-            cfg["autoquest_enabled"] = args[1].lower() in ("on", "enable", "true")
+        on = len(args) < 2 or args[1].lower() in ("on", "enable")
+        cfg["autoquest_enabled"] = on
         save_config(cfg)
-        enabled = cfg["autoquest_enabled"]
-        if enabled: asyncio.create_task(run_autoquest_pass_now(TOKEN))
-        state = "enabled" if enabled else "disabled"
-        await message.channel.send(f"```\nquest completer started\nautoquest {state}\n```", delete_after=5)
+        if on: asyncio.create_task(autoquest_run(TOKEN))
+        await message.channel.send(ui_ok(f"autoquest → {'on' if on else 'off'}"), delete_after=5)
+
+    elif cmd == "autoclaim":
+        global _autoclaim_enabled
+        _autoclaim_enabled = len(args) < 2 or args[1].lower() in ("on", "enable")
+        await message.edit(content=ui_ok(f"autoclaim → {'on' if _autoclaim_enabled else 'off'}"))
+
+    elif cmd == "captcha":
+        global _captcha_key
+        if len(args) < 3 or args[1].lower() != "set":
+            return await message.edit(content=ui_err("usage: captcha set <2captcha_api_key>"))
+        _captcha_key = args[2].strip()
+        cfg = load_config(); cfg["captcha_key"] = _captcha_key; save_config(cfg)
+        await message.edit(content=ui_ok("2captcha key saved"))
 
     elif cmd == "orbbadge":
         try: await message.delete()
         except Exception: pass
-        await message.channel.send("```\nclaiming orb badge...\n```", delete_after=3)
-        async with aiohttp.ClientSession() as session:
-            result = await _claim_orb_badge(session, TOKEN)
-        if result["status"] == "SUCCESS":
-            extra = f"  balance before: {result['balance']} orbs" if isinstance(result.get("balance"), int) else ""
-            await message.channel.send(f"```\n✓ orb badge claimed!{extra}\n```", delete_after=10)
-        else:
-            await message.channel.send(f"```\n✗ failed: {result.get('message')} (code: {result.get('code')})\n```", delete_after=10)
+        ok, text = await claim_orb(TOKEN)
+        await message.channel.send(
+            ui_ok("orb badge claimed!") if ok else ui_err(f"failed: {text[:80]}"),
+            delete_after=8)
 
-    # ── RPC ──
+    # ─────────────────────────────────
+    # RPC
+    # ─────────────────────────────────
+
     elif cmd == "rpc":
         sub = args[1].lower() if len(args) > 1 else ""
-
-        # brand presets
-        if sub in BRAND_PRESETS:
-            brand_args = args[2:]
-            ok = await apply_brand_rpc(sub, brand_args)
-            preset = BRAND_PRESETS[sub]
-            if ok:
-                await message.edit(content=ansi(
-                    f"{GR}✓ rpc{R}  {WH}{preset.get('type', 'playing')} {preset.get('name', sub)}{R}"
-                ))
-            else:
-                await message.edit(content=ansi(f"{RD}✗  rpc preset failed{R}"))
-            return
+        BRANDS = ("spotify","youtube","xbox","playstation","crunchyroll","roblox","custom")
 
         if not sub or sub == "help":
-            await message.edit(content=build_help_rpc())
+            try: await message.delete()
+            except Exception: pass
+            await message.channel.send(build_help_section("rpc"))
 
-        elif sub in ("disable", "stop", "clear", "off"):
-            cfg = load_rpc_config()
-            cfg["enabled"] = False
-            save_rpc_config(cfg)
+        elif sub in BRANDS:
+            ok = await apply_brand_rpc(sub, args[2:])
+            await message.edit(content=ui_ok(f"rpc → {sub}") if ok else ui_err("rpc failed"))
+
+        elif sub in ("disable","stop","clear","off"):
+            cfg = load_rpc_cfg(); cfg["enabled"] = False; save_rpc_cfg(cfg)
             await client.change_presence(activity=None)
-            await message.edit(content=ansi(f"{RD}✗ rpc disabled{R}"))
+            await message.edit(content=ui_ok("rpc cleared"))
 
         elif sub == "enable":
-            cfg = load_rpc_config()
-            cfg["enabled"] = True
-            save_rpc_config(cfg)
+            cfg = load_rpc_cfg(); cfg["enabled"] = True; save_rpc_cfg(cfg)
             await update_rpc()
-            await message.edit(content=ansi(f"{GR}✓ rpc enabled{R}"))
+            await message.edit(content=ui_ok("rpc enabled"))
 
         elif sub == "status":
-            cfg = load_rpc_config()
-            state = f"{GR}enabled{R}" if cfg.get("enabled") else f"{RD}disabled{R}"
-            await message.edit(content=ansi(
-                f"{help_header('rpc status')}\n"
-                f"{help_row('state', '')}{state}\n"
-                f"{help_row('type', cfg.get('type', 'playing'))}\n"
-                f"{help_row('name', cfg.get('name') or 'none')}\n"
-                f"{help_row('details', cfg.get('details') or 'none')}\n"
-                f"{help_row('state_field', cfg.get('state') or 'none')}\n"
-                f"{help_row('large_image', cfg.get('large_image') or 'none')}\n"
-                f"{help_row('party', 'on' if cfg.get('party', {}).get('enabled') else 'off')}"
-            ))
+            cfg = load_rpc_cfg()
+            await message.edit(content=ui_box("rpc", [
+                f"  {DIM}enabled{RESET}     {'yes' if cfg.get('enabled') else 'no'}",
+                f"  {DIM}type{RESET}        {cfg.get('type')}",
+                f"  {DIM}name{RESET}        {cfg.get('name') or '-'}",
+                f"  {DIM}details{RESET}     {cfg.get('details') or '-'}",
+                f"  {DIM}state{RESET}       {cfg.get('state') or '-'}",
+                f"  {DIM}large_image{RESET} {cfg.get('large_image') or '-'}",
+            ]))
 
         elif sub == "type":
-            await message.delete()
-            valid = ["playing", "streaming", "listening", "watching", "competing"]
-            val = await rpc_prompt(message.channel, message.author, f"type  ({'/'.join(valid)})")
+            try: await message.delete()
+            except Exception: pass
+            val = await rpc_prompt(message.channel, message.author, "type (playing/streaming/watching/listening/competing)")
             if val == "__TIMEOUT__": return
-            if val not in valid:
-                return await message.channel.send(ansi(f"{RD}✗  invalid: {val}{R}"), delete_after=5)
-            cfg = load_rpc_config(); cfg["type"] = val; save_rpc_config(cfg)
-            await update_rpc()
-            await message.channel.send(ansi(f"{GR}✓ type{R}  {WH}{val}{R}"), delete_after=5)
+            cfg = load_rpc_cfg(); cfg["type"] = val; save_rpc_cfg(cfg); await update_rpc()
+            await message.channel.send(ui_ok(f"type → {val}"), delete_after=4)
 
-        elif sub in ("name", "details", "state", "large_image", "large_text",
-                     "small_image", "small_text", "url"):
-            await message.delete()
+        elif sub in ("name","details","state","url","large_image","large_text","small_image","small_text"):
+            try: await message.delete()
+            except Exception: pass
             val = await rpc_prompt(message.channel, message.author, sub)
             if val == "__TIMEOUT__": return
-            cfg = load_rpc_config(); cfg[sub] = val; save_rpc_config(cfg)
-            await update_rpc()
-            await message.channel.send(ansi(f"{GR}✓ {sub}{R}  {WH}{val or 'cleared'}{R}"), delete_after=5)
+            cfg = load_rpc_cfg(); cfg[sub] = val; save_rpc_cfg(cfg); await update_rpc()
+            await message.channel.send(ui_ok(f"{sub} set"), delete_after=4)
 
-        elif sub in ("start", "end"):
-            await message.delete()
+        elif sub in ("start","end"):
+            try: await message.delete()
+            except Exception: pass
             key = "start_timestamp" if sub == "start" else "end_timestamp"
-            val = await rpc_prompt(message.channel, message.author, f"{sub} timestamp  (unix / MM:SS / none)")
+            val = await rpc_prompt(message.channel, message.author, f"{sub} timestamp (unix / none)")
             if val == "__TIMEOUT__": return
-            cfg = load_rpc_config()
-            cfg[key] = None if (val is None or (val and val.lower() == "none")) else val
-            save_rpc_config(cfg); await update_rpc()
-            await message.channel.send(ansi(f"{GR}✓ {sub} timestamp set{R}"), delete_after=5)
+            cfg = load_rpc_cfg()
+            cfg[key] = None if (not val or val.lower() == "none") else val
+            save_rpc_cfg(cfg); await update_rpc()
+            await message.channel.send(ui_ok(f"{sub} timestamp set"), delete_after=4)
 
         elif sub in ("button1_name","button1_url","button2_name","button2_url"):
-            await message.delete()
-            idx = 0 if sub.startswith("button1") else 1
-            field = "label" if sub.endswith("name") else "url"
+            try: await message.delete()
+            except Exception: pass
+            idx = 0 if "1" in sub else 1
+            field = "label" if "name" in sub else "url"
             val = await rpc_prompt(message.channel, message.author, f"button {idx+1} {field}")
             if val == "__TIMEOUT__": return
-            cfg = load_rpc_config(); cfg["buttons"][idx][field] = val or ""; save_rpc_config(cfg)
-            await update_rpc()
-            await message.channel.send(ansi(f"{GR}✓ button {idx+1} {field} set{R}"), delete_after=5)
+            cfg = load_rpc_cfg(); cfg["buttons"][idx][field] = val or ""; save_rpc_cfg(cfg); await update_rpc()
+            await message.channel.send(ui_ok(f"button {idx+1} {field} set"), delete_after=4)
 
         elif sub == "party":
-            option = args[2].lower() if len(args) > 2 else ""
-            cfg = load_rpc_config()
-            if option == "enable":
-                cfg["party"]["enabled"] = True; save_rpc_config(cfg); await update_rpc()
-                await message.edit(content=ansi(f"{GR}✓ party enabled{R}"))
-            elif option == "disable":
-                cfg["party"]["enabled"] = False; save_rpc_config(cfg); await update_rpc()
-                await message.edit(content=ansi(f"{RD}✗ party disabled{R}"))
-            elif option in ("current", "max"):
-                await message.delete()
-                val = await rpc_prompt(message.channel, message.author, f"party {option}  (integer)")
-                if val == "__TIMEOUT__": return
+            opt = args[2].lower() if len(args) > 2 else ""
+            cfg = load_rpc_cfg()
+            if opt == "enable":
+                cfg["party"]["enabled"] = True; save_rpc_cfg(cfg); await update_rpc()
+                await message.edit(content=ui_ok("party enabled"))
+            elif opt == "disable":
+                cfg["party"]["enabled"] = False; save_rpc_cfg(cfg); await update_rpc()
+                await message.edit(content=ui_ok("party disabled"))
+            elif opt in ("current","max"):
                 try:
-                    cfg["party"][option] = int(val); save_rpc_config(cfg); await update_rpc()
-                    await message.channel.send(ansi(f"{GR}✓ party {option}{R}  {WH}{int(val)}{R}"), delete_after=5)
-                except (ValueError, TypeError):
-                    await message.channel.send(ansi(f"{RD}✗  must be integer{R}"), delete_after=5)
-            else:
-                await message.edit(content=ansi(f"{RD}✗  usage: {PREFIX}rpc party enable/disable/current/max{R}"))
+                    cfg["party"][opt] = int(args[3]); save_rpc_cfg(cfg); await update_rpc()
+                    await message.edit(content=ui_ok(f"party {opt} → {args[3]}"))
+                except (IndexError, ValueError):
+                    await message.edit(content=ui_err("usage: rpc party current/max <n>"))
         else:
-            await message.edit(content=ansi(f"{RD}✗  unknown subcommand: {sub}  —  use {PREFIX}rpc help{R}"))
+            await message.edit(content=ui_err(f"unknown rpc subcommand: {sub}"))
 
+    # ─────────────────────────────────
+    # VOICE
+    # ─────────────────────────────────
 
-    # ── VOICE COMMANDS ──
     elif cmd == "vcjoin":
         try: await message.delete()
         except Exception: pass
         if len(args) < 2:
-            # try to join author's current vc
-            if message.guild:
-                member = message.guild.get_member(client.user.id)
-                if member and member.voice and member.voice.channel:
-                    channel = member.voice.channel
-                else:
-                    return await message.channel.send("```\njoin a vc first or provide a channel id\n```", delete_after=5)
-            else:
-                return await message.channel.send("```\nprovide a channel id\n```", delete_after=5)
-        else:
-            try:
-                ch_id = int(args[1])
-                channel = client.get_channel(ch_id)
-                if not channel:
-                    return await message.channel.send("```\nchannel not found\n```", delete_after=5)
-            except ValueError:
-                return await message.channel.send("```\ninvalid channel id\n```", delete_after=5)
+            return await message.channel.send(ui_err("usage: vcjoin <channel_id>"), delete_after=5)
         try:
-            if message.guild.voice_client:
+            ch = client.get_channel(int(args[1]))
+            if not ch:
+                return await message.channel.send(ui_err("channel not found"), delete_after=5)
+            if message.guild and message.guild.voice_client:
                 await message.guild.voice_client.disconnect(force=True)
-            await channel.connect(self_deaf=True)
-            await message.channel.send(f"```\n✓ joined {channel.name}\n```", delete_after=5)
+            await ch.connect(self_deaf=True)
+            await message.channel.send(ui_ok(f"joined {ch.name}"), delete_after=5)
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+            await message.channel.send(ui_err(str(e)), delete_after=5)
 
     elif cmd == "vcleave":
         try: await message.delete()
@@ -1809,751 +1767,1685 @@ async def on_message(message):
         if message.guild and message.guild.voice_client:
             name = message.guild.voice_client.channel.name
             await message.guild.voice_client.disconnect(force=True)
-            await message.channel.send(f"```\n✓ left {name}\n```", delete_after=5)
+            await message.channel.send(ui_ok(f"left {name}"), delete_after=5)
         else:
-            await message.channel.send("```\nnot in a vc\n```", delete_after=5)
+            await message.channel.send(ui_err("not in a vc"), delete_after=5)
 
-    elif cmd == "vcmute":
+    elif cmd in ("vcmute","vcunmute","vcdeafen","vcundeafen","vckick"):
         try: await message.delete()
         except Exception: pass
         if not message.guild or len(args) < 2:
-            return await message.channel.send("```\nusage: vcmute <user_id>\n```", delete_after=5)
+            return await message.channel.send(ui_err(f"usage: {cmd} <user_id>"), delete_after=5)
         try:
             member = message.guild.get_member(int(args[1]))
-            if member and member.voice:
-                await member.edit(mute=True)
-                await message.channel.send(f"```\n✓ muted {member.name}\n```", delete_after=5)
+            if not member or not member.voice:
+                return await message.channel.send(ui_err("user not in vc"), delete_after=5)
+            if cmd == "vcmute":    await member.edit(mute=True)
+            elif cmd == "vcunmute":  await member.edit(mute=False)
+            elif cmd == "vcdeafen":  await member.edit(deafen=True)
+            elif cmd == "vcundeafen":await member.edit(deafen=False)
+            elif cmd == "vckick":    await member.move_to(None)
+            await message.channel.send(ui_ok(f"{cmd} → {member.name}"), delete_after=5)
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
-
-    elif cmd == "vcunmute":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild or len(args) < 2:
-            return await message.channel.send("```\nusage: vcunmute <user_id>\n```", delete_after=5)
-        try:
-            member = message.guild.get_member(int(args[1]))
-            if member and member.voice:
-                await member.edit(mute=False)
-                await message.channel.send(f"```\n✓ unmuted {member.name}\n```", delete_after=5)
-        except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
-
-    elif cmd == "vcdeafen":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild or len(args) < 2:
-            return await message.channel.send("```\nusage: vcdeafen <user_id>\n```", delete_after=5)
-        try:
-            member = message.guild.get_member(int(args[1]))
-            if member and member.voice:
-                await member.edit(deafen=True)
-                await message.channel.send(f"```\n✓ deafened {member.name}\n```", delete_after=5)
-        except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
-
-    elif cmd == "vcundeafen":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild or len(args) < 2:
-            return await message.channel.send("```\nusage: vcundeafen <user_id>\n```", delete_after=5)
-        try:
-            member = message.guild.get_member(int(args[1]))
-            if member and member.voice:
-                await member.edit(deafen=False)
-                await message.channel.send(f"```\n✓ undeafened {member.name}\n```", delete_after=5)
-        except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
-
-    elif cmd == "vckick":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild or len(args) < 2:
-            return await message.channel.send("```\nusage: vckick <user_id>\n```", delete_after=5)
-        try:
-            member = message.guild.get_member(int(args[1]))
-            if member and member.voice:
-                await member.move_to(None)
-                await message.channel.send(f"```\n✓ kicked {member.name} from vc\n```", delete_after=5)
-        except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+            await message.channel.send(ui_err(str(e)), delete_after=5)
 
     elif cmd == "vcmove":
         try: await message.delete()
         except Exception: pass
         if not message.guild or len(args) < 3:
-            return await message.channel.send("```\nusage: vcmove <user_id> <channel_id>\n```", delete_after=5)
+            return await message.channel.send(ui_err("usage: vcmove <user_id> <ch_id>"), delete_after=5)
         try:
             member = message.guild.get_member(int(args[1]))
-            channel = client.get_channel(int(args[2]))
-            if member and channel:
-                await member.move_to(channel)
-                await message.channel.send(f"```\n✓ moved {member.name} to {channel.name}\n```", delete_after=5)
+            ch = client.get_channel(int(args[2]))
+            await member.move_to(ch)
+            await message.channel.send(ui_ok(f"moved {member.name} → {ch.name}"), delete_after=5)
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+            await message.channel.send(ui_err(str(e)), delete_after=5)
 
     elif cmd == "vcmoveall":
         try: await message.delete()
         except Exception: pass
         if not message.guild or len(args) < 3:
-            return await message.channel.send("```\nusage: vcmoveall <ch1_id> <ch2_id>\n```", delete_after=5)
+            return await message.channel.send(ui_err("usage: vcmoveall <ch1_id> <ch2_id>"), delete_after=5)
         try:
             ch1 = client.get_channel(int(args[1]))
             ch2 = client.get_channel(int(args[2]))
-            if ch1 and ch2:
-                count = 0
-                for member in list(ch1.members):
-                    await member.move_to(ch2)
-                    count += 1
-                    await asyncio.sleep(0.3)
-                await message.channel.send(f"```\n✓ moved {count} users from {ch1.name} to {ch2.name}\n```", delete_after=8)
+            for m in list(ch1.members): await m.move_to(ch2); await asyncio.sleep(0.2)
+            await message.channel.send(ui_ok(f"moved all from {ch1.name} → {ch2.name}"), delete_after=5)
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+            await message.channel.send(ui_err(str(e)), delete_after=5)
 
-    # ── FUN COMMANDS ──
+    # ─────────────────────────────────
+    # FUN
+    # ─────────────────────────────────
+
     elif cmd == "gayrate":
         try: await message.delete()
         except Exception: pass
-        import random as _rnd
-        target_id = int(args[1]) if len(args) > 1 else message.author.id
-        if message.guild:
-            member = message.guild.get_member(target_id)
-            name = member.display_name if member else f"<@{target_id}>"
-        else:
-            name = f"<@{target_id}>"
-        pct = 0 if target_id == message.author.id else _rnd.randint(0, 100)
-        await message.channel.send(f"🏳️‍🌈 {name} is **{pct}%** gay")
+        uid = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.author.id
+        pct = 0 if uid == message.author.id else random.randint(0, 100)
+        await message.channel.send(f"🏳️‍🌈 <@{uid}> is **{pct}%** gay")
 
-    elif cmd in ("feed","tickle","slap","hug","cuddle","pat","kiss","poke","wink","smug","boop","nom"):
+    elif cmd in NEKO_ACTIONS:
         try: await message.delete()
         except Exception: pass
-        await send_neko(message.channel, cmd)
+        url = await neko_gif(cmd)
+        if url:
+            uid = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+            mention = f" <@{uid}>" if uid else ""
+            await message.channel.send(f"{cmd}{mention}\n{url}")
+        else:
+            await message.channel.send(ui_err("could not fetch image"), delete_after=5)
 
     elif cmd == "meme":
         try: await message.delete()
         except Exception: pass
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://meme-api.com/gimme") as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        await message.channel.send(data.get("url", "no meme found"))
-                    else:
-                        await message.channel.send("```\n✗ meme api down\n```", delete_after=5)
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://meme-api.com/gimme") as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        await message.channel.send(d.get("url", "no meme"))
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+            await message.channel.send(ui_err(str(e)), delete_after=5)
 
     elif cmd == "joke":
         try: await message.delete()
         except Exception: pass
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://official-joke-api.appspot.com/random_joke") as resp:
-                    if resp.status == 200:
-                        j = await resp.json()
-                        setup = j['setup']
-                        punchline = j['punchline']
-                        await message.channel.send(f"**{setup}**\n||{punchline}||")
-                    else:
-                        await message.channel.send("```\n✗ joke api down\n```", delete_after=5)
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://official-joke-api.appspot.com/random_joke") as r:
+                    if r.status == 200:
+                        j = await r.json()
+                        setup = j["setup"]; punch = j["punchline"]
+                        await message.channel.send(f"**{setup}**\n||{punch}||")
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=5)
+            await message.channel.send(ui_err(str(e)), delete_after=5)
 
     elif cmd == "mimic":
         try: await message.delete()
         except Exception: pass
         if len(args) < 2:
-            return await message.channel.send("```\nusage: mimic <user_id>\n```", delete_after=5)
+            return await message.channel.send(ui_err("usage: mimic <user_id>"), delete_after=5)
         uid = int(args[1])
         cid = message.channel.id
-        if cid not in _mimic_dict:
-            _mimic_dict[cid] = []
-        if uid not in _mimic_dict[cid]:
-            _mimic_dict[cid].append(uid)
-            await message.channel.send(f"```\n✓ mimicking <@{uid}> in this channel\n```", delete_after=5)
-        else:
-            await message.channel.send(f"```\nalready mimicking that user here\n```", delete_after=5)
+        if cid not in _mimic_dict: _mimic_dict[cid] = []
+        if uid not in _mimic_dict[cid]: _mimic_dict[cid].append(uid)
+        await message.channel.send(ui_ok(f"mimicking <@{uid}>"), delete_after=5)
 
     elif cmd == "unmimic":
         try: await message.delete()
         except Exception: pass
         if len(args) < 2:
-            return await message.channel.send("```\nusage: unmimic <user_id>\n```", delete_after=5)
-        uid = int(args[1])
-        cid = message.channel.id
+            return await message.channel.send(ui_err("usage: unmimic <user_id>"), delete_after=5)
+        uid = int(args[1]); cid = message.channel.id
         if cid in _mimic_dict and uid in _mimic_dict[cid]:
             _mimic_dict[cid].remove(uid)
-            if not _mimic_dict[cid]:
-                del _mimic_dict[cid]
-            await message.channel.send(f"```\n✓ stopped mimicking <@{uid}>\n```", delete_after=5)
-        else:
-            await message.channel.send("```\nnot mimicking that user here\n```", delete_after=5)
+            if not _mimic_dict[cid]: del _mimic_dict[cid]
+        await message.channel.send(ui_ok("stopped mimic"), delete_after=5)
 
     elif cmd == "stopmimic":
         try: await message.delete()
         except Exception: pass
         _mimic_dict.clear()
-        await message.channel.send("```\n✓ all mimics stopped\n```", delete_after=5)
+        await message.channel.send(ui_ok("all mimics stopped"), delete_after=5)
 
-    # ── TOOLS ──
+    # ─────────────────────────────────
+    # TOOLS
+    # ─────────────────────────────────
+
     elif cmd == "nitro":
         try: await message.delete()
         except Exception: pass
-        import random as _rnd
-        import string as _str
-        code = "".join(_rnd.choices(_str.ascii_letters + _str.digits, k=16))
-        url = f"https://discord.gift/{code}"
-        await message.channel.send(f"```\n{url}\n```")
-
-    elif cmd == "host":
-        sub = args[1].lower() if len(args) > 1 else ""
-        if sub == "add":
-            if len(args) < 3:
-                return await message.edit(content="```\nusage: host add <token>\n```")
-            token = args[2].strip()
-            if token in HOSTED_TOKENS:
-                return await message.edit(content="```\nalready in host list\n```")
-            HOSTED_TOKENS.append(token)
-            save_hosted()
-            username = await get_token_username(token)
-            await message.edit(content=f"```\n✓ added {username} to host list\n```")
-
-        elif sub == "remove":
-            if len(args) < 3:
-                return await message.edit(content="```\nusage: host remove <token>\n```")
-            token = args[2].strip()
-            if token in HOSTED_TOKENS:
-                HOSTED_TOKENS.remove(token)
-                save_hosted()
-                await message.edit(content="```\n✓ removed from host list\n```")
-            else:
-                await message.edit(content="```\ntoken not in host list\n```")
-
-        elif sub == "list":
-            if not HOSTED_TOKENS:
-                return await message.edit(content="```\nno hosted accounts\n```")
-            lines = ["```", f"hosted accounts: {len(HOSTED_TOKENS)}"]
-            for i, t in enumerate(HOSTED_TOKENS):
-                username = await get_token_username(t)
-                lines.append(f"  [{i}] {username}  {t[:10]}...")
-            lines.append("```")
-            await message.edit(content="\n".join(lines))
-
-        elif sub == "broadcast":
-            if len(args) < 3:
-                return await message.edit(content="```\nusage: host broadcast <message>\n```")
-            msg_text = " ".join(args[2:])
-            if not HOSTED_TOKENS:
-                return await message.edit(content="```\nno hosted accounts\n```")
-            await message.edit(content=f"```\nbroadcasting to {len(HOSTED_TOKENS)} accounts...\n```")
-            success = 0
-            for t in HOSTED_TOKENS:
-                ok = await hosted_send(t, message.channel.id, msg_text)
-                if ok: success += 1
-                await asyncio.sleep(0.5)
-            await message.edit(content=f"```\n✓ broadcast sent from {success}/{len(HOSTED_TOKENS)} accounts\n```")
-
-        else:
-            await message.edit(content=build_help_tools())
+        code = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+        await message.channel.send(f"```\nhttps://discord.gift/{code}\n```")
 
     elif cmd == "applybypass":
         try: await message.delete()
         except Exception: pass
         if len(args) < 2:
-            return await message.channel.send("```\nusage: applybypass <invite_code>\n```", delete_after=5)
-        invite = args[1].strip().replace("https://discord.gg/", "").replace("discord.gg/", "")
-        await message.channel.send(f"```\nattempting apply-to-join bypass for {invite}...\n```", delete_after=3)
+            return await message.channel.send(ui_err("usage: applybypass <invite>"), delete_after=5)
+        invite = args[1].replace("https://discord.gg/","").replace("discord.gg/","")
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
         try:
-            async with aiohttp.ClientSession() as session:
-                # Step 1: get invite info
-                headers = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
-                async with session.get(f"https://discord.com/api/v9/invites/{invite}", headers=headers) as resp:
-                    if resp.status != 200:
-                        return await message.channel.send(f"```\n✗ invalid invite\n```", delete_after=8)
-                    inv_data = await resp.json()
-
-                guild_id = inv_data.get("guild", {}).get("id")
-                if not guild_id:
-                    return await message.channel.send("```\n✗ could not get guild id\n```", delete_after=8)
-
-                # Step 2: accept invite (bypasses apply-to-join via direct accept)
-                async with session.post(
-                    f"https://discord.com/api/v9/invites/{invite}",
-                    headers=headers,
-                    json={"session_id": str(uuid4())[:8]}
-                ) as resp2:
-                    if resp2.status in (200, 204):
-                        guild_name = inv_data.get("guild", {}).get("name", "server")
-                        await message.channel.send(f"```\n✓ joined {guild_name}\n```", delete_after=8)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"https://discord.com/api/v9/invites/{invite}", headers=h) as r:
+                    if r.status != 200:
+                        return await message.channel.send(ui_err("invalid invite"), delete_after=6)
+                    inv = await r.json()
+                guild_id = inv.get("guild", {}).get("id")
+                async with s.post(f"https://discord.com/api/v9/invites/{invite}",
+                    headers=h, json={"session_id": str(uuid4())[:8]}) as r2:
+                    if r2.status in (200, 204):
+                        await message.channel.send(ui_ok(f"joined {inv.get('guild',{}).get('name','server')}"), delete_after=8)
+                    elif r2.status == 403 and guild_id:
+                        async with s.put(f"https://discord.com/api/v9/guilds/{guild_id}/requests/@me",
+                            headers=h, json={"form_fields": []}) as r3:
+                            await message.channel.send(
+                                ui_ok("application submitted") if r3.status in (200,201,204)
+                                else ui_err(f"bypass failed {r3.status}"), delete_after=8)
                     else:
-                        data2 = await resp2.json()
-                        # Try application bypass for apply-to-join
-                        if resp2.status == 403:
-                            # Server has apply-to-join — attempt via member verification bypass
-                            async with session.put(
-                                f"https://discord.com/api/v9/guilds/{guild_id}/requests/@me",
-                                headers=headers,
-                                json={"form_fields": []}
-                            ) as resp3:
-                                if resp3.status in (200, 201, 204):
-                                    await message.channel.send(f"```\n✓ application submitted — check server\n```", delete_after=8)
-                                else:
-                                    await message.channel.send(f"```\n✗ bypass failed: {resp2.status}\n```", delete_after=8)
-                        else:
-                            await message.channel.send(f"```\n✗ {data2.get('message', resp2.status)}\n```", delete_after=8)
+                        await message.channel.send(ui_err(f"failed {r2.status}"), delete_after=6)
         except Exception as e:
-            await message.channel.send(f"```\n✗ {e}\n```", delete_after=8)
+            await message.channel.send(ui_err(str(e)), delete_after=6)
 
-    # ── LAST.FM ──
+    elif cmd == "tokeninfo":
+        token = args[1] if len(args) > 1 else ""
+        if not token:
+            return await message.edit(content=ui_err("usage: tokeninfo <token>"))
+        try:
+            parts = token.split(".")
+            uid_b64 = parts[0]
+            uid = base64.b64decode(uid_b64 + "=" * (-len(uid_b64) % 4)).decode()
+            ts_b64 = parts[1]
+            pad = ts_b64 + "=" * (-len(ts_b64) % 4)
+            ts_bytes = base64.b64decode(pad)
+            epoch = int.from_bytes(ts_bytes[:4], "big")
+            created = datetime.utcfromtimestamp(epoch + 1293840000).strftime("%Y-%m-%d %H:%M:%S")
+            await message.edit(content=ui_box("token info", [
+                f"  {DIM}user_id{RESET}    {uid}",
+                f"  {DIM}created{RESET}    {created} UTC",
+            ]))
+        except Exception as e:
+            await message.edit(content=ui_err(f"decode failed: {e}"))
+
+    elif cmd == "calculate":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: calculate <expr>"))
+        expr = " ".join(args[1:])
+        try:
+            result = eval(re.sub(r"[^0-9+\-*/(). ]", "", expr))
+            await message.edit(content=ui_ok(f"{expr} = {result}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "fact":
+        try: await message.delete()
+        except Exception: pass
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://uselessfacts.jsph.pl/api/v2/facts/random?language=en") as r:
+                    d = await r.json()
+                    await message.channel.send(f"💡 {d.get('text','no fact')}")
+        except Exception as e:
+            await message.channel.send(ui_err(str(e)), delete_after=5)
+
+    elif cmd == "fetchlyrics":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: fetchlyrics <artist - title>"))
+        query = " ".join(args[1:])
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"https://lyrist.vercel.app/api/{query.replace(' - ','/')}") as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        lyrics = d.get("lyrics","")[:1800]
+                        await message.edit(content=f"```\n{lyrics}\n```")
+                    else:
+                        await message.edit(content=ui_err("lyrics not found"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "robuxtax":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: robuxtax <amount>"))
+        try:
+            amount = int(args[1])
+            after_tax = int(amount * 0.7)
+            fee = amount - after_tax
+            await message.edit(content=ui_box("roblox marketplace fee", [
+                f"  {DIM}listed price{RESET}   {amount:,} R$",
+                f"  {DIM}marketplace fee{RESET} {fee:,} R$ (30%)",
+                f"  {DIM}you receive{RESET}    {after_tax:,} R$",
+            ]))
+        except ValueError:
+            await message.edit(content=ui_err("invalid amount"))
+
+    elif cmd == "archivechannel":
+        try: await message.delete()
+        except Exception: pass
+        ch = client.get_channel(int(args[1])) if len(args) > 1 and args[1].isdigit() else message.channel
+        count = 0
+        out = []
+        async for msg in ch.history(limit=2000):
+            out.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author}: {msg.content}")
+            count += 1
+        fname = f"archive_{ch.id}.txt"
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write("\n".join(reversed(out)))
+        await message.channel.send(ui_ok(f"archived {count} messages to {fname}"), delete_after=8)
+
+    # ─────────────────────────────────
+    # HOST
+    # ─────────────────────────────────
+
+    elif cmd == "host":
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "add":
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: host add <token>"))
+            t = args[2].strip()
+            if t in HOSTED_TOKENS:
+                return await message.edit(content=ui_err("already in list"))
+            HOSTED_TOKENS.append(t)
+            save_hosted()
+            uname = await hosted_username(t)
+            await message.edit(content=ui_ok(f"added {uname}"))
+
+        elif sub == "remove":
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: host remove <token>"))
+            t = args[2].strip()
+            if t in HOSTED_TOKENS:
+                HOSTED_TOKENS.remove(t); save_hosted()
+                await message.edit(content=ui_ok("removed"))
+            else:
+                await message.edit(content=ui_err("not in list"))
+
+        elif sub == "list":
+            if not HOSTED_TOKENS:
+                return await message.edit(content=ui_err("no hosted accounts"))
+            rows = []
+            for i, t in enumerate(HOSTED_TOKENS):
+                uname = await hosted_username(t)
+                rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{uname}{RESET}  {DIM}{t[:12]}...{RESET}")
+            await message.edit(content=_paginate("host", "hosted accounts", rows))
+
+        elif sub == "broadcast":
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: host broadcast <msg>"))
+            text = " ".join(args[2:])
+            ok = 0
+            for t in HOSTED_TOKENS:
+                if await hosted_send(t, message.channel.id, text): ok += 1
+                await asyncio.sleep(0.5)
+            await message.edit(content=ui_ok(f"sent from {ok}/{len(HOSTED_TOKENS)} accounts"))
+
+        elif sub == "say":
+            if len(args) < 4:
+                return await message.edit(content=ui_err("usage: host say <index> <msg>"))
+            try:
+                idx = int(args[2])
+                t = HOSTED_TOKENS[idx]
+            except (ValueError, IndexError):
+                return await message.edit(content=ui_err("invalid index"))
+            text = " ".join(args[3:])
+            ok = await hosted_send(t, message.channel.id, text)
+            await message.edit(content=ui_ok("sent") if ok else ui_err("failed"))
+        else:
+            await message.edit(content=build_help_section("host"))
+
+    # ─────────────────────────────────
+    # LAST.FM
+    # ─────────────────────────────────
+
     elif cmd == "lastfm":
         sub = args[1].lower() if len(args) > 1 else ""
 
         if not sub or sub == "help":
             try: await message.delete()
             except Exception: pass
-            await message.channel.send(build_help_lastfm())
+            await message.channel.send(build_help_section("lastfm"))
 
         elif sub == "set":
-            # .lastfm set <username> [api_key]
             if len(args) < 3:
-                return await message.edit(content="```\nusage: lastfm set <username> [api_key]\n```")
-            _lastfm_cfg["username"] = args[2].strip()
-            if len(args) > 3:
-                _lastfm_cfg["api_key"] = args[3].strip()
-                global LASTFM_API_KEY
-                LASTFM_API_KEY = args[3].strip()
-            save_lastfm_cfg()
-            await message.edit(content=f"```\n✓ last.fm linked: {_lastfm_cfg['username']}\n```")
+                return await message.edit(content=ui_err("usage: lastfm set <username> [api_key]"))
+            _lfm["username"] = args[2].strip()
+            if len(args) > 3: _lfm["api_key"] = args[3].strip()
+            _save_lfm()
+            await message.edit(content=ui_ok(f"last.fm linked: {_lfm['username']}"))
 
-        elif sub in ("np", "nowplaying"):
+        elif sub in ("np","nowplaying"):
             try: await message.delete()
             except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first: .lastfm set <username>\n```", delete_after=8)
-            if LASTFM_API_KEY == "your_lastfm_api_key_here":
-                return await message.channel.send("```\n✗ set your api key: .lastfm set <username> <api_key>\nget one at last.fm/api\n```", delete_after=10)
-            track = await lfm_now_playing(username)
-            if not track:
-                return await message.channel.send("```\nno recent tracks found\n```", delete_after=8)
-            loved = "♥ " if track["loved"] else ""
-            status = "▶ now playing" if track["playing"] else "⏸ last played"
-            album = f"\n  album    {track['album']}" if track["album"] else ""
-            out = (
-                f"```\n"
-                f"  {status}\n"
-                f"  ──────────────────────────────\n"
-                f"  {loved}{track['title']}\n"
-                f"  by {track['artist']}{album}\n"
-                f"  ──────────────────────────────\n"
-                f"  scrobbles  {track['scrobbles']}\n"
-                f"  {track['url']}\n"
-                f"```"
-            )
-            await message.channel.send(out)
+            u = _lfm.get("username","")
+            if not u:
+                return await message.channel.send(ui_err("set username first: lastfm set <user>"), delete_after=8)
+            t = await lfm_np(u)
+            if not t:
+                return await message.channel.send(ui_info("no recent tracks"), delete_after=6)
+            loved = "♥ " if t["loved"] else ""
+            status = "▶ now playing" if t["playing"] else "⏸ last played"
+            rows = [
+                f"  {DIM}{status}{RESET}",
+                f"  {GREEN}{'─'*30}{RESET}",
+                f"  {WHITE}{loved}{t['title']}{RESET}",
+                f"  {DIM}by{RESET} {t['artist']}",
+            ]
+            if t["album"]: rows.append(f"  {DIM}album{RESET} {t['album']}")
+            rows.append(f"  {DIM}scrobbles{RESET} {t['total']}")
+            await message.channel.send(_ansi_block(rows))
 
         elif sub == "recent":
             try: await message.delete()
             except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            u = _lfm.get("username","")
+            if not u:
+                return await message.channel.send(ui_err("set username first"), delete_after=6)
             n = int(args[2]) if len(args) > 2 and args[2].isdigit() else 5
-            n = min(n, 15)
-            data = await lfm_get("user.getRecentTracks", {"user": username, "limit": n})
-            tracks = data.get("recenttracks", {}).get("track", [])
+            d = await lfm_get("user.getRecentTracks", {"user": u, "limit": min(n, 15)})
+            tracks = d.get("recenttracks", {}).get("track", [])
             if not tracks:
-                return await message.channel.send("```\nno recent tracks\n```", delete_after=8)
-            lines = ["```", f"  recent tracks — {username}", "  " + "─"*30]
+                return await message.channel.send(ui_info("no recent tracks"), delete_after=6)
+            rows = []
             for i, t in enumerate(tracks[:n], 1):
-                title  = t.get("name", "?")
-                artist = t.get("artist", {}).get("#text", "?") if isinstance(t.get("artist"), dict) else t.get("artist", "?")
-                now    = " ▶" if t.get("@attr", {}).get("nowplaying") else ""
-                lines.append(f"  {i:2}. {title} — {artist}{now}")
-            lines.append("```")
-            await message.channel.send("\n".join(lines))
+                title = t.get("name","?")
+                artist = (t.get("artist",{}) or {}).get("#text","?") if isinstance(t.get("artist"),dict) else "?"
+                now = " ▶" if t.get("@attr",{}).get("nowplaying") else ""
+                rows.append(f"  {GREY}{i:2}.{RESET} {WHITE}{title}{RESET}  {DIM}— {artist}{now}{RESET}")
+            await message.channel.send(_paginate("recent", u, rows))
 
-        elif sub in ("topartists", "artists"):
+        elif sub in ("topartists","artists","toptracks","tracks","topalbums","albums"):
             try: await message.delete()
             except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
+            u = _lfm.get("username","")
+            if not u:
+                return await message.channel.send(ui_err("set username first"), delete_after=6)
             period_raw = args[2].lower() if len(args) > 2 else "overall"
-            period = PERIOD_MAP.get(period_raw, "overall")
-            label  = PERIOD_LABEL.get(period, "all time")
-            data = await lfm_get("user.getTopArtists", {"user": username, "period": period, "limit": 10})
-            artists = data.get("topartists", {}).get("artist", [])
-            if not artists:
-                return await message.channel.send("```\nno data\n```", delete_after=8)
-            max_plays = int(artists[0].get("playcount", 1))
-            lines = ["```", f"  top artists — {username} — {label}", "  " + "─"*34]
-            for i, a in enumerate(artists[:10], 1):
-                name   = a.get("name", "?")
-                plays  = int(a.get("playcount", 0))
-                pct    = int(plays / max_plays * 100) if max_plays else 0
-                bar    = _progress_bar(pct, 8)
-                lines.append(f"  {i:2}. {bar} {plays:>5}  {name}")
-            lines.append("```")
-            await message.channel.send("\n".join(lines))
-
-        elif sub in ("toptracks", "tracks"):
-            try: await message.delete()
-            except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
-            period_raw = args[2].lower() if len(args) > 2 else "overall"
-            period = PERIOD_MAP.get(period_raw, "overall")
-            label  = PERIOD_LABEL.get(period, "all time")
-            data = await lfm_get("user.getTopTracks", {"user": username, "period": period, "limit": 10})
-            tracks = data.get("toptracks", {}).get("track", [])
-            if not tracks:
-                return await message.channel.send("```\nno data\n```", delete_after=8)
-            max_plays = int(tracks[0].get("playcount", 1))
-            lines = ["```", f"  top tracks — {username} — {label}", "  " + "─"*34]
-            for i, t in enumerate(tracks[:10], 1):
-                name   = t.get("name", "?")
-                artist = t.get("artist", {}).get("name", "?") if isinstance(t.get("artist"), dict) else "?"
-                plays  = int(t.get("playcount", 0))
-                pct    = int(plays / max_plays * 100) if max_plays else 0
-                bar    = _progress_bar(pct, 8)
-                lines.append(f"  {i:2}. {bar} {plays:>5}  {name} — {artist}")
-            lines.append("```")
-            await message.channel.send("\n".join(lines))
-
-        elif sub in ("topalbums", "albums"):
-            try: await message.delete()
-            except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
-            period_raw = args[2].lower() if len(args) > 2 else "overall"
-            period = PERIOD_MAP.get(period_raw, "overall")
-            label  = PERIOD_LABEL.get(period, "all time")
-            data = await lfm_get("user.getTopAlbums", {"user": username, "period": period, "limit": 10})
-            albums = data.get("topalbums", {}).get("album", [])
-            if not albums:
-                return await message.channel.send("```\nno data\n```", delete_after=8)
-            max_plays = int(albums[0].get("playcount", 1))
-            lines = ["```", f"  top albums — {username} — {label}", "  " + "─"*34]
-            for i, a in enumerate(albums[:10], 1):
-                name   = a.get("name", "?")
-                artist = a.get("artist", {}).get("name", "?") if isinstance(a.get("artist"), dict) else "?"
-                plays  = int(a.get("playcount", 0))
-                pct    = int(plays / max_plays * 100) if max_plays else 0
-                bar    = _progress_bar(pct, 8)
-                lines.append(f"  {i:2}. {bar} {plays:>5}  {name} — {artist}")
-            lines.append("```")
-            await message.channel.send("\n".join(lines))
+            period = _PERIOD.get(period_raw, "overall")
+            label  = _PLABEL.get(period, "all time")
+            method_map = {
+                "topartists": ("user.getTopArtists", "topartists", "artist"),
+                "artists":    ("user.getTopArtists", "topartists", "artist"),
+                "toptracks":  ("user.getTopTracks",  "toptracks",  "track"),
+                "tracks":     ("user.getTopTracks",  "toptracks",  "track"),
+                "topalbums":  ("user.getTopAlbums",  "topalbums",  "album"),
+                "albums":     ("user.getTopAlbums",  "topalbums",  "album"),
+            }
+            method, key, item_key = method_map[sub]
+            d = await lfm_get(method, {"user": u, "period": period, "limit": 10})
+            items = d.get(key, {}).get(item_key, [])
+            if not items:
+                return await message.channel.send(ui_info("no data"), delete_after=6)
+            max_plays = int(items[0].get("playcount", 1)) or 1
+            rows = []
+            for i, item in enumerate(items[:10], 1):
+                name   = item.get("name","?")
+                plays  = int(item.get("playcount", 0))
+                pct    = int(plays / max_plays * 100)
+                bar    = f"{GREEN}{'▓' * (pct // 10)}{GREY}{'░' * (10 - pct // 10)}{RESET}"
+                extra  = ""
+                if "artist" in item and isinstance(item["artist"], dict):
+                    extra = f"  {DIM}— {item['artist'].get('name','')}{RESET}"
+                rows.append(f"  {GREY}{i:2}.{RESET} {bar} {DIM}{plays:>5}{RESET}  {WHITE}{name}{RESET}{extra}")
+            await message.channel.send(_paginate(sub, f"{u} — {label}", rows))
 
         elif sub == "stats":
             try: await message.delete()
             except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
-            data = await lfm_get("user.getInfo", {"user": username})
-            user_data = data.get("user", {})
-            if not user_data:
-                return await message.channel.send("```\n✗ user not found\n```", delete_after=8)
-            scrobbles   = user_data.get("playcount", "?")
-            artists     = user_data.get("artist_count", "?")
-            tracks      = user_data.get("track_count", "?")
-            albums      = user_data.get("album_count", "?")
-            country     = user_data.get("country", "?")
-            registered  = user_data.get("registered", {}).get("#text", "?") if isinstance(user_data.get("registered"), dict) else "?"
-            realname    = user_data.get("realname", "")
-            lines = [
-                "```",
-                f"  {username}" + (f" ({realname})" if realname else ""),
-                "  " + "─"*30,
-                f"  scrobbles    {scrobbles}",
-                f"  artists      {artists}",
-                f"  albums       {albums}",
-                f"  tracks       {tracks}",
-                f"  country      {country}",
-                f"  since        {registered}",
-                f"  last.fm/user/{username}",
-                "```",
+            u = _lfm.get("username","")
+            if not u:
+                return await message.channel.send(ui_err("set username first"), delete_after=6)
+            d = await lfm_get("user.getInfo", {"user": u})
+            ud = d.get("user",{})
+            if not ud:
+                return await message.channel.send(ui_err("user not found"), delete_after=6)
+            rows = [
+                f"  {WHITE}{u}{RESET}",
+                f"  {DIM}scrobbles{RESET}   {ud.get('playcount','?')}",
+                f"  {DIM}artists{RESET}     {ud.get('artist_count','?')}",
+                f"  {DIM}albums{RESET}      {ud.get('album_count','?')}",
+                f"  {DIM}tracks{RESET}      {ud.get('track_count','?')}",
+                f"  {DIM}country{RESET}     {ud.get('country','?')}",
             ]
-            await message.channel.send("\n".join(lines))
+            await message.channel.send(_ansi_block(rows))
 
         elif sub == "compare":
             try: await message.delete()
             except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
-            if len(args) < 3:
-                return await message.channel.send("```\nusage: lastfm compare <other_username>\n```", delete_after=8)
-            other = args[2].strip()
-            data = await lfm_get("tasteometer.compare", {"type1": "user", "type2": "user", "value1": username, "value2": other, "limit": 5})
-            result = data.get("comparison", {}).get("result", {})
-            score_raw = result.get("score", 0)
-            try: score = float(score_raw) * 100
-            except: score = 0
-            artists_list = result.get("artists", {}).get("artist", [])
-            if isinstance(artists_list, dict):
-                artists_list = [artists_list]
-            bar = _progress_bar(int(score), 20)
-            lines = [
-                "```",
-                f"  taste compare — {username} vs {other}",
-                "  " + "─"*34,
-                f"  compatibility  {score:.1f}%",
-                f"  {bar}",
+            u = _lfm.get("username","")
+            if not u or len(args) < 3:
+                return await message.channel.send(ui_err("usage: lastfm compare <other_user>"), delete_after=6)
+            other = args[2]
+            d = await lfm_get("tasteometer.compare", {"type1":"user","type2":"user","value1":u,"value2":other,"limit":5})
+            result = d.get("comparison",{}).get("result",{})
+            score = float(result.get("score",0)) * 100
+            artists = result.get("artists",{}).get("artist",[])
+            if isinstance(artists, dict): artists = [artists]
+            filled = int(score / 10)
+            bar = f"{GREEN}{'▓'*filled}{GREY}{'░'*(10-filled)}{RESET}"
+            rows = [
+                f"  {WHITE}{u}{RESET}  {DIM}vs{RESET}  {WHITE}{other}{RESET}",
+                f"  {bar}  {DIM}{score:.1f}% compatible{RESET}",
             ]
-            if artists_list:
-                lines.append("  ─"*17)
-                lines.append("  shared artists")
-                for a in artists_list[:5]:
-                    name = a.get("name", "?") if isinstance(a, dict) else str(a)
-                    lines.append(f"    • {name}")
-            lines.append("```")
-            await message.channel.send("\n".join(lines))
+            if artists:
+                rows.append(f"  {DIM}shared:{RESET}")
+                for a in artists[:5]:
+                    rows.append(f"    {GREY}•{RESET} {a.get('name','?') if isinstance(a,dict) else a}")
+            await message.channel.send(_ansi_block(rows))
 
         elif sub == "rpc":
             try: await message.delete()
             except Exception: pass
-            username = _lfm_user()
-            if not username:
-                return await message.channel.send("```\n✗ set your last.fm first\n```", delete_after=8)
-            track = await lfm_now_playing(username)
-            if not track or not track["playing"]:
-                return await message.channel.send("```\nno track playing right now\n```", delete_after=8)
-            title  = track["title"]
-            artist = track["artist"]
-            ok = await apply_brand_rpc("spotify", [f"{title} | {artist} | 210"])
-            if ok:
-                await message.channel.send(f"```\n✓ rpc set to {title} — {artist}\n```", delete_after=6)
-            else:
-                await message.channel.send("```\n✗ rpc update failed\n```", delete_after=6)
+            u = _lfm.get("username","")
+            if not u:
+                return await message.channel.send(ui_err("set username first"), delete_after=6)
+            t = await lfm_np(u)
+            if not t or not t["playing"]:
+                return await message.channel.send(ui_info("nothing playing right now"), delete_after=6)
+            ok = await apply_brand_rpc("spotify", [f"{t['title']} | {t['artist']} | 210"])
+            await message.channel.send(
+                ui_ok(f"rpc → {t['title']} — {t['artist']}") if ok else ui_err("rpc failed"),
+                delete_after=6)
 
         elif sub == "autorpc":
-            global _autorpc_task, _autorpc_enabled
-            option = args[2].lower() if len(args) > 2 else ""
-            if option == "on":
-                username = _lfm_user()
-                if not username:
-                    return await message.edit(content="```\n✗ set your last.fm first\n```")
-                if _autorpc_task and not _autorpc_task.done():
-                    _autorpc_task.cancel()
+            global _autorpc_enabled, _autorpc_task
+            opt = args[2].lower() if len(args) > 2 else ""
+            if opt == "on":
+                u = _lfm.get("username","")
+                if not u:
+                    return await message.edit(content=ui_err("set username first"))
                 _autorpc_enabled = True
-                _autorpc_task = asyncio.create_task(lfm_autorpc_loop())
-                await message.edit(content="```\n✓ lastfm autorpc enabled — updates every 30s\n```")
-            elif option == "off":
-                _autorpc_enabled = False
                 if _autorpc_task and not _autorpc_task.done():
                     _autorpc_task.cancel()
-                    _autorpc_task = None
-                await client.change_presence(activity=None)
-                await message.edit(content="```\n✗ lastfm autorpc disabled\n```")
+                _autorpc_task = asyncio.create_task(lfm_autorpc_loop())
+                await message.edit(content=ui_ok("lastfm autorpc enabled"))
+            elif opt == "off":
+                _autorpc_enabled = False
+                if _autorpc_task:
+                    _autorpc_task.cancel(); _autorpc_task = None
+                await message.edit(content=ui_ok("lastfm autorpc disabled"))
             else:
                 state = "on" if _autorpc_enabled else "off"
-                await message.edit(content=f"```\nauthorpc is {state}\n```")
-
+                await message.edit(content=ui_info(f"autorpc is {state}"))
         else:
             try: await message.delete()
             except Exception: pass
-            await message.channel.send(build_help_lastfm())
+            await message.channel.send(build_help_section("lastfm"))
+
+    # ─────────────────────────────────
+    # DEVELOPER
+    # ─────────────────────────────────
+
+    elif cmd == "eval":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: eval <code>"))
+        code = " ".join(args[1:])
+        try:
+            result = eval(code, {"client": client, "message": message, "discord": discord, "asyncio": asyncio})
+            if asyncio.iscoroutine(result): result = await result
+            await message.edit(content=f"```py\n{str(result)[:1900]}\n```")
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "restart":
+        await message.edit(content=ui_warn("restarting..."))
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    # ─────────────────────────────────
+    # SERVER MANAGEMENT
+    # ─────────────────────────────────
+
+    elif cmd == "serverinfo":
+        g = message.guild
+        if not g:
+            return await message.edit(content=ui_err("not in a server"))
+        await message.edit(content=ui_box(g.name, [
+            f"  {DIM}id{RESET}          {g.id}",
+            f"  {DIM}owner{RESET}       {g.owner}",
+            f"  {DIM}members{RESET}     {g.member_count}",
+            f"  {DIM}channels{RESET}    {len(g.channels)}",
+            f"  {DIM}roles{RESET}       {len(g.roles)}",
+            f"  {DIM}created{RESET}     {g.created_at.strftime('%Y-%m-%d')}",
+            f"  {DIM}boost level{RESET} {g.premium_tier}",
+        ]))
+
+    elif cmd == "members":
+        g = message.guild
+        if not g:
+            return await message.edit(content=ui_err("not in a server"))
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+        rows = [f"  {GREY}•{RESET} {m.display_name}  {DIM}({m.id}){RESET}" for m in list(g.members)[:n]]
+        await message.edit(content=_paginate("members", g.name, rows))
+
+    elif cmd == "channels":
+        g = message.guild
+        if not g:
+            return await message.edit(content=ui_err("not in a server"))
+        rows = [f"  {GREY}•{RESET} #{ch.name}  {DIM}({ch.id}){RESET}" for ch in g.channels]
+        await message.edit(content=_paginate("channels", g.name, rows))
+
+    elif cmd == "roles":
+        g = message.guild
+        if not g:
+            return await message.edit(content=ui_err("not in a server"))
+        rows = [f"  {GREY}•{RESET} {r.name}  {DIM}({r.id}){RESET}" for r in g.roles]
+        await message.edit(content=_paginate("roles", g.name, rows))
+
+    elif cmd in ("ban","kick","mute","unmute"):
+        g = message.guild
+        if not g or len(args) < 2:
+            return await message.edit(content=ui_err(f"usage: {cmd} <user_id>"))
+        try:
+            member = g.get_member(int(args[1]))
+            if cmd == "ban":
+                reason = " ".join(args[2:]) or "no reason"
+                await g.ban(member, reason=reason)
+            elif cmd == "kick":
+                reason = " ".join(args[2:]) or "no reason"
+                await g.kick(member, reason=reason)
+            elif cmd == "mute":
+                until = discord.utils.utcnow() + timedelta(minutes=10)
+                await member.timeout(until)
+            elif cmd == "unmute":
+                await member.timeout(None)
+            await message.edit(content=ui_ok(f"{cmd} → {member}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "setnick":
+        g = message.guild
+        if not g or len(args) < 3:
+            return await message.edit(content=ui_err("usage: setnick <user_id> <nick>"))
+        try:
+            m = g.get_member(int(args[1]))
+            nick = " ".join(args[2:])
+            await m.edit(nick=nick)
+            await message.edit(content=ui_ok(f"nick set: {nick}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "topic":
+        if not message.guild or len(args) < 2:
+            return await message.edit(content=ui_err("usage: topic <text>"))
+        try:
+            await message.channel.edit(topic=" ".join(args[1:]))
+            await message.edit(content=ui_ok("topic set"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "slowmode":
+        if not message.guild or len(args) < 2:
+            return await message.edit(content=ui_err("usage: slowmode <seconds>"))
+        try:
+            await message.channel.edit(slowmode_delay=int(args[1]))
+            await message.edit(content=ui_ok(f"slowmode → {args[1]}s"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    # ─────────────────────────────────
+    # INFORMATION
+    # ─────────────────────────────────
+
+    elif cmd == "userinfo":
+        uid = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.author.id
+        try:
+            async with aiohttp.ClientSession() as s:
+                h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+                async with s.get(f"https://discord.com/api/v9/users/{uid}", headers=h) as r:
+                    if r.status != 200:
+                        return await message.edit(content=ui_err("user not found"))
+                    u = await r.json()
+            pfp = f"https://cdn.discordapp.com/avatars/{uid}/{u.get('avatar')}.webp?size=256" if u.get("avatar") else "no avatar"
+            await message.edit(content=ui_box("user info", [
+                f"  {DIM}username{RESET}   {u.get('username','?')}",
+                f"  {DIM}id{RESET}         {uid}",
+                f"  {DIM}avatar{RESET}     {pfp}",
+                f"  {DIM}bot{RESET}        {'yes' if u.get('bot') else 'no'}",
+                f"  {DIM}badge flags{RESET} {u.get('public_flags',0)}",
+            ]))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "avatar":
+        uid = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.author.id
+        try:
+            async with aiohttp.ClientSession() as s:
+                h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+                async with s.get(f"https://discord.com/api/v9/users/{uid}", headers=h) as r:
+                    if r.status != 200:
+                        return await message.edit(content=ui_err("user not found"))
+                    u = await r.json()
+            if u.get("avatar"):
+                url = f"https://cdn.discordapp.com/avatars/{uid}/{u['avatar']}.webp?size=2048"
+                await message.edit(content=url)
+            else:
+                await message.edit(content=ui_info("no avatar"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "checkname":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: checkname <username>"))
+        username = args[1].lower().strip()
+        try:
+            async with aiohttp.ClientSession() as s:
+                h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+                async with s.post("https://discord.com/api/v9/users/@me/pomelo-attempt",
+                    headers=h, json={"username": username}) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        taken = d.get("taken", True)
+                        await message.edit(content=
+                            ui_ok(f"`{username}` is AVAILABLE! claim it now") if not taken
+                            else ui_err(f"`{username}` is taken"))
+                    else:
+                        await message.edit(content=ui_err(f"check failed ({r.status})"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "whois":
+        uid = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.author.id
+        try:
+            async with aiohttp.ClientSession() as s:
+                h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+                async with s.get(f"https://discord.com/api/v9/users/{uid}/profile", headers=h) as r:
+                    if r.status != 200:
+                        return await message.edit(content=ui_err("profile not found"))
+                    p = await r.json()
+            u = p.get("user", {})
+            badges = [b.get("id","") for b in p.get("badges", [])]
+            rows = [
+                f"  {DIM}username{RESET}   {u.get('username','?')}",
+                f"  {DIM}id{RESET}         {uid}",
+                f"  {DIM}bio{RESET}        {u.get('bio','') or '-'}",
+                f"  {DIM}badges{RESET}     {', '.join(badges) or 'none'}",
+                f"  {DIM}nitro{RESET}      {'yes' if p.get('premium_since') else 'no'}",
+                f"  {DIM}mutual servers{RESET} {len(p.get('mutual_guilds', []))}",
+                f"  {DIM}mutual friends{RESET} {len(p.get('mutual_friends', []))}",
+            ]
+            await message.edit(content=ui_box("whois", rows))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    # ─────────────────────────────────
+    # GROUP CHAT
+    # ─────────────────────────────────
+
+    elif cmd == "gclist":
+        try: await message.delete()
+        except Exception: pass
+        dms = [c for c in client.private_channels if isinstance(c, discord.GroupChannel)]
+        if not dms:
+            return await message.channel.send(ui_info("no group DMs"), delete_after=5)
+        rows = [f"  {GREY}[{i}]{RESET} {WHITE}{gc.name or 'Unnamed GC'}{RESET}  {DIM}({gc.id}){RESET}"
+                for i, gc in enumerate(dms)]
+        await message.channel.send(_paginate("groupchats", "your group DMs", rows))
+
+    elif cmd == "gcrename":
+        if len(args) < 2 or not isinstance(message.channel, discord.GroupChannel):
+            return await message.edit(content=ui_err("run in a group DM: gcrename <name>"))
+        try:
+            await message.channel.edit(name=" ".join(args[1:]))
+            await message.edit(content=ui_ok("gc renamed"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcleave":
+        if not isinstance(message.channel, discord.GroupChannel):
+            return await message.edit(content=ui_err("run in a group DM"))
+        try:
+            await message.channel.leave()
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "agc":
+        sub = args[1].lower() if len(args) > 1 else ""
+        if not sub:
+            state = "ON" if _agc_state["enabled"] else "OFF"
+            return await message.edit(content=ui_info(f"anti-gc trap is {state}"))
+        elif sub in ("on","enable"):
+            _agc_state["enabled"] = True
+            await message.edit(content=ui_ok("anti-gc trap enabled"))
+        elif sub in ("off","disable"):
+            _agc_state["enabled"] = False
+            await message.edit(content=ui_ok("anti-gc trap disabled"))
+        elif sub == "block":
+            opt = args[2].lower() if len(args) > 2 else ""
+            _agc_state["block"] = opt in ("on","enable")
+            await message.edit(content=ui_ok(f"agc auto-block → {opt}"))
+        elif sub == "msg":
+            _agc_state["leave_msg"] = " ".join(args[2:])
+            await message.edit(content=ui_ok("agc leave message set"))
+        elif sub == "name":
+            _agc_state["gc_name"] = " ".join(args[2:])
+            await message.edit(content=ui_ok("agc gc name set"))
+        elif sub == "icon":
+            _agc_state["gc_icon_url"] = args[2] if len(args) > 2 else None
+            await message.edit(content=ui_ok("agc icon url set"))
+        elif sub == "webhook":
+            _agc_state["webhook_url"] = args[2] if len(args) > 2 else None
+            await message.edit(content=ui_ok("agc webhook set"))
+        elif sub == "whitelist":
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: agc whitelist <user_id>"))
+            uid = args[2].strip("<@!>")
+            _agc_whitelist.add(uid); _agc_save_wl()
+            await message.edit(content=ui_ok(f"whitelisted {uid}"))
+        elif sub == "unwhitelist":
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: agc unwhitelist <user_id>"))
+            uid = args[2].strip("<@!>")
+            _agc_whitelist.discard(uid); _agc_save_wl()
+            await message.edit(content=ui_ok(f"removed {uid} from whitelist"))
+        elif sub == "wllist":
+            if not _agc_whitelist:
+                return await message.edit(content=ui_info("whitelist is empty"))
+            rows = [f"  {GREY}•{RESET} {uid}" for uid in _agc_whitelist]
+            await message.edit(content=_paginate("agc whitelist", "", rows))
+        else:
+            await message.edit(content=ui_err("usage: agc on/off/block/msg/name/icon/webhook/whitelist"))
+
+    # ─────────────────────────────────
+    # UTILITY
+    # ─────────────────────────────────
+
+    elif cmd == "uwuify":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: uwuify <text>"))
+        await message.edit(content=uwuify(" ".join(args[1:])))
+
+    elif cmd == "owoify":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: owoify <text>"))
+        await message.edit(content=owoify(" ".join(args[1:])))
+
+    elif cmd == "mock":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: mock <text>"))
+        await message.edit(content=mock_text(" ".join(args[1:])))
+
+    elif cmd == "reverse":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: reverse <text>"))
+        await message.edit(content=" ".join(args[1:])[::-1])
+
+    elif cmd == "aesthetic":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: aesthetic <text>"))
+        await message.edit(content=aesthetic(" ".join(args[1:])))
+
+    elif cmd == "clap":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: clap <text>"))
+        await message.edit(content=clap_text(" ".join(args[1:])))
+
+    elif cmd == "animatetype":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: animatetype <text>"))
+        text = " ".join(args[1:])
+        built = ""
+        for ch in text:
+            built += ch
+            try: await message.edit(content=built)
+            except Exception: pass
+            await asyncio.sleep(0.1)
+
+    elif cmd == "autoreact":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: autoreact <emoji>"))
+        _autoreact_emoji = args[1]
+        await message.edit(content=ui_ok(f"auto-reacting with {_autoreact_emoji}"))
+
+    elif cmd == "autoreactstop":
+        _autoreact_emoji = None
+        await message.edit(content=ui_ok("auto-react stopped"))
+
+    elif cmd == "typing":
+        cid = message.channel.id
+        if cid in _typing_tasks and not _typing_tasks[cid].done():
+            return await message.edit(content=ui_info("already typing here"))
+        try: await message.delete()
+        except Exception: pass
+        _typing_tasks[cid] = asyncio.create_task(typing_loop(message.channel))
+
+    elif cmd == "typingstop":
+        cid = message.channel.id
+        if cid in _typing_tasks:
+            _typing_tasks[cid].cancel(); del _typing_tasks[cid]
+        try: await message.delete()
+        except Exception: pass
+
+    elif cmd == "afk":
+        _afk_enabled = True
+        _afk_msg = " ".join(args[1:]) if len(args) > 1 else "I'm AFK right now."
+        await message.edit(content=ui_ok(f"AFK set: {_afk_msg}"))
+
+    elif cmd == "afkstop":
+        _afk_enabled = False; _afk_msg = None
+        await message.edit(content=ui_ok("AFK disabled"))
+
+    elif cmd == "translate":
+        if len(args) < 3:
+            return await message.edit(content=ui_err("usage: translate <lang_code> <text>"))
+        lang = args[1]; text = " ".join(args[2:])
+        result = await translate_text(text, lang)
+        await message.edit(content=f"```\n{result}\n```")
+
+    elif cmd == "speaklanguage":
+        global _speak_lang
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: speaklanguage <lang_code>"))
+        _speak_lang = args[1]
+        await message.edit(content=ui_ok(f"auto-translate → {_speak_lang}"))
+
+    elif cmd == "speaklanguagestop":
+        _speak_lang = None
+        await message.edit(content=ui_ok("auto-translate stopped"))
+
+    elif cmd == "ghostping":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: ghostping <user_id>"))
+        try: await message.delete()
+        except Exception: pass
+        m = await message.channel.send(f"<@{args[1]}>")
+        await asyncio.sleep(0.3)
+        await m.delete()
+
+    elif cmd == "pin":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: pin <msg_id>"))
+        try:
+            msg = await message.channel.fetch_message(int(args[1]))
+            await msg.pin()
+            await message.edit(content=ui_ok("pinned"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "unpin":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: unpin <msg_id>"))
+        try:
+            msg = await message.channel.fetch_message(int(args[1]))
+            await msg.unpin()
+            await message.edit(content=ui_ok("unpinned"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "therapy":
+        try: await message.delete()
+        except Exception: pass
+        responses = [
+            "I hear you. That sounds really difficult.",
+            "Your feelings are valid. Take things one step at a time.",
+            "It's okay to not have everything figured out.",
+            "You're doing better than you think.",
+            "Remember to be kind to yourself today.",
+        ]
+        await message.channel.send(random.choice(responses))
+
+    elif cmd == "ragebait":
+        try: await message.delete()
+        except Exception: pass
+        baits = [
+            "pineapple on pizza is literally the best topping change my mind",
+            "anime is just cartoons for people who couldn't make friends in high school",
+            "people who say 'its the vibe' without explaining anything are just not smart enough to articulate",
+            "dogs are overrated. cats are objectively superior",
+            "morning people are just people who go to bed early. you're not special",
+        ]
+        await message.channel.send(random.choice(baits))
+
+    elif cmd == "firstmessage":
+        try: await message.delete()
+        except Exception: pass
+        async for msg in message.channel.history(limit=1, oldest_first=True):
+            await message.channel.send(
+                ui_box("first message", [
+                    f"  {DIM}author{RESET}  {msg.author}",
+                    f"  {DIM}date{RESET}    {msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"  {DIM}content{RESET} {msg.content[:200] or '(empty)'}",
+                    f"  {DIM}url{RESET}     {msg.jump_url}",
+                ]))
+
+    # ─────────────────────────────────
+    # TRACKING
+    # ─────────────────────────────────
+
+    elif cmd == "track":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: track <user_id>"))
+        uid = int(args[1])
+        _tracked_users.add(uid)
+        await message.edit(content=ui_ok(f"tracking <@{uid}>"))
+
+    elif cmd == "untrack":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: untrack <user_id>"))
+        uid = int(args[1])
+        _tracked_users.discard(uid)
+        _tracking.pop(uid, None)
+        await message.edit(content=ui_ok(f"stopped tracking <@{uid}>"))
+
+    elif cmd == "tracklist":
+        if not _tracked_users:
+            return await message.edit(content=ui_info("not tracking anyone"))
+        rows = [f"  {GREY}•{RESET} <@{uid}>  {DIM}({len(_tracking.get(uid,[]))} msgs){RESET}"
+                for uid in _tracked_users]
+        await message.edit(content=_paginate("tracking", "tracked users", rows))
+
+    elif cmd == "history":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: history <user_id>"))
+        uid = int(args[1])
+        msgs = _tracking.get(uid, [])
+        if not msgs:
+            return await message.edit(content=ui_info("no tracked messages for this user"))
+        rows = [f"  {DIM}[{m['time']}] #{m['channel']}{RESET}  {WHITE}{m['content'][:60]}{RESET}"
+                for m in msgs[-PAGE_SIZE * 3:]]
+        await message.edit(content=_paginate("history", f"<@{uid}>", rows))
+
+    # ─────────────────────────────────
+    # DOWNLOADS
+    # ─────────────────────────────────
+
+    elif cmd in ("yt","youtube","ytaudio","tiktok","tt","instagram","ig"):
+        try: await message.delete()
+        except Exception: pass
+        if len(args) < 2:
+            return await message.channel.send(ui_err(f"usage: {cmd} <url>"), delete_after=5)
+        url = args[1]
+        audio_only = cmd in ("ytaudio",)
+        audio_flag = ["--extract-audio", "--audio-format", "mp3"] if audio_only else ["-f", "best[filesize<25M]"]
+        import subprocess
+        try:
+            await message.channel.send(ui_info(f"downloading {url}..."), delete_after=5)
+            fname = f"/tmp/dl_{uuid4().hex[:8]}.%(ext)s"
+            proc = await asyncio.create_subprocess_exec(
+                "yt-dlp", url, "-o", fname, *audio_flag,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+            import glob
+            files = glob.glob(f"/tmp/dl_*")
+            if files:
+                latest = max(files, key=os.path.getctime)
+                size = os.path.getsize(latest)
+                if size < 25 * 1024 * 1024:
+                    await message.channel.send(file=discord.File(latest))
+                    os.remove(latest)
+                else:
+                    await message.channel.send(ui_err("file too large for discord (>25MB)"), delete_after=8)
+                    os.remove(latest)
+            else:
+                await message.channel.send(ui_err(f"download failed: {err.decode()[:200]}"), delete_after=8)
+        except asyncio.TimeoutError:
+            await message.channel.send(ui_err("download timed out"), delete_after=8)
+        except FileNotFoundError:
+            await message.channel.send(ui_err("yt-dlp not installed — pip install yt-dlp"), delete_after=8)
+        except Exception as e:
+            await message.channel.send(ui_err(str(e)[:200]), delete_after=8)
+
+    # ─────────────────────────────────
+    # SOCIAL
+    # ─────────────────────────────────
+
+    elif cmd == "addfriend":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: addfriend <user_id>"))
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.put(f"https://discord.com/api/v9/users/@me/relationships/{args[1]}",
+                    headers=h, json={"type": 1}) as r:
+                    await message.edit(content=ui_ok(f"friend request sent") if r.status in (200,201,204) else ui_err(f"failed {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "removefriend":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: removefriend <user_id>"))
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.delete(f"https://discord.com/api/v9/users/@me/relationships/{args[1]}", headers=h) as r:
+                    await message.edit(content=ui_ok("removed") if r.status in (200,204) else ui_err(f"failed {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "block":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: block <user_id>"))
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.put(f"https://discord.com/api/v9/users/@me/relationships/{args[1]}",
+                    headers=h, json={"type": 2}) as r:
+                    await message.edit(content=ui_ok("blocked") if r.status in (200,204) else ui_err(f"failed {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "unblock":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: unblock <user_id>"))
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.delete(f"https://discord.com/api/v9/users/@me/relationships/{args[1]}", headers=h) as r:
+                    await message.edit(content=ui_ok("unblocked") if r.status in (200,204) else ui_err(f"failed {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd in ("friends","blocked","pending"):
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://discord.com/api/v9/users/@me/relationships", headers=h) as r:
+                    if r.status != 200:
+                        return await message.edit(content=ui_err(f"failed {r.status}"))
+                    rels = await r.json()
+            type_filter = {"friends": 1, "blocked": 2, "pending": 3}
+            t = type_filter[cmd]
+            filtered = [x for x in rels if x.get("type") == t]
+            rows = [f"  {GREY}•{RESET} {x.get('user',{}).get('username','?')}  {DIM}({x.get('user',{}).get('id','?')}){RESET}"
+                    for x in filtered]
+            await message.edit(content=_paginate(cmd, f"{len(filtered)} results", rows) if rows else ui_info(f"no {cmd}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "friendcount":
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://discord.com/api/v9/users/@me/relationships", headers=h) as r:
+                    rels = await r.json() if r.status == 200 else []
+            friends = sum(1 for x in rels if x.get("type") == 1)
+            blocked = sum(1 for x in rels if x.get("type") == 2)
+            pending = sum(1 for x in rels if x.get("type") == 3)
+            await message.edit(content=ui_box("friend counts", [
+                f"  {DIM}friends{RESET}  {friends}",
+                f"  {DIM}blocked{RESET}  {blocked}",
+                f"  {DIM}pending{RESET}  {pending}",
+            ]))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "clearincoming":
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://discord.com/api/v9/users/@me/relationships", headers=h) as r:
+                    rels = await r.json() if r.status == 200 else []
+                incoming = [x for x in rels if x.get("type") == 3]
+                for rel in incoming:
+                    uid = rel.get("user", {}).get("id")
+                    if uid:
+                        await s.delete(f"https://discord.com/api/v9/users/@me/relationships/{uid}", headers=h)
+                        await asyncio.sleep(0.3)
+            await message.edit(content=ui_ok(f"declined {len(incoming)} incoming requests"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "clearoutgoing":
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://discord.com/api/v9/users/@me/relationships", headers=h) as r:
+                    rels = await r.json() if r.status == 200 else []
+                outgoing = [x for x in rels if x.get("type") == 4]
+                for rel in outgoing:
+                    uid = rel.get("user", {}).get("id")
+                    if uid:
+                        await s.delete(f"https://discord.com/api/v9/users/@me/relationships/{uid}", headers=h)
+                        await asyncio.sleep(0.3)
+            await message.edit(content=ui_ok(f"cancelled {len(outgoing)} outgoing requests"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "closedms":
+        count = 0
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                for ch in list(client.private_channels):
+                    if isinstance(ch, discord.DMChannel):
+                        await s.delete(f"https://discord.com/api/v9/channels/{ch.id}", headers=h)
+                        count += 1
+                        await asyncio.sleep(0.3)
+            await message.edit(content=ui_ok(f"closed {count} DMs"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "readdms":
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        count = 0
+        try:
+            async with aiohttp.ClientSession() as s:
+                for ch in list(client.private_channels):
+                    await s.post(f"https://discord.com/api/v9/channels/{ch.id}/ack",
+                        headers={**h, "Content-Type": "application/json"}, json={})
+                    count += 1
+                    await asyncio.sleep(0.2)
+            await message.edit(content=ui_ok(f"marked {count} DMs as read"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "note":
+        if len(args) < 3:
+            return await message.edit(content=ui_err("usage: note <user_id> <text>"))
+        uid = args[1]; text = " ".join(args[2:])
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.put(f"https://discord.com/api/v9/users/@me/notes/{uid}",
+                    headers=h, json={"note": text}) as r:
+                    await message.edit(content=ui_ok("note set") if r.status in (200,204) else ui_err(f"failed {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "autoaddback":
+        global _autoaddback
+        _autoaddback = len(args) < 2 or args[1].lower() in ("on","enable")
+        cfg = load_config(); cfg["autoaddback"] = _autoaddback; save_config(cfg)
+        await message.edit(content=ui_ok(f"autoaddback → {'on' if _autoaddback else 'off'}"))
+
+    # ─────────────────────────────────
+    # AUTO
+    # ─────────────────────────────────
+
+    elif cmd == "giveaway":
+        global _giveaway_enabled
+        _giveaway_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
+        await message.edit(content=ui_ok(f"giveaway sniper → {'on' if _giveaway_enabled else 'off'}"))
+
+    elif cmd == "nitrosniper":
+        global _nitrosniper_enabled
+        _nitrosniper_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
+        await message.edit(content=ui_ok(f"nitro sniper → {'on' if _nitrosniper_enabled else 'off'}"))
+
+    elif cmd == "vsniper":
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "add":
+            if len(args) < 4:
+                return await message.edit(content=ui_err("usage: vsniper add <vanity_code> <guild_id>"))
+            _vsniper_list.append({"code": args[2], "guild_id": args[3]})
+            await message.edit(content=ui_ok(f"watching vanity: {args[2]}"))
+        elif sub == "start":
+            global _vsniper_task
+            if _vsniper_task and not _vsniper_task.done():
+                return await message.edit(content=ui_info("vsniper already running"))
+            _vsniper_task = asyncio.create_task(vsniper_loop())
+            await message.edit(content=ui_ok("vsniper started"))
+        elif sub == "stop":
+            if _vsniper_task:
+                _vsniper_task.cancel(); _vsniper_task = None
+            await message.edit(content=ui_ok("vsniper stopped"))
+        elif sub == "list":
+            if not _vsniper_list:
+                return await message.edit(content=ui_info("no vanities in watch list"))
+            rows = [f"  {GREY}•{RESET} {e['code']}  {DIM}guild {e['guild_id']}{RESET}" for e in _vsniper_list]
+            await message.edit(content=_paginate("vsniper", "watch list", rows))
+        else:
+            await message.edit(content=ui_err("usage: vsniper add/start/stop/list"))
+
+    # ─────────────────────────────────
+    # PROFILE
+    # ─────────────────────────────────
+
+    elif cmd == "setpfp":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: setpfp <image_url>"))
+        url = args[1]
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url) as r:
+                    img_data = await r.read()
+                ext = url.split(".")[-1].split("?")[0].lower()
+                mime = {"jpg":"jpeg","jpeg":"jpeg","png":"png","gif":"gif","webp":"webp"}.get(ext,"png")
+                b64 = base64.b64encode(img_data).decode()
+                data_uri = f"data:image/{mime};base64,{b64}"
+                h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+                async with s.patch("https://discord.com/api/v9/users/@me",
+                    headers=h, json={"avatar": data_uri}) as r2:
+                    await message.edit(content=ui_ok("pfp updated") if r2.status == 200 else ui_err(f"failed {r2.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "setbio":
+        bio = " ".join(args[1:]) if len(args) > 1 else ""
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.patch("https://discord.com/api/v9/users/@me/profile",
+                    headers=h, json={"bio": bio}) as r:
+                    await message.edit(content=ui_ok("bio updated") if r.status == 200 else ui_err(f"failed {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "setbanner":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: setbanner <image_url>"))
+        url = args[1]
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url) as r:
+                    img_data = await r.read()
+                ext = url.split(".")[-1].split("?")[0].lower()
+                mime = {"jpg":"jpeg","jpeg":"jpeg","png":"png","gif":"gif","webp":"webp"}.get(ext,"png")
+                b64 = base64.b64encode(img_data).decode()
+                data_uri = f"data:image/{mime};base64,{b64}"
+                h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+                async with s.patch("https://discord.com/api/v9/users/@me",
+                    headers=h, json={"banner": data_uri}) as r2:
+                    await message.edit(content=ui_ok("banner updated") if r2.status == 200 else ui_err(f"failed {r2.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "myprofile":
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://discord.com/api/v9/users/@me", headers=h) as r:
+                    if r.status != 200:
+                        return await message.edit(content=ui_err("failed"))
+                    u = await r.json()
+            uid = u.get("id")
+            pfp = f"https://cdn.discordapp.com/avatars/{uid}/{u.get('avatar')}.webp?size=256" if u.get("avatar") else "none"
+            banner = f"https://cdn.discordapp.com/banners/{uid}/{u.get('banner')}.webp?size=512" if u.get("banner") else "none"
+            await message.edit(content=ui_box("my profile", [
+                f"  {DIM}username{RESET}  {u.get('username')}",
+                f"  {DIM}id{RESET}        {uid}",
+                f"  {DIM}avatar{RESET}    {pfp}",
+                f"  {DIM}banner{RESET}    {banner}",
+                f"  {DIM}email{RESET}     {u.get('email','?')}",
+                f"  {DIM}phone{RESET}     {u.get('phone','?')}",
+                f"  {DIM}nitro{RESET}     {'yes' if u.get('premium_type') else 'no'}",
+            ]))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "accountbackup":
+        try: await message.delete()
+        except Exception: pass
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://discord.com/api/v9/users/@me", headers=h) as r:
+                profile = await r.json() if r.status == 200 else {}
+            async with s.get("https://discord.com/api/v9/users/@me/relationships", headers=h) as r:
+                rels = await r.json() if r.status == 200 else []
+        backup = {
+            "profile": profile,
+            "relationships": rels,
+            "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds],
+            "timestamp": datetime.now().isoformat(),
+        }
+        fname = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(fname, "w") as f:
+            json.dump(backup, f, indent=2)
+        await message.channel.send(ui_ok(f"account backed up to {fname}"), delete_after=8)
+
+# ─────────────────────────────────────────────
+# OTHER EVENTS
+# ─────────────────────────────────────────────
+
+
+    # ─────────────────────────────────
+    # SERVER — missing commands
+    # ─────────────────────────────────
+
+    elif cmd == "createrole":
+        g = message.guild
+        if not g or len(args) < 2:
+            return await message.edit(content=ui_err("usage: createrole <name>"))
+        try:
+            role = await g.create_role(name=" ".join(args[1:]))
+            await message.edit(content=ui_ok(f"role created: {role.name} ({role.id})"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "delrole":
+        g = message.guild
+        if not g or len(args) < 2:
+            return await message.edit(content=ui_err("usage: delrole <role_id>"))
+        try:
+            role = g.get_role(int(args[1]))
+            await role.delete()
+            await message.edit(content=ui_ok(f"role deleted: {role.name}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "createchannel":
+        g = message.guild
+        if not g or len(args) < 2:
+            return await message.edit(content=ui_err("usage: createchannel <name>"))
+        try:
+            ch = await g.create_text_channel(name=" ".join(args[1:]))
+            await message.edit(content=ui_ok(f"channel created: #{ch.name} ({ch.id})"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "deletechannel":
+        g = message.guild
+        if not g or len(args) < 2:
+            return await message.edit(content=ui_err("usage: deletechannel <ch_id>"))
+        try:
+            ch = client.get_channel(int(args[1]))
+            name = ch.name
+            await ch.delete()
+            await message.edit(content=ui_ok(f"deleted #{name}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "ban":
+        g = message.guild
+        if not g or len(args) < 2:
+            return await message.edit(content=ui_err("usage: ban <user_id> [reason]"))
+        try:
+            user = await client.fetch_user(int(args[1]))
+            reason = " ".join(args[2:]) or "no reason"
+            await g.ban(user, reason=reason)
+            await message.edit(content=ui_ok(f"banned {user}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "channelinfo":
+        ch_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.channel.id
+        ch = client.get_channel(ch_id)
+        if not ch:
+            return await message.edit(content=ui_err("channel not found"))
+        await message.edit(content=ui_box("channel info", [
+            f"  {DIM}name{RESET}    #{ch.name}",
+            f"  {DIM}id{RESET}      {ch.id}",
+            f"  {DIM}type{RESET}    {str(ch.type)}",
+            f"  {DIM}created{RESET} {ch.created_at.strftime('%Y-%m-%d')}",
+            f"  {DIM}guild{RESET}   {ch.guild.name if hasattr(ch,'guild') else 'DM'}",
+        ]))
+
+    elif cmd == "roleinfo":
+        if not message.guild or len(args) < 2:
+            return await message.edit(content=ui_err("usage: roleinfo <role_id>"))
+        role = message.guild.get_role(int(args[1]))
+        if not role:
+            return await message.edit(content=ui_err("role not found"))
+        await message.edit(content=ui_box("role info", [
+            f"  {DIM}name{RESET}     {role.name}",
+            f"  {DIM}id{RESET}       {role.id}",
+            f"  {DIM}color{RESET}    #{role.color.value:06x}",
+            f"  {DIM}members{RESET}  {len(role.members)}",
+            f"  {DIM}position{RESET} {role.position}",
+            f"  {DIM}mentionable{RESET} {'yes' if role.mentionable else 'no'}",
+            f"  {DIM}hoisted{RESET}  {'yes' if role.hoist else 'no'}",
+        ]))
+
+    # ─────────────────────────────────
+    # GROUPCHAT — missing commands
+    # ─────────────────────────────────
+
+    elif cmd == "gccreate":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: gccreate <user_id> [user_id2...]"))
+        try:
+            users = []
+            for uid_str in args[1:]:
+                u = await client.fetch_user(int(uid_str))
+                if u: users.append(u)
+            if not users:
+                return await message.edit(content=ui_err("no valid users"))
+            gc = await client.user.create_group(*users)
+            await message.edit(content=ui_ok(f"group DM created: {gc.id}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcadd":
+        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
+            return await message.edit(content=ui_err("run in group DM: gcadd <user_id>"))
+        try:
+            u = await client.fetch_user(int(args[1]))
+            await message.channel.add_recipients(u)
+            await message.edit(content=ui_ok(f"added {u}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcremove":
+        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
+            return await message.edit(content=ui_err("run in group DM: gcremove <user_id>"))
+        try:
+            u = await client.fetch_user(int(args[1]))
+            await message.channel.remove_recipients(u)
+            await message.edit(content=ui_ok(f"removed {u}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcicon":
+        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
+            return await message.edit(content=ui_err("run in group DM: gcicon <url>"))
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(args[1]) as r:
+                    img = await r.read()
+            ext = args[1].split(".")[-1].split("?")[0].lower()
+            mime = {"gif":"gif","png":"png","jpg":"jpeg","jpeg":"jpeg","webp":"webp"}.get(ext,"png")
+            b64 = base64.b64encode(img).decode()
+            h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+            async with aiohttp.ClientSession() as s:
+                async with s.patch(f"https://discord.com/api/v9/channels/{message.channel.id}",
+                    headers=h, json={"icon": f"data:image/{mime};base64,{b64}"}) as resp:
+                    await message.edit(content=ui_ok("gc icon set") if resp.status == 200 else ui_err(f"failed {resp.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+
+    # ─────────────────────────────────
+    # STATUS
+    # ─────────────────────────────────
+
+    elif cmd in ("setstatus", "customstatus"):
+        if len(args) < 2:
+            return await message.edit(content=ui_box("setstatus", [
+                f"  {DIM}usage:{RESET}",
+                f"  {PREFIX}setstatus <text>",
+                f"  {PREFIX}setstatus <emoji>, <text>",
+                f"  {PREFIX}setstatus <:name:id>, <text>",
+                f"  {DIM}examples:{RESET}",
+                f"  {PREFIX}setstatus Gaming now",
+                f"  {PREFIX}setstatus 🎮, Gaming now",
+                f"  {PREFIX}setstatus <:pepe:123456789>, vibing",
+            ]))
+
+        import re as _re
+
+        full_text = " ".join(args[1:])
+        emoji_name = None
+        emoji_id = None
+        text = full_text.strip()
+
+        if "," in text:
+            parts = text.split(",", 1)
+            emoji_part = parts[0].strip()
+            text_part = parts[1].strip() if len(parts) > 1 else ""
+
+            if not text_part:
+                return await message.edit(content=ui_err("provide status text after the comma"))
+
+            # custom emoji <:name:id>
+            ce_match = _re.match(r"<:([a-zA-Z0-9_]+):([0-9]+)>", emoji_part)
+            if ce_match:
+                emoji_name = ce_match.group(1)
+                emoji_id   = ce_match.group(2)
+            elif len(emoji_part) >= 1 and (len(emoji_part) == 1 or any(ord(c) > 127 for c in emoji_part)):
+                emoji_name = emoji_part
+            else:
+                return await message.edit(content=ui_err("invalid emoji — use standard emoji or <:name:id>"))
+
+            text = text_part
+
+        if not text:
+            return await message.edit(content=ui_err("provide status text"))
+
+        payload = {"custom_status": {"text": text, "emoji_name": emoji_name, "emoji_id": emoji_id}}
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.patch("https://discord.com/api/v9/users/@me/settings",
+                    headers=h, json=payload) as r:
+                    if r.status == 200:
+                        emoji_display = f"{emoji_name} " if emoji_name else ""
+                        # Save to history
+                        cfg = load_config()
+                        hist = cfg.get("status_history", [])
+                        hist.insert(0, {"text": text, "emoji": emoji_name, "time": datetime.now().strftime("%H:%M %d/%m")})
+                        cfg["status_history"] = hist[:20]
+                        save_config(cfg)
+                        await message.edit(content=ui_ok(f"status set: {emoji_display}{text}"))
+                    elif r.status == 429:
+                        retry = (await r.json()).get("retry_after", 1)
+                        await message.edit(content=ui_warn(f"rate limited — retry in {retry}s"))
+                    else:
+                        await message.edit(content=ui_err(f"failed: {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "clearstatus":
+        payload = {"custom_status": {"text": "", "emoji_name": None, "emoji_id": None}}
+        h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.patch("https://discord.com/api/v9/users/@me/settings",
+                    headers=h, json=payload) as r:
+                    await message.edit(content=ui_ok("status cleared") if r.status == 200 else ui_err(f"failed: {r.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd in ("stealstatus", "copystatus"):
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: stealstatus <user_id>"))
+        uid = args[1].strip("<@!>")
+        h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+        try:
+            async with aiohttp.ClientSession() as s:
+                # Fetch user profile to get their custom status
+                async with s.get(f"https://discord.com/api/v9/users/{uid}/profile", headers=h) as r:
+                    if r.status != 200:
+                        return await message.edit(content=ui_err("could not fetch user profile"))
+                    profile = await r.json()
+
+                username = profile.get("user", {}).get("username", "?")
+
+                # Try to get custom status from presence
+                user_profile = profile.get("user_profile", {})
+                activity_data = profile.get("user", {})
+
+                # Custom status lives in the activities or user_profile
+                custom_text  = user_profile.get("bio", "") or ""
+                emoji_name   = None
+                emoji_id     = None
+
+                # Also try fetching from user settings if it's our own
+                # For other users, bio is the closest we get via profile endpoint
+                if not custom_text:
+                    return await message.edit(content=ui_err(f"{username} has no visible custom status"))
+
+                payload = {"custom_status": {"text": custom_text, "emoji_name": emoji_name, "emoji_id": emoji_id}}
+                async with s.patch("https://discord.com/api/v9/users/@me/settings",
+                    headers={**h, "Content-Type": "application/json"}, json=payload) as r2:
+                    if r2.status == 200:
+                        cfg = load_config()
+                        hist = cfg.get("status_history", [])
+                        hist.insert(0, {"text": custom_text, "emoji": None, "time": datetime.now().strftime("%H:%M %d/%m"), "stolen_from": username})
+                        cfg["status_history"] = hist[:20]
+                        save_config(cfg)
+                        await message.edit(content=ui_ok(f"stole status from {username}: {custom_text}"))
+                    else:
+                        await message.edit(content=ui_err(f"failed to apply status: {r2.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "statushistory":
+        cfg = load_config()
+        hist = cfg.get("status_history", [])
+        if not hist:
+            return await message.edit(content=ui_info("no status history yet"))
+        rows = []
+        for i, entry in enumerate(hist[:20], 1):
+            emoji = f"{entry['emoji']} " if entry.get("emoji") else ""
+            stolen = f"  {DIM}(from {entry['stolen_from']}){RESET}" if entry.get("stolen_from") else ""
+            rows.append(f"  {GREY}{i:2}.{RESET} {WHITE}{emoji}{entry['text']}{RESET}  {DIM}{entry['time']}{RESET}{stolen}")
+        await message.edit(content=_paginate("status history", "recent statuses", rows))
 
 @client.event
 async def on_message_delete(message):
-    if not LOGGER_ENABLED or message.author.id == client.user.id: return
-    try:
-        log_message("DELETE", f"{message.author} in #{getattr(message.channel, 'name', 'DM')}: {message.content}")
-    except Exception: pass
+    if not LOGGER_ENABLED or message.author.id == client.user.id:
+        return
+    log_msg("DEL", f"{message.author} in #{getattr(message.channel,'name','DM')}: {message.content[:100]}")
 
 @client.event
 async def on_message_edit(before, after):
-    if not LOGGER_ENABLED or before.author.id == client.user.id: return
-    if before.content == after.content: return
-    try:
-        log_message("EDIT", f"{before.author}: '{before.content}' → '{after.content}'")
-    except Exception: pass
+    if not LOGGER_ENABLED or before.author.id == client.user.id:
+        return
+    if before.content == after.content:
+        return
+    log_msg("EDIT", f"{before.author}: '{before.content[:60]}' → '{after.content[:60]}'")
+
+@client.event
+async def on_relationship_add(relationship):
+    if not _autoaddback:
+        return
+    if relationship.type == discord.RelationshipType.incoming_request:
+        try:
+            await relationship.accept()
+            log_msg("SOCIAL", f"auto-accepted friend request from {relationship.user}")
+        except Exception as e:
+            log_msg("SOCIAL", f"autoaddback failed: {e}")
+
+@client.event
+async def on_group_channel_create(channel):
+    """AGC — anti group chat trap (ported from agc.py)"""
+    if not _agc_state["enabled"]:
+        return
+
+    channel_id = str(channel.id)
+    owner_id   = str(channel.owner_id) if hasattr(channel, "owner_id") and channel.owner_id else ""
+
+    if owner_id == str(client.user.id):
+        return
+    if owner_id in _agc_whitelist:
+        log_msg("AGC", f"whitelisted owner {owner_id}, skipping")
+        return
+
+    log_msg("AGC", f"trap detected — ch {channel_id}, owner {owner_id}")
+
+    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+
+    async with aiohttp.ClientSession() as s:
+        if _agc_state["gc_name"]:
+            try:
+                await s.patch(f"https://discord.com/api/v9/channels/{channel_id}",
+                    headers=h, json={"name": _agc_state["gc_name"]})
+            except Exception: pass
+
+        if _agc_state["gc_icon_url"]:
+            try:
+                async with s.get(_agc_state["gc_icon_url"]) as r:
+                    img = await r.read()
+                mime = "image/gif" if img[:6] in (b"GIF87a",b"GIF89a") else "image/png"
+                b64 = base64.b64encode(img).decode()
+                await s.patch(f"https://discord.com/api/v9/channels/{channel_id}",
+                    headers=h, json={"icon": f"data:{mime};base64,{b64}"})
+            except Exception: pass
+
+        if _agc_state["leave_msg"]:
+            try:
+                await s.post(f"https://discord.com/api/v9/channels/{channel_id}/messages",
+                    headers=h, json={"content": _agc_state["leave_msg"]})
+            except Exception: pass
+
+        if _agc_state["block"] and owner_id:
+            try:
+                await s.put(f"https://discord.com/api/v9/users/@me/relationships/{owner_id}",
+                    headers=h, json={"type": 2})
+            except Exception: pass
+
+        for _ in range(3):
+            try:
+                async with s.delete(f"https://discord.com/api/v9/channels/{channel_id}", headers=h) as r:
+                    if r.status in (200,204): break
+            except Exception: pass
+            await asyncio.sleep(1)
+
+        if _agc_state["webhook_url"]:
+            try:
+                members = [str(u.id) for u in (channel.recipients or [])]
+                body = {"content": f"**AGC Alert**\nowner: `{owner_id}`\nchannel: `{channel_id}`\nmembers: `{', '.join(members)}`"}
+                await s.post(_agc_state["webhook_url"], json=body)
+            except Exception: pass
 
 # ─────────────────────────────────────────────
 # RUN
 # ─────────────────────────────────────────────
 
+_nitrosniper_enabled = True
 
-# ─────────────────────────────────────────────
-# MIMIC STATE (fun cog)
-# ─────────────────────────────────────────────
-_mimic_dict = {}  # channel_id -> [user_id, ...]
-
-async def fetch_neko_image(action: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://nekos.life/api/v2/img/{action}"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    return (await resp.json()).get("url")
-    except Exception:
-        pass
-    return None
-
-async def send_neko(channel, action: str):
-    url = await fetch_neko_image(action)
-    if not url:
-        await channel.send(f"```\n✗ could not fetch {action} image\n```", delete_after=5)
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    import io
-                    data = await resp.read()
-                    await channel.send(file=discord.File(io.BytesIO(data), f"{action}.gif"))
-    except Exception as e:
-        await channel.send(f"```\n✗ {e}\n```", delete_after=5)
-
-# ─────────────────────────────────────────────
-# HOST SYSTEM
-# ─────────────────────────────────────────────
-HOSTED_TOKENS = []
-
-def load_hosted():
-    global HOSTED_TOKENS
-    cfg = load_config()
-    HOSTED_TOKENS = cfg.get("hosted_tokens", [])
-
-def save_hosted():
-    cfg = load_config()
-    cfg["hosted_tokens"] = HOSTED_TOKENS
-    save_config(cfg)
-
-load_hosted()
-
-async def hosted_send(token: str, channel_id: int, content: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-            headers = {"Authorization": token.strip(), "Content-Type": "application/json", "User-Agent": USER_AGENT}
-            async with session.post(url, headers=headers, json={"content": content}) as resp:
-                return resp.status in (200, 201)
-    except Exception:
-        return False
-
-async def get_token_username(token: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": token.strip(), "User-Agent": USER_AGENT}
-            async with session.get("https://discord.com/api/v9/users/@me", headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("username", "unknown")
-    except Exception:
-        pass
-    return "unknown"
-
-
-# ─────────────────────────────────────────────
-# LAST.FM COG
-# ─────────────────────────────────────────────
-
-LASTFM_API_BASE = "https://ws.audioscrobbler.com/2.0/"
-
-# Free public API key — replace with your own from https://www.last.fm/api/account/create
-# The default key below is a read-only public key for basic scrobble data
-LASTFM_API_KEY = "your_lastfm_api_key_here"
-
-_lastfm_cfg = {}        # username, api_key per user
-_autorpc_task = None    # background task handle
-_autorpc_enabled = False
-
-def load_lastfm_cfg():
-    global _lastfm_cfg, LASTFM_API_KEY
-    cfg = load_config()
-    _lastfm_cfg = cfg.get("lastfm", {})
-    if _lastfm_cfg.get("api_key"):
-        LASTFM_API_KEY = _lastfm_cfg["api_key"]
-
-def save_lastfm_cfg():
-    cfg = load_config()
-    cfg["lastfm"] = _lastfm_cfg
-    save_config(cfg)
-
-load_lastfm_cfg()
-
-PERIOD_MAP = {
-    "w":   "7day",   "week":  "7day",  "7day": "7day",
-    "m":   "1month", "month": "1month","1month": "1month",
-    "3m":  "3month", "3month":"3month",
-    "6m":  "6month", "6month":"6month",
-    "y":   "12month","year":  "12month","12month":"12month",
-    "all": "overall","overall":"overall",
-}
-PERIOD_LABEL = {
-    "7day": "this week", "1month": "this month",
-    "3month": "past 3 months", "6month": "past 6 months",
-    "12month": "this year", "overall": "all time",
-}
-
-async def lfm_get(method: str, params: dict) -> dict:
-    params.update({
-        "method": method,
-        "api_key": LASTFM_API_KEY,
-        "format": "json",
-    })
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(LASTFM_API_BASE, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return {"error": resp.status, "message": f"HTTP {resp.status}"}
-    except Exception as e:
-        return {"error": 0, "message": str(e)}
-
-def _lfm_user():
-    return _lastfm_cfg.get("username", "")
-
-def _progress_bar(pct: int, width: int = 12) -> str:
-    filled = int(width * pct / 100)
-    return "▓" * filled + "░" * (width - filled)
-
-async def lfm_now_playing(username: str) -> dict | None:
-    data = await lfm_get("user.getRecentTracks", {
-        "user": username, "limit": 1, "extended": 1,
-    })
-    tracks = data.get("recenttracks", {}).get("track", [])
-    if not tracks:
-        return None
-    track = tracks[0] if isinstance(tracks, list) else tracks
-    is_playing = track.get("@attr", {}).get("nowplaying") == "true"
-    return {
-        "title":    track.get("name", "Unknown"),
-        "artist":   track.get("artist", {}).get("name", "Unknown") if isinstance(track.get("artist"), dict) else track.get("artist", "Unknown"),
-        "album":    track.get("album", {}).get("#text", "") if isinstance(track.get("album"), dict) else "",
-        "image":    next((i["#text"] for i in track.get("image", []) if i.get("size") == "large" and i.get("#text")), ""),
-        "url":      track.get("url", ""),
-        "playing":  is_playing,
-        "loved":    track.get("loved", "0") == "1",
-        "scrobbles":data.get("recenttracks", {}).get("@attr", {}).get("total", "?"),
-    }
-
-async def lfm_autorpc_loop():
-    global _autorpc_enabled
-    last_track = ""
-    while _autorpc_enabled:
-        try:
-            username = _lfm_user()
-            if username:
-                track = await lfm_now_playing(username)
-                if track and track["playing"]:
-                    track_key = f"{track['title']}|{track['artist']}"
-                    if track_key != last_track:
-                        last_track = track_key
-                        title  = track["title"]
-                        artist = track["artist"]
-                        dur    = 210
-                        await apply_brand_rpc("spotify", [f"{title} | {artist} | {dur}"])
-        except Exception as e:
-            print(f"[LastFM autorpc] error: {e}")
-        await asyncio.sleep(30)
-
-print(f"[selfbot] starting — prefix '{PREFIX}'")
+print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
     client.run(TOKEN)
 except discord.LoginFailure as e:
