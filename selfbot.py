@@ -7,6 +7,7 @@ import aiohttp
 import json
 import os
 import sys
+import time
 import re
 import base64
 import io
@@ -59,7 +60,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
@@ -173,7 +174,7 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("rpc details",                       "details line"),
         ("rpc state",                         "state line"),
         ("rpc url",                           "streaming url"),
-        ("rpc start / end",                   "timestamps (unix/MM:SS/none)"),
+        ("rpc start / end",                   "timestamps (unix/none)"),
         ("rpc large_image <url or key>",      "large image (auto-registers url)"),
         ("rpc large_text",                    "large image hover text"),
         ("rpc small_image <url or key>",      "small image (auto-registers url)"),
@@ -486,8 +487,6 @@ _snipe_cache:      dict[int, list[dict]] = {}
 _editsnipe_cache:  dict[int, list[dict]] = {}
 SNIPE_LIMIT = 20
 
-_rpc_asset_cache: dict[str, str] = {}
-
 _autoaddback   = False
 _giveaway_enabled = False
 _nitrosniper_enabled = True
@@ -561,42 +560,103 @@ def log_msg(tag: str, content: str):
     except Exception:
         pass
 
-# ─────────────────────────────────────────────
-# RPC CONFIG
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════
+# RPC — REWRITTEN (compat + hardening)
+# ═════════════════════════════════════════════
 
-def load_rpc_cfg():
-    path = "config/rpc_config.json"
-    default = {
-        "enabled": False, "type": "playing", "name": "selfbot",
-        "state": "", "details": "", "url": "",
-        "application_id": DEFAULT_APP_ID,
-        "large_image": "", "large_text": "", "small_image": "", "small_text": "",
-        "start_timestamp": None, "end_timestamp": None,
-        "party": {"enabled": False, "current": 1, "max": 5},
-        "buttons": [{"label": "", "url": ""}, {"label": "", "url": ""}],
-    }
-    if not os.path.exists(path):
-        with open(path, "w") as f:
-            json.dump(default, f, indent=4)
-        return default
+RPC_CONFIG_PATH = "config/rpc_config.json"
+
+_RPC_DEFAULTS = {
+    "enabled": False,
+    "type": "playing",
+    "name": "selfbot",
+    "state": "",
+    "details": "",
+    "url": "",
+    "application_id": DEFAULT_APP_ID,
+    "large_image": "",
+    "large_text": "",
+    "small_image": "",
+    "small_text": "",
+    "start_timestamp": None,
+    "end_timestamp": None,
+    "party": {"enabled": False, "current": 1, "max": 5},
+    "buttons": [{"label": "", "url": ""}, {"label": "", "url": ""}],
+}
+
+def load_rpc_cfg() -> dict:
+    """
+    Load rpc_config.json, repairing any missing / corrupt keys in memory.
+    Never raises. Never returns None.
+    """
+    os.makedirs("config", exist_ok=True)
+    if not os.path.exists(RPC_CONFIG_PATH):
+        try:
+            with open(RPC_CONFIG_PATH, "w") as f:
+                json.dump(_RPC_DEFAULTS, f, indent=4)
+        except Exception as e:
+            print(f"[RPC cfg] write failed: {e}")
+        return dict(_RPC_DEFAULTS)
+
     try:
-        with open(path) as f:
+        with open(RPC_CONFIG_PATH) as f:
             d = json.load(f)
-        if not d.get("application_id"):
-            d["application_id"] = DEFAULT_APP_ID
-        for k, v in default.items():
-            if k not in d:
-                d[k] = v
-        return d
-    except Exception:
-        return default
+        if not isinstance(d, dict):
+            raise ValueError("root is not an object")
+    except Exception as e:
+        print(f"[RPC cfg] read failed, using defaults: {e}")
+        return dict(_RPC_DEFAULTS)
 
-def save_rpc_cfg(cfg):
-    with open("config/rpc_config.json", "w") as f:
-        json.dump(cfg, f, indent=4)
+    # migrate / repair application_id
+    if not d.get("application_id"):
+        d["application_id"] = DEFAULT_APP_ID
 
-# ── RPC external-asset registration (rpc.txt flow) ─────────────
+    # fill missing top-level keys
+    for k, v in _RPC_DEFAULTS.items():
+        if k not in d:
+            d[k] = v
+
+    # reshape party
+    if not isinstance(d.get("party"), dict):
+        d["party"] = {"enabled": False, "current": 1, "max": 5}
+    for pk, pv in _RPC_DEFAULTS["party"].items():
+        d["party"].setdefault(pk, pv)
+
+    # reshape buttons
+    btns = d.get("buttons")
+    if not isinstance(btns, list) or len(btns) < 2:
+        d["buttons"] = [{"label": "", "url": ""}, {"label": "", "url": ""}]
+    else:
+        for i in (0, 1):
+            if not isinstance(d["buttons"][i], dict):
+                d["buttons"][i] = {"label": "", "url": ""}
+            d["buttons"][i].setdefault("label", "")
+            d["buttons"][i].setdefault("url", "")
+
+    return d
+
+def save_rpc_cfg(cfg: dict) -> None:
+    try:
+        with open(RPC_CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=4)
+    except Exception as e:
+        print(f"[RPC cfg] save failed: {e}")
+
+# ── RPC asset registration ─────────────────────
+# Discord rich presence image slots don't accept raw URLs. They accept:
+#   1) an asset key uploaded to the Discord app's art-assets page, or
+#   2) an external-asset key from POST /applications/{id}/external-assets.
+# Register http(s) URLs against the app, cache the returned mp:external/...
+# key locally. Failed registrations get a 60s cooldown so we don't hammer
+# the API on repeated update_rpc calls.
+
+_rpc_asset_cache: dict[str, str] = {}     # "app_id:url" -> "mp:external/..."
+_rpc_asset_fail:  dict[str, float] = {}   # "app_id:url" -> unix ts
+RPC_ASSET_FAIL_TTL = 60.0
+
+def _asset_is_url(s: str) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
 async def register_external_image(url: str, application_id: str, token: str) -> str | None:
     endpoint = f"https://discord.com/api/v9/applications/{application_id}/external-assets"
     headers = {
@@ -606,34 +666,182 @@ async def register_external_image(url: str, application_id: str, token: str) -> 
     }
     body = {"urls": [url]}
     try:
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(endpoint, json=body, headers=headers) as resp:
+                if resp.status == 429:
+                    ra = 1.0
+                    try:
+                        ra = float((await resp.json()).get("retry_after", 1.0))
+                    except Exception:
+                        pass
+                    print(f"[RPC asset] rate limited, sleeping {ra}s")
+                    await asyncio.sleep(ra + 0.2)
+                    return None
                 if resp.status != 200:
                     txt = await resp.text()
                     print(f"[RPC asset] register failed {resp.status}: {txt[:200]}")
                     return None
                 data = await resp.json()
-                if data and isinstance(data, list):
+                if isinstance(data, list) and data:
                     return data[0].get("external_asset_path")
+    except asyncio.TimeoutError:
+        print("[RPC asset] register timed out")
     except Exception as e:
         print(f"[RPC asset] {e}")
     return None
 
-async def resolve_rpc_image(url: str, application_id: str, token: str) -> str | None:
-    if not url:
-        return None
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return url
+async def resolve_rpc_image(raw: str, application_id: str, token: str) -> tuple[str | None, str]:
+    """
+    Resolve a stored image value to what goes into Activity.assets.
+    Returns (value, status). status ∈ {"empty","passthrough","cached","registered","failed"}.
+    """
+    if not raw:
+        return None, "empty"
+    if not _asset_is_url(raw):
+        return raw, "passthrough"
     if not application_id:
-        return url
-    cache_key = f"{application_id}:{url}"
+        return None, "failed"
+
+    cache_key = f"{application_id}:{raw}"
     if cache_key in _rpc_asset_cache:
-        return _rpc_asset_cache[cache_key]
-    key = await register_external_image(url, str(application_id), token)
+        return _rpc_asset_cache[cache_key], "cached"
+
+    last_fail = _rpc_asset_fail.get(cache_key)
+    if last_fail and (time.time() - last_fail) < RPC_ASSET_FAIL_TTL:
+        return None, "failed"
+
+    key = await register_external_image(raw, application_id, token)
     if key:
         _rpc_asset_cache[cache_key] = key
-        return key
-    return None
+        _rpc_asset_fail.pop(cache_key, None)
+        return key, "registered"
+
+    _rpc_asset_fail[cache_key] = time.time()
+    return None, "failed"
+
+async def _build_activity(cfg: dict):
+    """
+    Build a discord.Activity from the RPC config dict.
+    Returns (activity_or_None, warnings_list). Never raises.
+    """
+    warnings: list[str] = []
+
+    try:
+        from discord.activity import ActivityAssets, ActivityTimestamps, ActivityParty
+        from discord import ActivityType, Activity, ActivityButton
+    except ImportError as e:
+        return None, [f"discord.activity import failed: {e}"]
+
+    type_map = {
+        "playing":    ActivityType.playing,
+        "streaming":  ActivityType.streaming,
+        "listening":  ActivityType.listening,
+        "watching":   ActivityType.watching,
+        "competing":  ActivityType.competing,
+    }
+    act_type = type_map.get(str(cfg.get("type", "playing")).lower().strip(), ActivityType.playing)
+
+    name = cfg.get("name") or "selfbot"
+    kw: dict = {"name": str(name)[:128], "type": act_type}
+
+    app_id = cfg.get("application_id") or DEFAULT_APP_ID
+    try:
+        kw["application_id"] = int(app_id)
+    except (TypeError, ValueError):
+        warnings.append(f"invalid application_id: {app_id!r}")
+        try: kw["application_id"] = int(DEFAULT_APP_ID)
+        except Exception: pass
+
+    if act_type == ActivityType.streaming:
+        url = cfg.get("url") or "https://twitch.tv/voltrix"
+        if not (url.startswith("http://") or url.startswith("https://")):
+            warnings.append("streaming url is not http(s); defaulting")
+            url = "https://twitch.tv/voltrix"
+        kw["url"] = url
+
+    if cfg.get("state"):   kw["state"]   = str(cfg["state"])[:128]
+    if cfg.get("details"): kw["details"] = str(cfg["details"])[:128]
+
+    # ── assets ──
+    ak: dict = {}
+    for slot in ("large_image", "small_image"):
+        raw = cfg.get(slot)
+        if not raw: continue
+        resolved, status = await resolve_rpc_image(str(raw), str(app_id), TOKEN)
+        if resolved:
+            ak[slot] = resolved
+        elif status == "failed" and _asset_is_url(raw):
+            warnings.append(f"{slot}: could not register url, slot dropped")
+    for slot in ("large_text", "small_text"):
+        if cfg.get(slot):
+            ak[slot] = str(cfg[slot])[:128]
+    # only attach assets if at least one usable key present
+    if ak and any(k in ak for k in ("large_image", "small_image")):
+        try:
+            kw["assets"] = ActivityAssets(**ak)
+        except Exception as e:
+            warnings.append(f"assets rejected: {e}")
+
+    # ── timestamps ──
+    ts_kw: dict = {}
+    start_raw = cfg.get("start_timestamp")
+    end_raw   = cfg.get("end_timestamp")
+    if start_raw:
+        try:
+            ts_kw["start"] = datetime.fromtimestamp(float(start_raw), tz=timezone.utc)
+        except (TypeError, ValueError):
+            warnings.append(f"invalid start_timestamp: {start_raw!r}")
+    if end_raw:
+        try:
+            ts_kw["end"] = datetime.fromtimestamp(float(end_raw), tz=timezone.utc)
+        except (TypeError, ValueError):
+            warnings.append(f"invalid end_timestamp: {end_raw!r}")
+    if ts_kw:
+        try:
+            kw["timestamps"] = ActivityTimestamps(**ts_kw)
+        except Exception as e:
+            warnings.append(f"timestamps rejected: {e}")
+
+    # ── party ──
+    party = cfg.get("party") or {}
+    if isinstance(party, dict) and party.get("enabled"):
+        try:
+            cur = int(party.get("current", 1))
+            mx  = int(party.get("max", 5))
+            if cur > 0 and mx > 0 and cur <= mx:
+                kw["party"] = ActivityParty(id="voltrix", current_size=cur, max_size=mx)
+            else:
+                warnings.append(f"party sizes invalid ({cur}/{mx}); skipped")
+        except (TypeError, ValueError):
+            warnings.append("party sizes not numeric; skipped")
+
+    # ── buttons ──
+    btns_in = cfg.get("buttons", [])
+    if isinstance(btns_in, list):
+        btns = []
+        for b in btns_in[:2]:
+            if not isinstance(b, dict):
+                continue
+            label = (b.get("label") or "").strip()
+            url   = (b.get("url") or "").strip()
+            if not label or not url:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                warnings.append(f"button url not http(s): {url[:40]}")
+                continue
+            btns.append(ActivityButton(label=label[:32], url=url))
+        if btns:
+            try:
+                kw["buttons"] = btns
+            except Exception as e:
+                warnings.append(f"buttons rejected: {e}")
+
+    try:
+        activity = Activity(**kw)
+    except Exception as e:
+        return None, [f"Activity() rejected payload: {e}"] + warnings
+    return activity, warnings
 
 async def update_rpc():
     try:
@@ -641,58 +849,22 @@ async def update_rpc():
         if not cfg.get("enabled"):
             await client.change_presence(activity=None)
             return
-        from discord.activity import ActivityAssets, ActivityTimestamps
-        from discord import ActivityType, Activity, ActivityButton
-        t = cfg.get("type", "playing")
-        tmap = {"playing": ActivityType.playing, "streaming": ActivityType.streaming,
-                "listening": ActivityType.listening, "watching": ActivityType.watching,
-                "competing": ActivityType.competing}
-        act_type = tmap.get(t, ActivityType.playing)
-        kw: dict = {"name": cfg.get("name") or "selfbot", "type": act_type}
-
-        app_id = cfg.get("application_id") or DEFAULT_APP_ID
-        try: kw["application_id"] = int(app_id)
-        except Exception: pass
-
-        if act_type == ActivityType.streaming and cfg.get("url"):
-            kw["url"] = cfg["url"]
-        if cfg.get("state"):   kw["state"]   = cfg["state"]
-        if cfg.get("details"): kw["details"] = cfg["details"]
-
-        ak = {}
-        for slot in ("large_image", "small_image"):
-            raw = cfg.get(slot)
-            if raw:
-                resolved = await resolve_rpc_image(raw, str(app_id), TOKEN)
-                if resolved:
-                    ak[slot] = resolved
-                else:
-                    ak[slot] = raw
-        for slot in ("large_text", "small_text"):
-            if cfg.get(slot):
-                ak[slot] = cfg[slot]
-        if ak:
-            try: kw["assets"] = ActivityAssets(**ak)
-            except Exception: pass
-
-        if cfg.get("start_timestamp"):
-            try:
-                ts_kw = {"start": datetime.fromtimestamp(float(cfg["start_timestamp"]), tz=timezone.utc)}
-                if cfg.get("end_timestamp"):
-                    ts_kw["end"] = datetime.fromtimestamp(float(cfg["end_timestamp"]), tz=timezone.utc)
-                kw["timestamps"] = ActivityTimestamps(**ts_kw)
-            except Exception: pass
-        btns = [ActivityButton(label=b["label"], url=b["url"])
-                for b in cfg.get("buttons", [])[:2] if b.get("label") and b.get("url")]
-        if btns:
-            try: kw["buttons"] = btns
-            except Exception: pass
-        await client.change_presence(activity=Activity(**kw))
+        activity, warnings = await _build_activity(cfg)
+        for w in warnings:
+            print(f"[RPC warn] {w}")
+        if activity is None:
+            print("[RPC] activity build failed; clearing presence")
+            await client.change_presence(activity=None)
+            return
+        await client.change_presence(activity=activity)
     except Exception as e:
-        print(f"[RPC] {e}")
+        print(f"[RPC] update failed: {e}")
 
 async def rpc_prompt(channel, author, label: str) -> str | None:
-    pm = await channel.send(_ansi_block([f"  {YELLOW}✏  {label}{RESET}", f"  {DIM}type value — 60s — 'none' to clear{RESET}"]))
+    pm = await channel.send(_ansi_block([
+        f"  {YELLOW}✏  {label}{RESET}",
+        f"  {DIM}reply within 60s — 'none' to clear{RESET}",
+    ]))
     def check(m): return m.author.id == author.id and m.channel.id == channel.id
     try:
         msg = await client.wait_for("message", check=check, timeout=60)
@@ -721,16 +893,32 @@ BRAND_ICONS = {
     "playstation": "https://cdn.discordapp.com/app-icons/473226677884194826/2dd91e54b57ad2cb4949dc4b24feae0d.webp?size=256",
 }
 
-BRAND_APP_IDS = {b: DEFAULT_APP_ID for b in BRAND_ICONS}
+def _brand_parts(raw_args: list[str], n: int = 3) -> list[str]:
+    raw = " ".join(raw_args) if raw_args else ""
+    p = [x.strip() for x in raw.split("|")]
+    while len(p) < n:
+        p.append("")
+    return p[:n]
 
-async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
+def _safe_int(s, default: int) -> int:
+    try:
+        v = int(str(s).strip())
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+async def apply_brand_rpc(brand: str, user_args: list[str]) -> tuple[bool, str]:
+    """
+    Apply a brand RPC. Returns (success, note).
+    Never raises. Never blocks more than ~12s.
+    """
     try:
         from discord.activity import ActivityAssets, ActivityTimestamps
         from discord import ActivityType, Activity
     except ImportError as e:
-        print(f"[RPC] import error: {e}")
-        return False
+        return False, f"import failed: {e}"
 
+    app_id = DEFAULT_APP_ID
     now = datetime.now(timezone.utc)
 
     def _ts(start=None, end=None):
@@ -738,23 +926,22 @@ async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
             kw = {}
             if start: kw["start"] = start
             if end:   kw["end"]   = end
-            return ActivityTimestamps(**kw)
-        except Exception: return None
+            return ActivityTimestamps(**kw) if kw else None
+        except Exception:
+            return None
 
-    def _parts(n=3):
-        raw = " ".join(user_args) if user_args else ""
-        p = [x.strip() for x in raw.split("|")]
-        while len(p) < n: p.append("")
-        return p
-
-    app_id = DEFAULT_APP_ID
     raw_icon = BRAND_ICONS.get(brand, "")
     icon_key = None
+    icon_warn = ""
     if raw_icon:
-        icon_key = await resolve_rpc_image(raw_icon, app_id, TOKEN)
+        resolved, status = await resolve_rpc_image(raw_icon, app_id, TOKEN)
+        if resolved:
+            icon_key = resolved
+        elif status == "failed":
+            icon_warn = " (icon unavailable)"
 
     kw: dict = {"application_id": int(app_id)}
-    ak = {}
+    ak: dict = {}
     if icon_key:
         ak["large_image"] = icon_key
         ak["small_image"] = icon_key
@@ -762,94 +949,125 @@ async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
     ak["small_text"] = brand.capitalize()
 
     if brand == "spotify":
-        p = _parts(3)
-        title = p[0] or "Unknown"; artist = p[1] or "Unknown"
-        try: dur = int(p[2]) if p[2] else 210
-        except: dur = 210
-        kw.update({"type": ActivityType.listening, "name": "Spotify",
-                   "details": title, "state": artist})
-        ak["large_text"] = "Spotify"; ak["small_text"] = artist
+        p = _brand_parts(user_args, 3)
+        title  = p[0] or "Unknown"
+        artist = p[1] or "Unknown"
+        dur    = _safe_int(p[2], 210)
+        kw.update({
+            "type": ActivityType.listening,
+            "name": "Spotify",
+            "details": title[:128],
+            "state": artist[:128],
+        })
+        ak["large_text"] = "Spotify"
+        ak["small_text"] = artist[:128]
         ts = _ts(now, now + timedelta(seconds=dur))
         if ts: kw["timestamps"] = ts
 
     elif brand == "youtube":
-        p = _parts(3)
-        video = p[0] or "Video"; channel = p[1] or "Channel"
-        try: dur = int(p[2]) if p[2] else 600
-        except: dur = 600
-        kw.update({"type": ActivityType.watching, "name": "YouTube",
-                   "details": video, "state": channel})
-        ak["large_text"] = channel
+        p = _brand_parts(user_args, 3)
+        video   = p[0] or "Video"
+        channel = p[1] or "Channel"
+        dur     = _safe_int(p[2], 600)
+        kw.update({
+            "type": ActivityType.watching,
+            "name": "YouTube",
+            "details": video[:128],
+            "state": channel[:128],
+        })
+        ak["large_text"] = channel[:128]
         ts = _ts(now, now + timedelta(seconds=dur))
         if ts: kw["timestamps"] = ts
 
     elif brand == "xbox":
-        p = _parts(2)
-        game = p[0] or "Game"; state = p[1] or "Playing on Xbox"
-        kw.update({"type": ActivityType.playing, "name": "Xbox",
-                   "details": game, "state": state})
-        ak["large_text"] = game
+        p = _brand_parts(user_args, 2)
+        game  = p[0] or "Game"
+        state = p[1] or "Playing on Xbox"
+        kw.update({
+            "type": ActivityType.playing,
+            "name": "Xbox",
+            "details": game[:128],
+            "state": state[:128],
+        })
+        ak["large_text"] = game[:128]
         ts = _ts(now)
         if ts: kw["timestamps"] = ts
 
     elif brand == "playstation":
-        p = _parts(2)
-        game = p[0] or "Game"; state = p[1] or "Playing on PlayStation"
-        kw.update({"type": ActivityType.playing, "name": "PlayStation",
-                   "details": game, "state": state})
-        ak["large_text"] = game
+        p = _brand_parts(user_args, 2)
+        game  = p[0] or "Game"
+        state = p[1] or "Playing on PlayStation"
+        kw.update({
+            "type": ActivityType.playing,
+            "name": "PlayStation",
+            "details": game[:128],
+            "state": state[:128],
+        })
+        ak["large_text"] = game[:128]
         ts = _ts(now)
         if ts: kw["timestamps"] = ts
 
     elif brand == "crunchyroll":
-        p = _parts(3)
-        anime = p[0] or "Anime"; ep = p[1] or ""
-        try: dur = int(p[2]) if p[2] else 1440
-        except: dur = 1440
-        kw.update({"type": ActivityType.watching, "name": "Crunchyroll",
-                   "details": anime})
-        if ep: kw["state"] = ep
-        ak["large_text"] = anime
+        p = _brand_parts(user_args, 3)
+        anime = p[0] or "Anime"
+        ep    = p[1] or ""
+        dur   = _safe_int(p[2], 1440)
+        kw.update({
+            "type": ActivityType.watching,
+            "name": "Crunchyroll",
+            "details": anime[:128],
+        })
+        if ep: kw["state"] = ep[:128]
+        ak["large_text"] = anime[:128]
         ts = _ts(now, now + timedelta(seconds=dur))
         if ts: kw["timestamps"] = ts
 
     elif brand == "roblox":
-        p = _parts(5)
-        game = p[0] or "Roblox"; det = p[1] or game
+        p = _brand_parts(user_args, 5)
+        game  = p[0] or "Roblox"
+        det   = p[1] or game
         state = p[2] or "Playing on Roblox"
-        lt = p[3] or game; st = p[4] or "Roblox"
-        kw.update({"type": ActivityType.playing, "name": "Roblox",
-                   "details": det, "state": state})
-        ak.update({"large_text": lt, "small_text": st})
+        lt    = p[3] or game
+        st    = p[4] or "Roblox"
+        kw.update({
+            "type": ActivityType.playing,
+            "name": "Roblox",
+            "details": det[:128],
+            "state": state[:128],
+        })
+        ak["large_text"] = lt[:128]
+        ak["small_text"] = st[:128]
         ts = _ts(now)
         if ts: kw["timestamps"] = ts
 
     elif brand == "custom":
-        p = _parts(3)
-        kw.update({"type": ActivityType.playing, "name": p[0] or "Custom"})
-        if p[1]: kw["details"] = p[1]
-        if p[2]: kw["state"]   = p[2]
+        p = _brand_parts(user_args, 3)
+        kw.update({"type": ActivityType.playing, "name": (p[0] or "Custom")[:128]})
+        if p[1]: kw["details"] = p[1][:128]
+        if p[2]: kw["state"]   = p[2][:128]
         ts = _ts(now)
         if ts: kw["timestamps"] = ts
         ak = {}
 
     else:
-        kw.update({"type": ActivityType.playing, "name": brand.capitalize()})
-        ts = _ts(now)
-        if ts: kw["timestamps"] = ts
+        return False, f"unknown brand: {brand}"
 
     if ak:
         try:
             kw["assets"] = ActivityAssets(**ak)
         except Exception as e:
-            print(f"[RPC] assets: {e}")
+            print(f"[RPC brand] assets rejected: {e}")
 
     try:
         await client.change_presence(activity=Activity(**kw))
-        return True
+        return True, icon_warn
     except Exception as e:
-        print(f"[RPC] presence: {e}")
-        return False
+        print(f"[RPC brand] presence failed: {e}")
+        return False, str(e)
+
+# ═════════════════════════════════════════════
+# END RPC
+# ═════════════════════════════════════════════
 
 # ─────────────────────────────────────────────
 # QUEST SYSTEM
@@ -1793,8 +2011,11 @@ async def on_message(message):
             await message.channel.send(build_help_section("rpc"))
 
         elif sub in BRANDS:
-            ok = await apply_brand_rpc(sub, args[2:])
-            await message.edit(content=ui_ok(f"rpc → {sub}") if ok else ui_err("rpc failed"))
+            ok, note = await apply_brand_rpc(sub, args[2:])
+            if ok:
+                await message.edit(content=ui_ok(f"rpc → {sub}{note}"))
+            else:
+                await message.edit(content=ui_err(f"rpc failed: {note}"))
 
         elif sub in ("disable","stop","clear","off"):
             cfg = load_rpc_cfg(); cfg["enabled"] = False; save_rpc_cfg(cfg)
@@ -1817,6 +2038,8 @@ async def on_message(message):
                 f"  {DIM}state{RESET}          {cfg.get('state') or '-'}",
                 f"  {DIM}large_image{RESET}    {cfg.get('large_image') or '-'}",
                 f"  {DIM}small_image{RESET}    {cfg.get('small_image') or '-'}",
+                f"  {DIM}assets cached{RESET}  {len(_rpc_asset_cache)}",
+                f"  {DIM}assets failed{RESET}  {len(_rpc_asset_fail)}",
             ]))
 
         elif sub == "application_id":
@@ -1826,6 +2049,7 @@ async def on_message(message):
             if val == "__TIMEOUT__": return
             cfg = load_rpc_cfg(); cfg["application_id"] = val or DEFAULT_APP_ID; save_rpc_cfg(cfg)
             _rpc_asset_cache.clear()
+            _rpc_asset_fail.clear()
             await update_rpc()
             await message.channel.send(ui_ok(f"application_id → {cfg['application_id']}"), delete_after=4)
 
@@ -2370,9 +2594,9 @@ async def on_message(message):
             t = await lfm_np(u)
             if not t or not t["playing"]:
                 return await message.channel.send(ui_info("nothing playing right now"), delete_after=6)
-            ok = await apply_brand_rpc("spotify", [f"{t['title']} | {t['artist']} | 210"])
+            ok, note = await apply_brand_rpc("spotify", [f"{t['title']} | {t['artist']} | 210"])
             await message.channel.send(
-                ui_ok(f"rpc → {t['title']} — {t['artist']}") if ok else ui_err("rpc failed"),
+                ui_ok(f"rpc → {t['title']} — {t['artist']}{note}") if ok else ui_err(f"rpc failed: {note}"),
                 delete_after=6)
 
         elif sub == "autorpc":
