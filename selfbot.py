@@ -182,9 +182,13 @@ HELP_DATA = {
         ("archivechannel [ch_id]","save channel messages to txt"),
     ],
     "host": [
-        ("host add <token>","add account to host list"),("host remove <token>","remove from host list"),
-        ("host list","list hosted accounts"),("host broadcast <msg>","send msg from all hosted accounts"),
-        ("host say <idx> <msg>","force hosted account to say something"),
+        ("host add <token>",         "add & validate a discord account"),
+        ("host remove <idx|token>",  "remove by index or token"),
+        ("host list",                "list all hosted accounts with status"),
+        ("host info <idx>",          "show account details + token preview"),
+        ("host say <idx> <msg>",     "send message as hosted account"),
+        ("host broadcast <msg>",     "send message from all hosted accounts"),
+        ("host clear",               "remove all hosted accounts"),
     ],
     "lastfm": [
         ("lastfm set <user> [key]","link your last.fm account"),("lastfm np","now playing track"),
@@ -364,11 +368,15 @@ HELP_DATA = {
         ("accountbackup","backup account to JSON"),
     ],
     "status": [
-    ("setstatus <text | emoji, text | :name:id, text>", "set your custom status (emoji optional)"),
-    ("clearstatus", "clear your custom status"),
-    ("stealstatus <user_id>", "copy a user's custom status"),
-    ("statushistory", "show your recent status history"),
-     ],
+        ("setstatus <text>","set custom status text"),
+        ("setstatus <emoji>, <text>","set status with emoji"),
+        ("setstatus <:name:id>, <text>","set status with custom emoji"),
+        ("clearstatus","clear your custom status"),
+        ("stealstatus <user_id>","copy a user's custom status"),
+        ("statushistory","show your recent status history"),
+        ("schedule status <unix> <text>","schedule a status change"),
+        ("schedule list","list scheduled statuses"),("schedule clear","clear scheduled statuses"),
+    ],
     "mass": [
         ("massdm <msg>","DM everyone in a server"),("massdmfile <path> <msg>","DM a list of user IDs from a file"),
         ("massfriend <file>","send friend requests to user IDs"),
@@ -1102,23 +1110,53 @@ async def lfm_np(username):
 # HOSTED / UTIL HELPERS
 # ─────────────────────────────────────────────
 
-async def hosted_send(token, channel_id, content):
+async def hosted_send(token: str, channel_id: int, content: str) -> tuple[bool, str]:
+    """Send a message from a hosted account. Returns (success, error_msg)."""
+    token = token.strip().strip('"').strip("'")
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://discord.com/api/v9/channels/{channel_id}/messages",
-                headers={"Authorization": token.strip(), "Content-Type":"application/json", "User-Agent":USER_AGENT},
-                json={"content": content}) as r:
-                return r.status in (200,201)
-    except Exception: return False
+            async with s.post(
+                f"https://discord.com/api/v9/channels/{channel_id}/messages",
+                headers=headers,
+                json={"content": content},
+            ) as r:
+                if r.status in (200, 201):
+                    return True, ""
+                body = {}
+                try: body = await r.json()
+                except Exception: pass
+                err = body.get("message", f"HTTP {r.status}")
+                return False, err
+    except Exception as e:
+        return False, str(e)
 
-async def hosted_username(token):
+async def hosted_info(token: str) -> dict:
+    """Fetch user info for a hosted token. Returns dict with username, id, status."""
+    token = token.strip().strip('"').strip("'")
+    headers = {"Authorization": token, "User-Agent": USER_AGENT}
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get("https://discord.com/api/v9/users/@me",
-                headers={"Authorization": token.strip(), "User-Agent": USER_AGENT}) as r:
-                if r.status == 200: return (await r.json()).get("username","?")
-    except Exception: pass
-    return "?"
+            async with s.get("https://discord.com/api/v9/users/@me", headers=headers) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    return {
+                        "username": d.get("username", "?"),
+                        "id": d.get("id", "?"),
+                        "valid": True,
+                    }
+                return {"username": "invalid token", "id": "?", "valid": False}
+    except Exception as e:
+        return {"username": f"error: {e}", "id": "?", "valid": False}
+
+# keep backward compat
+async def hosted_username(token: str) -> str:
+    info = await hosted_info(token)
+    return info["username"]
 
 def uwuify(text):
     text = re.sub(r'[rRlL]', 'w', text)
@@ -2465,38 +2503,140 @@ async def on_message(message):
     # HOST
     elif cmd == "host":
         sub = args[1].lower() if len(args) > 1 else ""
+
         if sub == "add":
-            if len(args) < 3: return await message.edit(content=ui_err("usage: host add <token>"))
-            t = args[2].strip()
-            if t in HOSTED_TOKENS: return await message.edit(content=ui_err("already in list"))
-            HOSTED_TOKENS.append(t); save_hosted()
-            await message.edit(content=ui_ok(f"added {await hosted_username(t)}"))
-        elif sub == "remove":
-            if len(args) < 3: return await message.edit(content=ui_err("usage: host remove <token>"))
-            t = args[2].strip()
+            # Parse token from raw message — tokens have dots and can't use args[]
+            # Format: .host add <token>
+            raw_after = message.content[len(PREFIX):].strip()   # "host add <token>"
+            parts = raw_after.split(None, 2)                    # ["host","add","<token>"]
+            if len(parts) < 3:
+                return await message.edit(content=ui_err("usage: host add <token>"))
+            t = parts[2].strip().strip('"').strip("'")
+            if not t:
+                return await message.edit(content=ui_err("no token provided"))
             if t in HOSTED_TOKENS:
-                HOSTED_TOKENS.remove(t); save_hosted(); await message.edit(content=ui_ok("removed"))
-            else: await message.edit(content=ui_err("not in list"))
+                return await message.edit(content=ui_err("already in list"))
+            # Validate before saving
+            await message.edit(content=ui_info("validating token..."))
+            info = await hosted_info(t)
+            if not info["valid"]:
+                return await message.edit(content=ui_err(f"invalid token: {info['username']}"))
+            HOSTED_TOKENS.append(t)
+            save_hosted()
+            uname = info['username']
+            uid = info['id']
+            total = len(HOSTED_TOKENS)
+            await message.edit(content=ui_ok(
+                f"hosted: {uname} ({uid})  —  {total} total accounts"
+            ))
+
+        elif sub == "remove":
+            raw_after = message.content[len(PREFIX):].strip()
+            parts = raw_after.split(None, 2)
+            if len(parts) < 3:
+                return await message.edit(content=ui_err("usage: host remove <token_or_index>"))
+            ref = parts[2].strip().strip('"').strip("'")
+            # Support removal by index number OR token value
+            target = None
+            if ref.isdigit():
+                idx = int(ref)
+                if 0 <= idx < len(HOSTED_TOKENS):
+                    target = HOSTED_TOKENS[idx]
+            elif ref in HOSTED_TOKENS:
+                target = ref
+            if target:
+                HOSTED_TOKENS.remove(target)
+                save_hosted()
+                await message.edit(content=ui_ok(f"removed account [{ref}]"))
+            else:
+                await message.edit(content=ui_err("account not found — use index from host list"))
+
         elif sub == "list":
-            if not HOSTED_TOKENS: return await message.edit(content=ui_err("no accounts"))
+            if not HOSTED_TOKENS:
+                return await message.edit(content=ui_info("no hosted accounts — use: host add <token>"))
+            await message.edit(content=ui_info(f"fetching {len(HOSTED_TOKENS)} account(s)..."))
             rows = []
             for i, t in enumerate(HOSTED_TOKENS):
-                rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{await hosted_username(t)}{RESET}")
-            await message.edit(content=_paginate("host", "hosted accounts", rows))
+                info = await hosted_info(t)
+                status = f"{GREEN}✓{RESET}" if info["valid"] else f"{RED}✗{RESET}"
+                rows.append(
+                    f"  {GREY}[{i}]{RESET} {status} {WHITE}{info['username']}{RESET}  "
+                    f"{DIM}({info['id']}){RESET}"
+                )
+            await message.edit(content=_paginate("host", f"{len(HOSTED_TOKENS)} accounts", rows))
+
         elif sub == "broadcast":
-            if len(args) < 3: return await message.edit(content=ui_err("usage: host broadcast <msg>"))
-            text = " ".join(args[2:]); ok = 0
-            for t in HOSTED_TOKENS:
-                if await hosted_send(t, message.channel.id, text): ok += 1
-                await asyncio.sleep(0.5)
-            await message.edit(content=ui_ok(f"sent from {ok}/{len(HOSTED_TOKENS)}"))
+            raw_after = message.content[len(PREFIX):].strip()
+            parts = raw_after.split(None, 2)
+            if len(parts) < 3:
+                return await message.edit(content=ui_err("usage: host broadcast <message>"))
+            text = parts[2]
+            if not HOSTED_TOKENS:
+                return await message.edit(content=ui_err("no hosted accounts"))
+            await message.edit(content=ui_info(f"broadcasting to {len(HOSTED_TOKENS)} account(s)..."))
+            ok = 0; failed = []
+            for i, t in enumerate(HOSTED_TOKENS):
+                success, err = await hosted_send(t, message.channel.id, text)
+                if success:
+                    ok += 1
+                else:
+                    info = await hosted_info(t)
+                    failed.append(f"{info['username']}: {err}")
+                await asyncio.sleep(0.6)
+            result = ui_ok(f"broadcast sent from {ok}/{len(HOSTED_TOKENS)} accounts")
+            if failed:
+                failed_str = ", ".join(failed[:3])
+                result += f"  failed: {failed_str}"
+            await message.edit(content=result)
+
         elif sub == "say":
-            if len(args) < 4: return await message.edit(content=ui_err("usage: host say <idx> <msg>"))
-            try: idx = int(args[2]); t = HOSTED_TOKENS[idx]
-            except (ValueError, IndexError): return await message.edit(content=ui_err("invalid index"))
-            ok = await hosted_send(t, message.channel.id, " ".join(args[3:]))
-            await message.edit(content=ui_ok("sent") if ok else ui_err("failed"))
-        else: await message.edit(content=build_help_section("host"))
+            # .host say <index> <message>
+            if len(args) < 4:
+                return await message.edit(content=ui_err("usage: host say <index> <message>"))
+            try:
+                idx = int(args[2])
+                t = HOSTED_TOKENS[idx]
+            except (ValueError, IndexError):
+                return await message.edit(content=ui_err(
+                    f"invalid index — use host list to see indices (0 to {len(HOSTED_TOKENS)-1})"
+                ))
+            raw_after = message.content[len(PREFIX):].strip()
+            parts = raw_after.split(None, 3)
+            text = parts[3] if len(parts) > 3 else ""
+            if not text:
+                return await message.edit(content=ui_err("no message provided"))
+            success, err = await hosted_send(t, message.channel.id, text)
+            if success:
+                info = await hosted_info(t)
+                await message.edit(content=ui_ok(f"sent as **{info['username']}**"))
+            else:
+                await message.edit(content=ui_err(f"failed: {err}"))
+
+        elif sub == "info":
+            # .host info <index>
+            if len(args) < 3 or not args[2].isdigit():
+                return await message.edit(content=ui_err("usage: host info <index>"))
+            idx = int(args[2])
+            if idx >= len(HOSTED_TOKENS):
+                return await message.edit(content=ui_err("index out of range"))
+            t = HOSTED_TOKENS[idx]
+            info = await hosted_info(t)
+            await message.edit(content=ui_box("hosted account", [
+                f"  {DIM}index{RESET}     [{idx}]",
+                f"  {DIM}username{RESET}  {info['username']}",
+                f"  {DIM}id{RESET}        {info['id']}",
+                f"  {DIM}valid{RESET}     {'yes' if info['valid'] else 'no'}",
+                f"  {DIM}token{RESET}     {t[:12]}...{t[-6:]}",
+            ]))
+
+        elif sub == "clear":
+            count = len(HOSTED_TOKENS)
+            HOSTED_TOKENS.clear()
+            save_hosted()
+            await message.edit(content=ui_ok(f"cleared {count} hosted account(s)"))
+
+        else:
+            await message.edit(content=build_help_section("host"))
 
     # LASTFM
     elif cmd == "lastfm":
