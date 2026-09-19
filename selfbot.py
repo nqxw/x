@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# sy's selfbot — v2.2.0
+# sy's selfbot — v2.2.1
 
 import discord
 import asyncio
@@ -69,7 +69,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
@@ -1070,7 +1070,8 @@ async def _spam_worker(channel, count, text):
 LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 _lfm = {}
 def _load_lfm():
-    global _lfm; _lfm = load_config().get("lastfm", {})
+    global _lfm
+    _lfm = load_config().get("lastfm", {})
 def _save_lfm():
     cfg = load_config(); cfg["lastfm"] = _lfm; save_config(cfg)
 _load_lfm()
@@ -1488,6 +1489,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message):
+    # ── ALL GLOBALS HOISTED TO THE TOP (fixes 'used prior to global declaration') ──
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
     global _autoreact_emoji, _autoaddback, _current_platform
@@ -1498,6 +1500,13 @@ async def on_message(message):
     global _autodelete_secs, _encrypt_enabled, _proxy, _session_idx
     global _rate_limit_tracking, _cache_auto
     global _queue_enabled, _queue_workers
+    global _scheduler
+    global _reconnect_count, _auto_reconnect, _auto_restart
+    global _buttons_enabled, _modals_enabled
+    global _triggers, _trigger_fired_counts
+    global _server_prefixes, _cmd_blacklist_server, _cmd_blacklist_channel
+    global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
+    global _managed_tasks, _multireact_enabled
 
     if LOGGER_ENABLED and message.guild:
         try: log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | {message.author}: {message.content[:100]}")
@@ -1595,7 +1604,6 @@ async def on_message(message):
 
     if message.author.id != client.user.id: return
 
-    # per-server prefix
     effective_prefix = PREFIX
     if message.guild and str(message.guild.id) in _server_prefixes:
         effective_prefix = _server_prefixes[str(message.guild.id)]
@@ -1618,7 +1626,9 @@ async def on_message(message):
 
     db_stats_inc(cmd)
 
+    # ─────────────────────────────────────────────
     # HELP
+    # ─────────────────────────────────────────────
     if cmd in ("help", "h"):
         try: await message.delete()
         except Exception: pass
@@ -1630,7 +1640,9 @@ async def on_message(message):
             await message.channel.send(build_help_section(sub, page)); return
         await message.channel.send(build_help_root(1))
 
+    # ─────────────────────────────────────────────
     # SETTINGS
+    # ─────────────────────────────────────────────
     elif cmd == "prefix":
         if len(args) < 2: return await message.edit(content=ui_info(f"current prefix: {PREFIX}"))
         PREFIX = args[1]; cfg = load_config(); cfg["prefix"] = PREFIX; save_config(cfg)
@@ -1731,7 +1743,9 @@ async def on_message(message):
         rows = [f"  {GREY}•{RESET} {c}" for c in sorted(_cmd_disabled)]
         await message.edit(content=_paginate("disabled commands", "", rows) if rows else ui_info("none"))
 
+    # ─────────────────────────────────────────────
     # GUARDS
+    # ─────────────────────────────────────────────
     elif cmd == "blacklist":
         try: await message.delete()
         except Exception: pass
@@ -1827,7 +1841,9 @@ async def on_message(message):
             await message.edit(content=ui_ok("guards reset"))
         else: await message.edit(content=build_help_section("guards"))
 
+    # ─────────────────────────────────────────────
     # RESILIENCE
+    # ─────────────────────────────────────────────
     elif cmd == "autoreconnect":
         _auto_reconnect = (args[1].lower() in ("on","enable")) if len(args) > 1 else not _auto_reconnect
         await message.edit(content=ui_ok(f"autoreconnect → {'on' if _auto_reconnect else 'off'}"))
@@ -1894,7 +1910,9 @@ async def on_message(message):
             ]))
         else: await message.edit(content=build_help_section("resilience"))
 
+    # ─────────────────────────────────────────────
     # TASKS
+    # ─────────────────────────────────────────────
     elif cmd == "task":
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "list":
@@ -1919,7 +1937,9 @@ async def on_message(message):
             await message.edit(content=ui_ok("cleared"))
         else: await message.edit(content=build_help_section("tasks"))
 
+    # ─────────────────────────────────────────────
     # TRIGGERS
+    # ─────────────────────────────────────────────
     elif cmd == "trigger":
         try: await message.delete()
         except Exception: pass
@@ -1999,7 +2019,9 @@ async def on_message(message):
             await message.edit(content=ui_ok("cleared"))
         else: await message.edit(content=build_help_section("triggers"))
 
+    # ─────────────────────────────────────────────
     # GENERAL
+    # ─────────────────────────────────────────────
     elif cmd == "ping":
         await message.edit(content=ui_ok(f"pong — `{round(client.latency*1000)}ms`"))
     elif cmd == "info":
@@ -3088,7 +3110,6 @@ async def on_message(message):
             rows = [f"  {GREY}•{RESET} {j['id']} @ {j['when']}" for j in _scheduler]
             await message.channel.send(_paginate("scheduled", "", rows) if rows else ui_info("none"))
         elif sub == "remove" and len(args) >= 3:
-            global _scheduler
             _scheduler = [j for j in _scheduler if j["id"] != args[2]]
             sched_save(); await message.channel.send(ui_ok("removed"))
         elif sub == "clear":
@@ -3907,7 +3928,7 @@ async def on_message(message):
         pass
 
 # ─────────────────────────────────────────────
-# REACTION / VOICE / MEMBER TRIGGER EVENTS
+# REACTION / VOICE TRIGGER EVENTS
 # ─────────────────────────────────────────────
 
 @client.event
