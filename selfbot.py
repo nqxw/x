@@ -436,7 +436,8 @@ def build_help_root(page: int = 1) -> str:
         desc = desc_map.get(cat, "commands")
         lines.append(f"  {CYAN}{cat:<14}{RESET}  {DIM}{desc}{RESET}")
     lines.append(bar)
-    lines.append(f"  {DIM}{PREFIX}help <category> [page]  •  page {page}/{total_pages}{RESET}")
+    lines.append(f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}")
+    lines.append(f"  {DIM}page {page}/{total_pages}{RESET}")
     lines.append(f"  {DIM}sy | ver {VERSION}{RESET}")
     lines.append(bar)
     return _ansi_block(lines)
@@ -1341,14 +1342,29 @@ async def on_message(message):
     # ─────────────────────────────────
 
     if cmd in ("help", "h"):
-        sub  = args[1].lower() if len(args) > 1 else ""
-        page = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
+        # $help                → root, page 1
+        # $help 2              → root, page 2          (bare number = flip root)
+        # $help rpc            → rpc section, page 1
+        # $help rpc 2          → rpc section, page 2
         try: await message.delete()
         except Exception: pass
-        if not sub:
+
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        # bare number → flip root page
+        if sub.isdigit():
+            page = int(sub)
             await message.channel.send(build_help_root(page))
-        else:
+            return
+
+        # category (+ optional page)
+        if sub:
+            page = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
             await message.channel.send(build_help_section(sub, page))
+            return
+
+        # no arg → root page 1
+        await message.channel.send(build_help_root(1))
 
     # ─────────────────────────────────
     # SETTINGS
