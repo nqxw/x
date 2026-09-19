@@ -1,7 +1,8 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# sy's selfbot — v2.2.1
+# sy's selfbot — v2.2.2
 
 import discord
+from discord.ext import commands as _cmds_ext
 import asyncio
 import aiohttp
 import json
@@ -28,6 +29,15 @@ from uuid import uuid4
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+# ── external integrations ──
+from selfbot_ipc import start_ipc_server
+from db_helper import (
+    config_get, config_set, config_get_all,
+    hosted_tokens_get, hosted_token_add, hosted_token_remove,
+    hosted_token_update_username, sync_local_to_supabase, health_check,
+    async_hosted_tokens_get, async_hosted_token_add, async_hosted_token_remove,
+)
+
 # ─────────────────────────────────────────────
 # BOOTSTRAP
 # ─────────────────────────────────────────────
@@ -37,22 +47,15 @@ os.makedirs("database", exist_ok=True)
 os.makedirs("exports", exist_ok=True)
 os.makedirs("plugins", exist_ok=True)
 os.makedirs("backups", exist_ok=True)
+os.makedirs("cogs", exist_ok=True)
+os.makedirs("data", exist_ok=True)
 
 def load_config():
-    if os.path.exists("config.json"):
-        try:
-            with open("config.json", "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return config_get_all()   # reads Supabase + local fallback
 
-def save_config(cfg):
-    try:
-        with open("config.json", "w") as f:
-            json.dump(cfg, f, indent=4)
-    except Exception as e:
-        print(f"[Config] save error: {e}")
+def save_config(cfg: dict):
+    for key, value in cfg.items():
+        config_set(key, value)
 
 _cfg = load_config()
 
@@ -69,8 +72,12 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 LOG_FILE = "message_log.txt"
+
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
+              "Electron/28.2.10 Safari/537.36")
 
 # ─────────────────────────────────────────────
 # UI HELPERS
@@ -182,13 +189,13 @@ HELP_DATA = {
         ("archivechannel [ch_id]","save channel messages to txt"),
     ],
     "host": [
-        ("host add <token>",         "add & validate a discord account"),
-        ("host remove <idx|token>",  "remove by index or token"),
-        ("host list",                "list all hosted accounts with status"),
-        ("host info <idx>",          "show account details + token preview"),
-        ("host say <idx> <msg>",     "send message as hosted account"),
-        ("host broadcast <msg>",     "send message from all hosted accounts"),
-        ("host clear",               "remove all hosted accounts"),
+        ("host add <token>","add account to host list"),
+        ("host remove <token_or_index>","remove from host list"),
+        ("host list","list hosted accounts"),
+        ("host info <idx>","show account details + token preview"),
+        ("host say <idx> <msg>","force hosted account to say something"),
+        ("host broadcast <msg>","send msg from all hosted accounts"),
+        ("host clear","remove all hosted accounts"),
     ],
     "lastfm": [
         ("lastfm set <user> [key]","link your last.fm account"),("lastfm np","now playing track"),
@@ -477,6 +484,44 @@ HELP_DATA = {
         ("interact list","list pending interactions"),
         ("interact clear","clear pending interactions"),
     ],
+    "rpc": [
+        ("rpc1 <name|details|state|type|platform>","slot 1 rich presence"),
+        ("rpc1 name <text>","set slot 1 activity name"),
+        ("rpc1 details <text>","set slot 1 details line"),
+        ("rpc1 state <text>","set slot 1 state line"),
+        ("rpc1 type <type>","playing/streaming/listening/watching/competing/purplestream"),
+        ("rpc1 platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta"),
+        ("rpc1 large_image <url>","set slot 1 large image"),
+        ("rpc1 small_image <url>","set slot 1 small image"),
+        ("rpc1 timestamp <val>","3600 | 1:00:00 | clear"),
+        ("rpc1 btn1 <label> <url>","slot 1 first button"),
+        ("rpc1 btn2 <label> <url>","slot 1 second button"),
+        ("rpc1 spotify <song - artist>","slot 1 spotify presence"),
+        ("rpc1 youtube <video - channel>","slot 1 youtube presence"),
+        ("rpc1 xbox <game - details>","slot 1 xbox presence"),
+        ("rpc1 ps <game - details>","slot 1 playstation presence"),
+        ("rpc1 ps4 <game - details>","slot 1 ps4 presence"),
+        ("rpc1 crunchy <anime - ep>","slot 1 crunchyroll presence"),
+        ("rpc1 clear","clear slot 1"),
+        ("rpc2..rpc6 ...","same for slots 2–6"),
+        ("spotify <song - artist> [slot]","quick spotify to slot"),
+        ("youtube <video - channel> [slot]","quick youtube to slot"),
+        ("xbox <game - details> [slot]","quick xbox to slot"),
+        ("ps <game - details> [slot]","quick playstation to slot"),
+        ("ps4 <game - details> [slot]","quick ps4 to slot"),
+        ("crunchy <anime - ep> [slot]","quick crunchyroll to slot"),
+        ("vrchat <state - world> [slot]","quick vrchat presence"),
+        ("meta <state - world> [slot] [image]","quick meta quest presence"),
+        ("playing <text>","simple playing activity"),("listening <text>","simple listening activity"),
+        ("watching <text>","simple watching activity"),("competing <text>","simple competing activity"),
+        ("stopactivity","clear current activity"),("setstatus <status>","online/dnd/idle/invisible"),
+        ("aoff","quick activity off"),
+        ("clear_multi_rpc","wipe all 6 rpc slots"),
+        ("rpc_status","show all 6 rpc slots"),
+        ("rstatus <s1, s2, ...>","rotate custom statuses"),
+        ("remoji <e1, e2, ...>","rotate custom status emojis"),
+        ("stopstatus","stop status rotation"),("stopemoji","stop emoji rotation"),
+    ],
 }
 
 def build_help_root(page=1):
@@ -502,6 +547,7 @@ def build_help_root(page=1):
         "monitor":"event monitoring & alerts","backup":"server backup & restore",
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
+        "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
     }
     lines = [f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
@@ -528,6 +574,11 @@ def build_help_section(cat, page=1):
 # ─────────────────────────────────────────────
 
 client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
+
+# RPC cog shim — a commands.Bot that hosts the RPC cog.
+# We forward every on_message into process_commands so .rpc1..6 / .spotify / etc all fire.
+rpc_host = _cmds_ext.Bot(command_prefix=PREFIX, self_bot=True, help_command=None)
+RPC_COG = None
 
 AUTO_RESPONSES = {}
 SNIPER_ENABLED = True
@@ -588,7 +639,6 @@ _nuke_backups = {}
 _server_backups = {}
 _stats = defaultdict(int)
 
-# v2.2 additions
 _server_prefixes = {}
 _cmd_blacklist_server = {}
 _cmd_blacklist_channel = {}
@@ -621,6 +671,38 @@ _trigger_fired_counts = defaultdict(int)
 _TASK_STORE = "database/tasks.json"
 _TRIGGER_STORE = "database/triggers.json"
 
+PLATFORM_MAP = {
+    "desktop":  "Windows",
+    "web":      "Web",
+    "mobile":   "Android",
+    "ios":      "iOS",
+    "android":  "Android",
+    "embedded": "Embedded",
+}
+_current_platform = "desktop"
+
+HOUSE_IDS = {"bravery": 1, "brilliance": 2, "balance": 3}
+HOUSE_NAMES = {1: "Bravery", 2: "Brilliance", 3: "Balance"}
+
+async def set_hypesquad(house_id: int):
+    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post("https://discord.com/api/v9/hypesquad/online",
+                              headers=h, json={"house_id": house_id}) as r:
+                return r.status in (200, 204), await r.text()
+    except Exception as e:
+        return False, str(e)
+
+async def clear_hypesquad():
+    h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.delete("https://discord.com/api/v9/hypesquad/online", headers=h) as r:
+                return r.status in (200, 204)
+    except Exception:
+        return False
+
 # ─────────────────────────────────────────────
 # AGC STATE
 # ─────────────────────────────────────────────
@@ -647,13 +729,20 @@ _agc_load_wl()
 # HOSTED ACCOUNTS
 # ─────────────────────────────────────────────
 
-HOSTED_TOKENS = list(_cfg.get("hosted_tokens", []))
-def save_hosted():
-    cfg = load_config(); cfg["hosted_tokens"] = HOSTED_TOKENS; save_config(cfg)
+async def load_hosted_tokens_async():
+    global HOSTED_TOKENS
+    try:
+        HOSTED_TOKENS = await async_hosted_tokens_get()
+        print(f"[host] loaded {len(HOSTED_TOKENS)} tokens from Supabase")
+    except Exception as e:
+        print(f"[host] Supabase load failed: {e} — falling back to empty")
+        HOSTED_TOKENS = []
 
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
-              "Electron/28.2.10 Safari/537.36")
+HOSTED_TOKENS: list[str] = []  # populated in on_ready
+
+def save_hosted():
+    """no-op — HOSTED_TOKENS persists to Supabase via async_hosted_token_add/remove."""
+    pass
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -908,7 +997,9 @@ async def _api(session, method, url, headers=None, json_body=None, retries=3):
             if e.status >= 500:
                 await asyncio.sleep(0.5 * (attempt + 1)); continue
             raise
-    raise last
+    if last is not None:
+        raise last
+    return {}
 
 SUPPORTED_TASKS = ("WATCH_VIDEO","WATCH_VIDEO_ON_MOBILE","PLAY_ON_DESKTOP",
                    "PLAY_ON_DESKTOP_V2","PLAY_ACTIVITY","STREAM_ON_DESKTOP")
@@ -1110,53 +1201,36 @@ async def lfm_np(username):
 # HOSTED / UTIL HELPERS
 # ─────────────────────────────────────────────
 
-async def hosted_send(token: str, channel_id: int, content: str) -> tuple[bool, str]:
-    """Send a message from a hosted account. Returns (success, error_msg)."""
-    token = token.strip().strip('"').strip("'")
-    headers = {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
+async def hosted_send(token, channel_id, content):
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"https://discord.com/api/v9/channels/{channel_id}/messages",
-                headers=headers,
-                json={"content": content},
-            ) as r:
-                if r.status in (200, 201):
-                    return True, ""
-                body = {}
-                try: body = await r.json()
-                except Exception: pass
-                err = body.get("message", f"HTTP {r.status}")
-                return False, err
-    except Exception as e:
-        return False, str(e)
+            async with s.post(f"https://discord.com/api/v9/channels/{channel_id}/messages",
+                headers={"Authorization": token.strip(), "Content-Type":"application/json", "User-Agent":USER_AGENT},
+                json={"content": content}) as r:
+                return r.status in (200,201)
+    except Exception: return False
 
-async def hosted_info(token: str) -> dict:
-    """Fetch user info for a hosted token. Returns dict with username, id, status."""
-    token = token.strip().strip('"').strip("'")
-    headers = {"Authorization": token, "User-Agent": USER_AGENT}
+async def hosted_username(token):
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get("https://discord.com/api/v9/users/@me", headers=headers) as r:
+            async with s.get("https://discord.com/api/v9/users/@me",
+                headers={"Authorization": token.strip(), "User-Agent": USER_AGENT}) as r:
+                if r.status == 200: return (await r.json()).get("username","?")
+    except Exception: pass
+    return "?"
+
+async def hosted_info(token):
+    token = token.strip().strip('"').strip("'")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://discord.com/api/v9/users/@me",
+                             headers={"Authorization": token, "User-Agent": USER_AGENT}) as r:
                 if r.status == 200:
                     d = await r.json()
-                    return {
-                        "username": d.get("username", "?"),
-                        "id": d.get("id", "?"),
-                        "valid": True,
-                    }
+                    return {"username": d.get("username","?"), "id": d.get("id","?"), "valid": True}
                 return {"username": "invalid token", "id": "?", "valid": False}
     except Exception as e:
         return {"username": f"error: {e}", "id": "?", "valid": False}
-
-# keep backward compat
-async def hosted_username(token: str) -> str:
-    info = await hosted_info(token)
-    return info["username"]
 
 def uwuify(text):
     text = re.sub(r'[rRlL]', 'w', text)
@@ -1270,7 +1344,7 @@ def sched_load():
 # MASS ACTION WORKERS
 # ─────────────────────────────────────────────
 
-async def mass_dm(guild, msg, ctx):
+async def mass_dm(guild, msg, ctx=None):
     done = 0
     for m in list(guild.members):
         if m.bot or m.id == client.user.id: continue
@@ -1279,7 +1353,7 @@ async def mass_dm(guild, msg, ctx):
         await asyncio.sleep(1.2)
     return done
 
-async def mass_friend_ids(ids, ctx):
+async def mass_friend_ids(ids, ctx=None):
     done = 0
     h = {"Authorization": TOKEN, "Content-Type":"application/json", "User-Agent": USER_AGENT}
     async with aiohttp.ClientSession() as s:
@@ -1334,7 +1408,7 @@ async def mass_kick(guild, ids, reason="mass kick"):
         await asyncio.sleep(0.8)
     return done
 
-async def mass_join(invite, tokens, ctx):
+async def mass_join(invite, tokens, ctx=None):
     done = 0
     h_tmpl = {"Content-Type":"application/json","User-Agent":USER_AGENT}
     async with aiohttp.ClientSession() as s:
@@ -1381,7 +1455,7 @@ def _perm_check(cmd, message):
     if str(message.channel.id) in _cmd_blacklist_channel:
         if cmd in _cmd_blacklist_channel[str(message.channel.id)]: return False
     if cmd in _role_restrict:
-        if not message.guild: return False
+        if not message.guild or not hasattr(message.author, "roles"): return False
         have = {r.id for r in message.author.roles}
         if not (have & _role_restrict[cmd]): return False
     if cmd in _perm_block: return False
@@ -1476,15 +1550,51 @@ async def on_interaction(interaction):
         print(f"[interaction] {e}")
 
 # ─────────────────────────────────────────────
+# RPC COG LOADER
+# ─────────────────────────────────────────────
+
+async def _load_rpc_cog():
+    global RPC_COG
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cogs.rpc", "cogs/rpc.py")
+        if spec is None or spec.loader is None:
+            print("[RPC] cogs/rpc.py not found — skipping")
+            return
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["cogs.rpc"] = mod
+        spec.loader.exec_module(mod)
+        cog = mod.RPCCog(rpc_host)
+        # Give the cog a live gateway reference so its presence interceptor + _push() work
+        try:
+            rpc_host._connection = client._connection
+        except Exception as e:
+            print(f"[RPC] could not bind connection: {e}")
+        await rpc_host.add_cog(cog)
+        RPC_COG = cog
+        # Manually fire on_ready so slot restore + interceptor attach
+        try:
+            await cog.on_ready()
+        except Exception as e:
+            print(f"[RPC] on_ready failed: {e}")
+        print("[RPC] cog loaded")
+    except Exception as e:
+        print(f"[RPC] load failed: {e}")
+        traceback.print_exc()
+
+# ─────────────────────────────────────────────
 # EVENTS
 # ─────────────────────────────────────────────
 
 @client.event
 async def on_ready():
-    global _autoaddback, _autoreact_emoji, _last_ready_ts, _cmd_queue, _queue_worker_tasks
+    global _autoaddback, _autoreact_emoji, _last_ready_ts, _cmd_queue, _queue_worker_tasks, HOSTED_TOKENS
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
     print(f"[+] {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
+
+    # Load hosted tokens from Supabase
+    await load_hosted_tokens_async()
 
     cfg = load_config()
     if cfg.get("autoquest_enabled"): asyncio.create_task(autoquest_run(TOKEN))
@@ -1509,6 +1619,31 @@ async def on_ready():
             except Exception: pass
     except Exception: pass
 
+    try:
+        sync_local_to_supabase()
+    except Exception as e:
+        print(f"[db] sync error: {e}")
+
+    # initialise RPC state so IPC can read/write it immediately
+    globals().setdefault("_rpc_state", {
+        "enabled":     False,
+        "type":        "playing",
+        "name":        "selfbot",
+        "details":     "",
+        "state":       "",
+        "url":         "",
+        "large_image": "",
+        "large_text":  "",
+        "small_image": "",
+        "small_text":  "",
+    })
+
+    asyncio.create_task(start_ipc_server(globals()))
+
+    # Load the RPC cog once, after the client is fully ready
+    if RPC_COG is None:
+        await _load_rpc_cog()
+
 @client.event
 async def on_disconnect():
     global _reconnect_count
@@ -1523,7 +1658,7 @@ async def on_resumed():
 
 @client.event
 async def on_message(message):
-    # ── ALL GLOBALS HOISTED TO THE TOP (fixes 'used prior to global declaration') ──
+    # ── ALL GLOBALS HOISTED TO THE TOP ──
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
     global _autoreact_emoji, _autoaddback, _current_platform
@@ -1540,7 +1675,17 @@ async def on_message(message):
     global _triggers, _trigger_fired_counts
     global _server_prefixes, _cmd_blacklist_server, _cmd_blacklist_channel
     global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
-    global _managed_tasks, _multireact_enabled
+    global _managed_tasks, _multireact_enabled, _vsniper_list
+
+    # ── RPC COG FORWARDING ──
+    # The RPC cog lives on rpc_host (a commands.Bot shim). Feed every message
+    # into its process_commands so .rpc1..6, .spotify, .playing, etc. all run.
+    if RPC_COG is not None:
+        try:
+            rpc_host._connection.user = client.user
+            await rpc_host.process_commands(message)
+        except Exception as e:
+            print(f"[rpc dispatch] {e}")
 
     if LOGGER_ENABLED and message.guild:
         try: log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | {message.author}: {message.content[:100]}")
@@ -1647,6 +1792,20 @@ async def on_message(message):
     raw = message.content[len(effective_prefix):]
     args = raw.split()
     cmd = args[0].lower() if args else ""
+
+    # ── RPC COG COMMANDS SKIP THE LOCAL DISPATCHER ──
+    # If the cog already handled this command, bail so nothing double-fires.
+    if RPC_COG is not None:
+        rpc_cmds = {
+            "rpc1","rpc2","rpc3","rpc4","rpc5","rpc6",
+            "spotify","youtube","xbox","ps","ps4","crunchy","vrchat","meta",
+            "playing","listening","listen","watching","watch","competing",
+            "stopactivity","aoff",
+            "clear_multi_rpc","rpc_status",
+            "rstatus","remoji","stopstatus","stopemoji",
+        }
+        if cmd in rpc_cmds:
+            return
 
     if cmd in _aliases: cmd = _aliases[cmd]
 
@@ -2503,117 +2662,50 @@ async def on_message(message):
     # HOST
     elif cmd == "host":
         sub = args[1].lower() if len(args) > 1 else ""
-
         if sub == "add":
-            # Parse token from raw message — tokens have dots and can't use args[]
-            # Format: .host add <token>
-            raw_after = message.content[len(PREFIX):].strip()   # "host add <token>"
-            parts = raw_after.split(None, 2)                    # ["host","add","<token>"]
-            if len(parts) < 3:
-                return await message.edit(content=ui_err("usage: host add <token>"))
-            t = parts[2].strip().strip('"').strip("'")
-            if not t:
-                return await message.edit(content=ui_err("no token provided"))
+            if len(args) < 3: return await message.edit(content=ui_err("usage: host add <token>"))
+            t = args[2].strip().strip('"').strip("'")
             if t in HOSTED_TOKENS:
-                return await message.edit(content=ui_err("already in list"))
-            # Validate before saving
-            await message.edit(content=ui_info("validating token..."))
-            info = await hosted_info(t)
-            if not info["valid"]:
-                return await message.edit(content=ui_err(f"invalid token: {info['username']}"))
-            HOSTED_TOKENS.append(t)
-            save_hosted()
-            uname = info['username']
-            uid = info['id']
-            total = len(HOSTED_TOKENS)
-            await message.edit(content=ui_ok(
-                f"hosted: {uname} ({uid})  —  {total} total accounts"
-            ))
-
+                return await message.edit(content=ui_err("already in hosted list"))
+            uname = await hosted_username(t)
+            if not uname or uname == "?":
+                return await message.edit(content=ui_err("invalid or dead token"))
+            try:
+                await async_hosted_token_add(t, username=uname)
+                HOSTED_TOKENS.append(t)
+                await message.edit(content=ui_ok(f"✓ hosted {uname} (Supabase synced)"))
+                print(f"[host] added {uname} ({t[:20]}...) → Supabase")
+            except Exception as e:
+                await message.edit(content=ui_err(f"Supabase write failed: {e}"))
+                print(f"[host] error adding token: {e}")
         elif sub == "remove":
-            raw_after = message.content[len(PREFIX):].strip()
-            parts = raw_after.split(None, 2)
-            if len(parts) < 3:
-                return await message.edit(content=ui_err("usage: host remove <token_or_index>"))
-            ref = parts[2].strip().strip('"').strip("'")
-            # Support removal by index number OR token value
+            if len(args) < 3: return await message.edit(content=ui_err("usage: host remove <token_or_index>"))
+            ref = args[2].strip().strip('"').strip("'")
             target = None
             if ref.isdigit():
                 idx = int(ref)
-                if 0 <= idx < len(HOSTED_TOKENS):
-                    target = HOSTED_TOKENS[idx]
+                if 0 <= idx < len(HOSTED_TOKENS): target = HOSTED_TOKENS[idx]
             elif ref in HOSTED_TOKENS:
                 target = ref
-            if target:
+            if not target:
+                return await message.edit(content=ui_err("not in hosted list"))
+            try:
+                await async_hosted_token_remove(target)
                 HOSTED_TOKENS.remove(target)
-                save_hosted()
-                await message.edit(content=ui_ok(f"removed account [{ref}]"))
-            else:
-                await message.edit(content=ui_err("account not found — use index from host list"))
-
+                await message.edit(content=ui_ok("✓ removed (Supabase synced)"))
+                print(f"[host] removed token → Supabase")
+            except Exception as e:
+                await message.edit(content=ui_err(f"Supabase delete failed: {e}"))
+                print(f"[host] error removing token: {e}")
         elif sub == "list":
             if not HOSTED_TOKENS:
-                return await message.edit(content=ui_info("no hosted accounts — use: host add <token>"))
-            await message.edit(content=ui_info(f"fetching {len(HOSTED_TOKENS)} account(s)..."))
+                return await message.edit(content=ui_err("no hosted accounts"))
             rows = []
             for i, t in enumerate(HOSTED_TOKENS):
-                info = await hosted_info(t)
-                status = f"{GREEN}✓{RESET}" if info["valid"] else f"{RED}✗{RESET}"
-                rows.append(
-                    f"  {GREY}[{i}]{RESET} {status} {WHITE}{info['username']}{RESET}  "
-                    f"{DIM}({info['id']}){RESET}"
-                )
-            await message.edit(content=_paginate("host", f"{len(HOSTED_TOKENS)} accounts", rows))
-
-        elif sub == "broadcast":
-            raw_after = message.content[len(PREFIX):].strip()
-            parts = raw_after.split(None, 2)
-            if len(parts) < 3:
-                return await message.edit(content=ui_err("usage: host broadcast <message>"))
-            text = parts[2]
-            if not HOSTED_TOKENS:
-                return await message.edit(content=ui_err("no hosted accounts"))
-            await message.edit(content=ui_info(f"broadcasting to {len(HOSTED_TOKENS)} account(s)..."))
-            ok = 0; failed = []
-            for i, t in enumerate(HOSTED_TOKENS):
-                success, err = await hosted_send(t, message.channel.id, text)
-                if success:
-                    ok += 1
-                else:
-                    info = await hosted_info(t)
-                    failed.append(f"{info['username']}: {err}")
-                await asyncio.sleep(0.6)
-            result = ui_ok(f"broadcast sent from {ok}/{len(HOSTED_TOKENS)} accounts")
-            if failed:
-                failed_str = ", ".join(failed[:3])
-                result += f"  failed: {failed_str}"
-            await message.edit(content=result)
-
-        elif sub == "say":
-            # .host say <index> <message>
-            if len(args) < 4:
-                return await message.edit(content=ui_err("usage: host say <index> <message>"))
-            try:
-                idx = int(args[2])
-                t = HOSTED_TOKENS[idx]
-            except (ValueError, IndexError):
-                return await message.edit(content=ui_err(
-                    f"invalid index — use host list to see indices (0 to {len(HOSTED_TOKENS)-1})"
-                ))
-            raw_after = message.content[len(PREFIX):].strip()
-            parts = raw_after.split(None, 3)
-            text = parts[3] if len(parts) > 3 else ""
-            if not text:
-                return await message.edit(content=ui_err("no message provided"))
-            success, err = await hosted_send(t, message.channel.id, text)
-            if success:
-                info = await hosted_info(t)
-                await message.edit(content=ui_ok(f"sent as **{info['username']}**"))
-            else:
-                await message.edit(content=ui_err(f"failed: {err}"))
-
+                uname = await hosted_username(t)
+                rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{uname}{RESET}  {DIM}{t[:20]}...{RESET}")
+            await message.edit(content=_paginate("host", f"hosted accounts (Supabase)", rows))
         elif sub == "info":
-            # .host info <index>
             if len(args) < 3 or not args[2].isdigit():
                 return await message.edit(content=ui_err("usage: host info <index>"))
             idx = int(args[2])
@@ -2628,13 +2720,40 @@ async def on_message(message):
                 f"  {DIM}valid{RESET}     {'yes' if info['valid'] else 'no'}",
                 f"  {DIM}token{RESET}     {t[:12]}...{t[-6:]}",
             ]))
-
+        elif sub == "broadcast":
+            if len(args) < 3: return await message.edit(content=ui_err("usage: host broadcast <msg>"))
+            text = " ".join(args[2:]); ok = 0; failed = 0
+            if not HOSTED_TOKENS:
+                return await message.edit(content=ui_err("no hosted tokens"))
+            for t in HOSTED_TOKENS:
+                try:
+                    if await hosted_send(t, message.channel.id, text):
+                        ok += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+                await asyncio.sleep(0.5)
+            await message.edit(content=ui_ok(f"sent from {ok}/{len(HOSTED_TOKENS)}" + (f" ({failed} failed)" if failed else "")))
+        elif sub == "say":
+            if len(args) < 4: return await message.edit(content=ui_err("usage: host say <idx> <msg>"))
+            try:
+                idx = int(args[2])
+                if idx < 0 or idx >= len(HOSTED_TOKENS):
+                    return await message.edit(content=ui_err(f"index 0–{len(HOSTED_TOKENS)-1}"))
+                t = HOSTED_TOKENS[idx]
+            except ValueError:
+                return await message.edit(content=ui_err("invalid index"))
+            ok = await hosted_send(t, message.channel.id, " ".join(args[3:]))
+            await message.edit(content=ui_ok("sent") if ok else ui_err("failed"))
         elif sub == "clear":
             count = len(HOSTED_TOKENS)
+            # remove each from Supabase
+            for t in list(HOSTED_TOKENS):
+                try: await async_hosted_token_remove(t)
+                except Exception: pass
             HOSTED_TOKENS.clear()
-            save_hosted()
             await message.edit(content=ui_ok(f"cleared {count} hosted account(s)"))
-
         else:
             await message.edit(content=build_help_section("host"))
 
@@ -2746,7 +2865,7 @@ async def on_message(message):
         if len(args) < 2: return await message.channel.send(ui_err("usage: massdm <msg>"), delete_after=5)
         txt = " ".join(args[1:])
         await message.channel.send(ui_info("mass dm started"))
-        done = await mass_dm(message.guild, txt, message)
+        done = await mass_dm(message.guild, txt)
         await message.channel.send(ui_ok(f"sent to {done} members"))
     elif cmd == "massdmfile":
         try: await message.delete()
@@ -2769,7 +2888,7 @@ async def on_message(message):
         if len(args) < 2 or not os.path.exists(args[1]):
             return await message.channel.send(ui_err("usage: massfriend <file>"), delete_after=5)
         with open(args[1]) as f: ids = [l.strip() for l in f if l.strip()]
-        done = await mass_friend_ids(ids, message)
+        done = await mass_friend_ids(ids)
         await message.channel.send(ui_ok(f"sent {done}/{len(ids)}"))
     elif cmd == "massjoin":
         try: await message.delete()
@@ -2778,7 +2897,7 @@ async def on_message(message):
         invite = args[1].replace("https://discord.gg/","").replace("discord.gg/","")
         count = int(args[2]) if args[2].isdigit() else 1
         tokens = HOSTED_TOKENS[:count]
-        done = await mass_join(invite, tokens, message)
+        done = await mass_join(invite, tokens)
         await message.channel.send(ui_ok(f"joined {done}/{len(tokens)}"))
     elif cmd == "massleave":
         try: await message.delete()
@@ -3723,6 +3842,8 @@ async def on_message(message):
 
     # DOWNLOADS
     elif cmd in ("yt","youtube","ytaudio","tiktok","tt","instagram","ig"):
+        # NOTE: youtube is claimed by the RPC cog above — this branch only fires for
+        # ytaudio/tiktok/instagram when RPC_COG loaded successfully, or all four when it didn't.
         try: await message.delete()
         except Exception: pass
         if len(args) < 2: return await message.channel.send(ui_err(f"usage: {cmd} <url>"), delete_after=5)
