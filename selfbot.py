@@ -1376,22 +1376,7 @@ async def on_message(message):
         else:
             await message.channel.send(build_help_section(sub, page))
 
-    # ─────────────────────────────────
-    # SETTINGS
-    # ─────────────────────────────────
-
-    elif cmd == "prefix":
-        global PREFIX, _cfg
-        if len(args) < 2:
-            return await message.edit(content=ui_info("Please provide a new prefix."))
-        PREFIX = args[1]
-        _cfg = load_config()
-        _cfg["prefix"] = PREFIX
-        await message.edit(content=ui_ok(f"Prefix successfully changed to: {PREFIX}"))
-
-    elif cmd == "reload":
-        _cfg = load_config()
-        await message.edit(content=ui_ok("config reloaded"))
+    #
     # ─────────────────────────────────
     # GENERAL
     # ─────────────────────────────────
