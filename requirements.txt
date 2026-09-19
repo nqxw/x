@@ -1,4 +1,4 @@
 discord.py-self[voice]
+cryptography
 aiohttp
 PyNaCl
-yt-dlp
