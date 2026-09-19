@@ -1381,7 +1381,9 @@ async def on_message(message):
     # ─────────────────────────────────
 
     elif cmd == "prefix":
-        global PREFIX
+            global PREFIX, _cfg
+    
+    if cmd == "prefix":
         if len(args) < 2:
             return await message.edit(content=ui_info(f"current prefix: {PREFIX}"))
         PREFIX = args[1]
@@ -1392,9 +1394,9 @@ async def on_message(message):
         await message.edit(content=ui_info(f"sy's selfbot v{VERSION}"))
 
     elif cmd == "reload":
-        global _cfg
         _cfg = load_config()
         await message.edit(content=ui_ok("config reloaded"))
+
 
     # ─────────────────────────────────
     # GENERAL
