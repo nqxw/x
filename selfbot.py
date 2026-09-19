@@ -57,7 +57,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
@@ -148,8 +148,13 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("info",              "account snapshot"),
         ("say <text>",        "replace command with text"),
         ("spam <n> <text>",   "blast n messages fast"),
+        ("spamstop",          "kill active spam loop"),
         ("purge [n]",         "delete your last n messages"),
         ("clear",             "delete command message"),
+        ("snipe [n]",         "snipe last deleted message"),
+        ("snipe clear",       "wipe snipe cache"),
+        ("editsnipe [n]",     "snipe last edited message"),
+        ("editsnipe clear",   "wipe edit-snipe cache"),
         ("copycat <id>",      "mirror next 10 msgs from user"),
         ("status <text>",     "set custom status"),
         ("status clear",      "clear status"),
@@ -168,9 +173,9 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("rpc state",                         "state line"),
         ("rpc url",                           "streaming url"),
         ("rpc start / end",                   "timestamps (unix/MM:SS/none)"),
-        ("rpc large_image <url>",             "large image (discord cdn url)"),
+        ("rpc large_image <url>",             "large image (discord cdn url or external)"),
         ("rpc large_text",                    "large image hover text"),
-        ("rpc small_image <url>",             "small image (discord cdn url)"),
+        ("rpc small_image <url>",             "small image (discord cdn url or external)"),
         ("rpc small_text",                    "small image hover text"),
         ("rpc button1/2_name/url",            "rpc buttons"),
         ("rpc party enable/disable/current/max", "party config"),
@@ -326,8 +331,6 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("clap <text>",             "👏 add 👏 claps"),
         ("animatetype <text>",      "type message character-by-character"),
         ("checkname <username>",    "check if username is available"),
-        ("autoreact <emoji>",       "auto-react to your own messages"),
-        ("autoreactstop",           "stop auto-reacting"),
         ("typing",                  "start continuous typing indicator"),
         ("typingstop",              "stop typing indicator"),
         ("afk [msg]",               "set AFK auto-reply"),
@@ -374,6 +377,10 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("nitrosniper on/off",       "auto-redeem nitro gift codes"),
         ("autoreact <emoji>",        "auto-react to your own messages"),
         ("autoreactstop",            "stop auto-react"),
+        ("multireact add <emoji>",   "add emoji to multi-react pool"),
+        ("multireact remove <emoji>","remove emoji from pool"),
+        ("multireact list",          "list pool"),
+        ("multireact on/off",        "toggle multi-react"),
         ("autoaddback on/off",       "auto-accept friend requests"),
         ("vsniper add <code> <gid>", "add vanity url to watch list"),
         ("vsniper start/stop/list",  "vanity sniper control"),
@@ -478,9 +485,25 @@ _afk_msg:       str | None = None
 _afk_enabled   = False
 _typing_tasks:  dict[int, asyncio.Task] = {}
 _autoreact_emoji: str | None = None
+
+# multi-autoreact pool — fires every emoji in the pool on your own messages
+_multireact_pool: list[str] = []
+_multireact_enabled = False
+
+# spam task handles — channel_id → task
+_spam_tasks: dict[int, asyncio.Task] = {}
+
+# snipe caches
+_snipe_cache:      dict[int, list[dict]] = {}
+_editsnipe_cache:  dict[int, list[dict]] = {}
+SNIPE_LIMIT = 20
+
+# rpc external-asset cache — "app_id:url" → "mp:external/..."
+_rpc_asset_cache: dict[str, str] = {}
+
 _autoaddback   = False
 _giveaway_enabled = False
-_nitrosniper_enabled = True     # ← MOVED UP (was at the bottom, referenced by on_message)
+_nitrosniper_enabled = True
 _autorpc_enabled = False
 _autorpc_task:  asyncio.Task | None = None
 _captcha_key:   str = ""
@@ -583,6 +606,53 @@ def save_rpc_cfg(cfg):
     with open("config/rpc_config.json", "w") as f:
         json.dump(cfg, f, indent=4)
 
+# ── RPC external-asset registration (rpc.txt flow) ─────────────
+async def register_external_image(url: str, application_id: str, token: str) -> str | None:
+    """
+    Register an external image URL with Discord and return the asset key.
+    Returns the 'mp:external/...' string, or None if it failed.
+    """
+    endpoint = f"https://discord.com/api/v9/applications/{application_id}/external-assets"
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    body = {"urls": [url]}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint, json=body, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if data and isinstance(data, list):
+                    return data[0].get("external_asset_path")
+    except Exception as e:
+        print(f"[RPC asset] {e}")
+    return None
+
+async def resolve_rpc_image(url: str, application_id: str, token: str) -> str | None:
+    """
+    If url is already a valid asset key (no scheme), pass it through.
+    If it's an http(s) URL, register it with Discord and return the mp:external key.
+    Local cache keyed by app_id:url so repeat sets don't re-hit the API.
+    """
+    if not url:
+        return None
+    if not (url.startswith("http://") or url.startswith("https://")):
+        # already an asset key
+        return url
+    if not application_id:
+        # no app id — can't register, return as-is (will likely fail silently on discord side)
+        return url
+    cache_key = f"{application_id}:{url}"
+    if cache_key in _rpc_asset_cache:
+        return _rpc_asset_cache[cache_key]
+    key = await register_external_image(url, str(application_id), token)
+    if key:
+        _rpc_asset_cache[cache_key] = key
+    return key
+
 async def update_rpc():
     try:
         cfg = load_rpc_cfg()
@@ -597,19 +667,31 @@ async def update_rpc():
                 "competing": ActivityType.competing}
         act_type = tmap.get(t, ActivityType.playing)
         kw: dict = {"name": cfg.get("name") or "selfbot", "type": act_type}
-        if cfg.get("application_id"):
-            try: kw["application_id"] = int(cfg["application_id"])
+
+        app_id = cfg.get("application_id")
+        if app_id:
+            try: kw["application_id"] = int(app_id)
             except Exception: pass
         if act_type == ActivityType.streaming and cfg.get("url"):
             kw["url"] = cfg["url"]
         if cfg.get("state"):   kw["state"]   = cfg["state"]
         if cfg.get("details"): kw["details"] = cfg["details"]
+
+        # Resolve image URLs → external-asset keys when needed
         ak = {}
-        for k in ("large_image", "large_text", "small_image", "small_text"):
-            if cfg.get(k): ak[k] = cfg[k]
+        for slot in ("large_image", "small_image"):
+            raw = cfg.get(slot)
+            if raw:
+                resolved = await resolve_rpc_image(raw, str(app_id) if app_id else "", TOKEN)
+                if resolved:
+                    ak[slot] = resolved
+        for slot in ("large_text", "small_text"):
+            if cfg.get(slot):
+                ak[slot] = cfg[slot]
         if ak:
             try: kw["assets"] = ActivityAssets(**ak)
             except Exception: pass
+
         if cfg.get("start_timestamp"):
             try:
                 ts_kw = {"start": datetime.fromtimestamp(float(cfg["start_timestamp"]), tz=timezone.utc)}
@@ -1026,6 +1108,22 @@ async def snipe_nitro(code, channel_id):
         log_msg("SNIPER", f"error: {e}")
 
 # ─────────────────────────────────────────────
+# SPAM WORKER (cancellable)
+# ─────────────────────────────────────────────
+
+async def _spam_worker(channel, count: int, text: str):
+    """Send `count` copies of `text` to `channel`, cancellable mid-flight."""
+    try:
+        for _ in range(count):
+            await channel.send(text)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[spam] {e}")
+    finally:
+        _spam_tasks.pop(channel.id, None)
+
+# ─────────────────────────────────────────────
 # LAST.FM
 # ─────────────────────────────────────────────
 
@@ -1252,13 +1350,14 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # ── HOISTED GLOBALS (this is the fix for the SyntaxError) ──
+    # ── HOISTED GLOBALS ──
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
     global _autoreact_emoji, _autoaddback, _current_platform
     global _autoclaim_enabled, _captcha_key, _speak_lang
     global _giveaway_enabled, _nitrosniper_enabled
     global _autorpc_enabled, _autorpc_task, _vsniper_task
+    global _multireact_enabled, _multireact_pool
 
     # ── LOGGER ──
     if LOGGER_ENABLED and message.guild:
@@ -1323,10 +1422,17 @@ async def on_message(message):
                 await message.edit(content=translated)
         except Exception: pass
 
-    # ── AUTO-REACT TO OWN MESSAGES ──
-    if message.author.id == client.user.id and _autoreact_emoji and not message.content.startswith(PREFIX):
-        try: await message.add_reaction(_autoreact_emoji)
-        except Exception: pass
+    # ── AUTOREACT (single + multi) ──
+    if message.author.id == client.user.id and not message.content.startswith(PREFIX):
+        if _autoreact_emoji:
+            try: await message.add_reaction(_autoreact_emoji)
+            except Exception: pass
+        if _multireact_enabled and _multireact_pool:
+            for emoji in _multireact_pool:
+                try:
+                    await message.add_reaction(emoji)
+                except Exception: pass
+                await asyncio.sleep(0.15)
 
     if message.author.id != client.user.id:
         return
@@ -1342,28 +1448,17 @@ async def on_message(message):
     # ─────────────────────────────────
 
     if cmd in ("help", "h"):
-        # $help                → root, page 1
-        # $help 2              → root, page 2          (bare number = flip root)
-        # $help rpc            → rpc section, page 1
-        # $help rpc 2          → rpc section, page 2
         try: await message.delete()
         except Exception: pass
-
         sub = args[1].lower() if len(args) > 1 else ""
-
-        # bare number → flip root page
         if sub.isdigit():
             page = int(sub)
             await message.channel.send(build_help_root(page))
             return
-
-        # category (+ optional page)
         if sub:
             page = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
             await message.channel.send(build_help_section(sub, page))
             return
-
-        # no arg → root page 1
         await message.channel.send(build_help_root(1))
 
     # ─────────────────────────────────
@@ -1405,18 +1500,47 @@ async def on_message(message):
     elif cmd == "say":
         await message.edit(content=" ".join(args[1:]))
 
+    # ── SPAM + SPAMSTOP ──
     elif cmd == "spam":
         if len(args) < 3:
             return await message.edit(content=ui_err("usage: spam <n> <text>"))
         try: count = int(args[1])
         except ValueError:
             return await message.edit(content=ui_err("n must be a number"))
-        count = min(count, 50)
+        count = min(count, 200)
         text = " ".join(args[2:])
+        cid = message.channel.id
+        # kill an existing spam in this channel first
+        existing = _spam_tasks.get(cid)
+        if existing and not existing.done():
+            existing.cancel()
+            try: await existing
+            except Exception: pass
         try: await message.delete()
         except Exception: pass
-        tasks = [message.channel.send(text) for _ in range(count)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        _spam_tasks[cid] = asyncio.create_task(_spam_worker(message.channel, count, text))
+
+    elif cmd == "spamstop":
+        cid = message.channel.id
+        task = _spam_tasks.get(cid)
+        if not task or task.done():
+            # also try killing every running spam task, not just this channel
+            killed = 0
+            for ch_id, t in list(_spam_tasks.items()):
+                if t and not t.done():
+                    t.cancel()
+                    killed += 1
+            _spam_tasks.clear()
+            if killed:
+                await message.edit(content=ui_ok(f"spam stopped in {killed} channel(s)"))
+            else:
+                await message.edit(content=ui_info("no active spam to stop"))
+            return
+        task.cancel()
+        try: await task
+        except Exception: pass
+        _spam_tasks.pop(cid, None)
+        await message.edit(content=ui_ok("spam stopped"))
 
     elif cmd == "purge":
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
@@ -1443,6 +1567,65 @@ async def on_message(message):
     elif cmd == "clear":
         try: await message.delete()
         except Exception: pass
+
+    # ── SNIPE (deleted) ──
+    elif cmd == "snipe":
+        try: await message.delete()
+        except Exception: pass
+        sub = args[1].lower() if len(args) > 1 else ""
+        cid = message.channel.id
+        if sub == "clear":
+            _snipe_cache.pop(cid, None)
+            return await message.channel.send(ui_ok("snipe cache cleared"), delete_after=4)
+        entries = _snipe_cache.get(cid, [])
+        if not entries:
+            return await message.channel.send(ui_info("nothing to snipe in this channel"), delete_after=5)
+        try:
+            idx = int(sub) if sub else 1
+        except ValueError:
+            idx = 1
+        if idx < 1 or idx > len(entries):
+            return await message.channel.send(ui_err(f"index out of range (1–{len(entries)})"), delete_after=5)
+        e = entries[-idx]
+        atts = "\n".join(e.get("attachments", [])) or "none"
+        rows = [
+            f"  {DIM}author{RESET}     {WHITE}{e['author']}{RESET}  {DIM}({e['author_id']}){RESET}",
+            f"  {DIM}deleted{RESET}    {e['time']}",
+            f"  {DIM}attachments{RESET} {atts}",
+            f"  {GREEN}{'─'*40}{RESET}",
+            f"  {WHITE}{e['content'] or '(no content)'}{RESET}",
+        ]
+        await message.channel.send(ui_box(f"sniped message #{idx}/{len(entries)}", rows))
+
+    # ── EDIT SNIPE ──
+    elif cmd in ("editsnipe", "esnipe"):
+        try: await message.delete()
+        except Exception: pass
+        sub = args[1].lower() if len(args) > 1 else ""
+        cid = message.channel.id
+        if sub == "clear":
+            _editsnipe_cache.pop(cid, None)
+            return await message.channel.send(ui_ok("editsnipe cache cleared"), delete_after=4)
+        entries = _editsnipe_cache.get(cid, [])
+        if not entries:
+            return await message.channel.send(ui_info("no edits to snipe in this channel"), delete_after=5)
+        try:
+            idx = int(sub) if sub else 1
+        except ValueError:
+            idx = 1
+        if idx < 1 or idx > len(entries):
+            return await message.channel.send(ui_err(f"index out of range (1–{len(entries)})"), delete_after=5)
+        e = entries[-idx]
+        rows = [
+            f"  {DIM}author{RESET}     {WHITE}{e['author']}{RESET}  {DIM}({e['author_id']}){RESET}",
+            f"  {DIM}edited{RESET}     {e['time']}",
+            f"  {GREEN}{'─'*40}{RESET}",
+            f"  {DIM}before:{RESET}",
+            f"  {WHITE}{e['before'] or '(empty)'}{RESET}",
+            f"  {DIM}after:{RESET}",
+            f"  {WHITE}{e['after'] or '(empty)'}{RESET}",
+        ]
+        await message.channel.send(ui_box(f"sniped edit #{idx}/{len(entries)}", rows))
 
     elif cmd == "copycat":
         if len(args) < 2:
@@ -2608,16 +2791,6 @@ async def on_message(message):
             except Exception: pass
             await asyncio.sleep(0.1)
 
-    elif cmd == "autoreact":
-        if len(args) < 2:
-            return await message.edit(content=ui_err("usage: autoreact <emoji>"))
-        _autoreact_emoji = args[1]
-        await message.edit(content=ui_ok(f"auto-reacting with {_autoreact_emoji}"))
-
-    elif cmd == "autoreactstop":
-        _autoreact_emoji = None
-        await message.edit(content=ui_ok("auto-react stopped"))
-
     elif cmd == "typing":
         cid = message.channel.id
         if cid in _typing_tasks and not _typing_tasks[cid].done():
@@ -2976,6 +3149,58 @@ async def on_message(message):
         _nitrosniper_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
         await message.edit(content=ui_ok(f"nitro sniper → {'on' if _nitrosniper_enabled else 'off'}"))
 
+    # ── AUTOREACT (single) ──
+    elif cmd == "autoreact":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: autoreact <emoji>"))
+        _autoreact_emoji = args[1]
+        await message.edit(content=ui_ok(f"auto-reacting with {_autoreact_emoji}"))
+
+    elif cmd == "autoreactstop":
+        _autoreact_emoji = None
+        await message.edit(content=ui_ok("auto-react stopped"))
+
+    # ── MULTI-AUTOREACT ──
+    elif cmd in ("multireact", "multiautoreact"):
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "add":
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: multireact add <emoji>"))
+            emoji = args[2]
+            if emoji in _multireact_pool:
+                return await message.edit(content=ui_info(f"{emoji} already in pool"))
+            _multireact_pool.append(emoji)
+            await message.edit(content=ui_ok(f"added {emoji} to pool ({len(_multireact_pool)} total)"))
+        elif sub in ("remove","rem","del"):
+            if len(args) < 3:
+                return await message.edit(content=ui_err("usage: multireact remove <emoji>"))
+            emoji = args[2]
+            if emoji not in _multireact_pool:
+                return await message.edit(content=ui_err(f"{emoji} not in pool"))
+            _multireact_pool.remove(emoji)
+            await message.edit(content=ui_ok(f"removed {emoji} ({len(_multireact_pool)} left)"))
+        elif sub == "list":
+            if not _multireact_pool:
+                return await message.edit(content=ui_info("pool is empty"))
+            rows = [f"  {GREY}{i:2}.{RESET}  {e}" for i, e in enumerate(_multireact_pool, 1)]
+            state = "ON" if _multireact_enabled else "OFF"
+            await message.edit(content=ui_box(f"multi-react pool — {state}", rows))
+        elif sub in ("on","enable"):
+            if not _multireact_pool:
+                return await message.edit(content=ui_err("pool is empty — add emojis first"))
+            _multireact_enabled = True
+            await message.edit(content=ui_ok(f"multi-react enabled ({len(_multireact_pool)} emojis)"))
+        elif sub in ("off","disable"):
+            _multireact_enabled = False
+            await message.edit(content=ui_ok("multi-react disabled"))
+        elif sub == "clear":
+            _multireact_pool.clear()
+            _multireact_enabled = False
+            await message.edit(content=ui_ok("multi-react pool cleared"))
+        else:
+            await message.edit(content=ui_info(
+                "usage: multireact add/remove/list/on/off/clear"))
+
     elif cmd == "vsniper":
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "add":
@@ -3227,15 +3452,45 @@ async def on_message(message):
 
 @client.event
 async def on_message_delete(message):
-    if not LOGGER_ENABLED or message.author.id == client.user.id:
+    if message.author.id == client.user.id:
+        return
+    # snipe cache
+    cid = message.channel.id
+    _snipe_cache.setdefault(cid, [])
+    _snipe_cache[cid].append({
+        "author":    str(message.author),
+        "author_id": message.author.id,
+        "content":   message.content or "",
+        "attachments": [a.url for a in message.attachments] if message.attachments else [],
+        "time":      datetime.now().strftime("%H:%M:%S"),
+    })
+    if len(_snipe_cache[cid]) > SNIPE_LIMIT:
+        _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
+    # logger
+    if not LOGGER_ENABLED:
         return
     log_msg("DEL", f"{message.author} in #{getattr(message.channel,'name','DM')}: {message.content[:100]}")
 
 @client.event
 async def on_message_edit(before, after):
-    if not LOGGER_ENABLED or before.author.id == client.user.id:
+    if before.author.id == client.user.id:
         return
     if before.content == after.content:
+        return
+    # editsnipe cache
+    cid = before.channel.id
+    _editsnipe_cache.setdefault(cid, [])
+    _editsnipe_cache[cid].append({
+        "author":    str(before.author),
+        "author_id": before.author.id,
+        "before":    before.content or "",
+        "after":     after.content or "",
+        "time":      datetime.now().strftime("%H:%M:%S"),
+    })
+    if len(_editsnipe_cache[cid]) > SNIPE_LIMIT:
+        _editsnipe_cache[cid] = _editsnipe_cache[cid][-SNIPE_LIMIT:]
+    # logger
+    if not LOGGER_ENABLED:
         return
     log_msg("EDIT", f"{before.author}: '{before.content[:60]}' → '{after.content[:60]}'")
 

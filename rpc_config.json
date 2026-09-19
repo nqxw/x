@@ -1,0 +1,24 @@
+{
+    "enabled": false,
+    "type": "playing",
+    "name": "selfbot",
+    "state": "running",
+    "details": "",
+    "url": "https://twitch.tv/voltrix",
+    "application_id": 1550836202091843684,
+    "large_image": "",
+    "large_text": "",
+    "small_image": "",
+    "small_text": "",
+    "start_timestamp": null,
+    "end_timestamp": null,
+    "party": {
+        "enabled": false,
+        "current": 1,
+        "max": 5
+    },
+    "buttons": [
+        {"label": "", "url": ""},
+        {"label": "", "url": ""}
+    ]
+}
