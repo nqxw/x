@@ -26,7 +26,6 @@ from uuid import uuid4
 os.makedirs("config", exist_ok=True)
 os.makedirs("database", exist_ok=True)
 
-# default app id — used for RPC external-asset registration
 DEFAULT_APP_ID = "1550836202091843684"
 
 def load_config():
@@ -60,11 +59,11 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
-# UI HELPER — ansi block formatting
+# UI HELPER — ansi block formatting (no bars)
 # ─────────────────────────────────────────────
 
 ESC = "\x1b"
@@ -95,14 +94,12 @@ def _ansi_block(lines: list[str]) -> str:
     return "\n".join(cleaned)
 
 def ui_box(title: str, rows: list[str], footer: str = "") -> str:
-    bar = f"{GREY}{'─' * 40}{RESET}"
-    lines = [bar, f"{WHITE}{title}{RESET}", bar]
+    lines = [f"  {WHITE}{title}{RESET}"]
     for row in rows:
         lines.append(row)
     if footer:
-        lines.append(bar)
-        lines.append(f"{GREY}{footer}{RESET}")
-    lines.append(bar)
+        lines.append("")
+        lines.append(f"  {DIM}{footer}{RESET}")
     return _ansi_block(lines)
 
 def ui_row(cmd: str, desc: str) -> str:
@@ -139,10 +136,10 @@ def _paginate(title: str, subtitle: str, rows: list[str], page: int = 1) -> str:
     page = max(1, min(page, total_pages))
     start = (page - 1) * PAGE_SIZE
     chunk = rows[start:start + PAGE_SIZE]
-    bar = f"{GREY}{'─' * 40}{RESET}"
-    header = f"{WHITE}> {title}{RESET}  {DIM}{subtitle}{RESET}"
-    footer = f"{DIM}page {page}/{total_pages}  •  {PREFIX}help {title.lower()} {page + 1 if page < total_pages else 1} to flip{RESET}"
-    lines = [bar, header, bar, *chunk, bar, footer, bar]
+    lines = [f"  {WHITE}> {title}{RESET}  {DIM}{subtitle}{RESET}", ""]
+    lines.extend(chunk)
+    lines.append("")
+    lines.append(f"  {DIM}page {page}/{total_pages}  •  {PREFIX}h {title.lower()} {page + 1 if page < total_pages else 1} to flip{RESET}")
     return _ansi_block(lines)
 
 HELP_DATA: dict[str, list[tuple]] = {
@@ -411,13 +408,11 @@ def build_help_root(page: int = 1) -> str:
     total_pages = max(1, math.ceil(len(categories) / 10))
     page = max(1, min(page, total_pages))
     chunk = categories[(page - 1) * 10 : page * 10]
-    bar = f"{GREY}{'─' * 40}{RESET}"
     lines = [
-        bar,
-        f"{WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}",
-        bar,
+        f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}",
+        "",
         f"  {GREY}categories{RESET}",
-        bar,
+        "",
     ]
     for cat in chunk:
         desc_map = {
@@ -446,11 +441,9 @@ def build_help_root(page: int = 1) -> str:
         }
         desc = desc_map.get(cat, "commands")
         lines.append(f"  {CYAN}{cat:<14}{RESET}  {DIM}{desc}{RESET}")
-    lines.append(bar)
+    lines.append("")
     lines.append(f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}")
-    lines.append(f"  {DIM}page {page}/{total_pages}{RESET}")
-    lines.append(f"  {DIM}sy | ver {VERSION}{RESET}")
-    lines.append(bar)
+    lines.append(f"  {DIM}page {page}/{total_pages}  •  sy | ver {VERSION}{RESET}")
     return _ansi_block(lines)
 
 def build_help_section(cat: str, page: int = 1) -> str:
@@ -460,17 +453,11 @@ def build_help_section(cat: str, page: int = 1) -> str:
     total_pages = max(1, math.ceil(len(rows_raw) / PAGE_SIZE))
     page = max(1, min(page, total_pages))
     chunk = rows_raw[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
-    bar = f"{GREY}{'─' * 40}{RESET}"
-    lines = [
-        bar,
-        f"{WHITE}> {cat}{RESET}  {DIM}{HELP_DATA[cat][0][1] if HELP_DATA[cat] else ''}{RESET}",
-        bar,
-    ]
+    lines = [f"  {WHITE}> {cat}{RESET}", ""]
     for cmd, desc in chunk:
         lines.append(f"  {GREY}├{RESET} {WHITE}{PREFIX}{cmd}{RESET}  {DIM}{desc}{RESET}")
-    lines.append(bar)
+    lines.append("")
     lines.append(f"  {DIM}page {page}/{total_pages}  •  {PREFIX}h {cat} {(page % total_pages) + 1}{RESET}")
-    lines.append(bar)
     return _ansi_block(lines)
 
 # ─────────────────────────────────────────────
@@ -596,7 +583,6 @@ def load_rpc_cfg():
     try:
         with open(path) as f:
             d = json.load(f)
-        # migrate old configs: inject default app id if missing
         if not d.get("application_id"):
             d["application_id"] = DEFAULT_APP_ID
         for k, v in default.items():
@@ -612,10 +598,6 @@ def save_rpc_cfg(cfg):
 
 # ── RPC external-asset registration (rpc.txt flow) ─────────────
 async def register_external_image(url: str, application_id: str, token: str) -> str | None:
-    """
-    Register an external image URL with Discord and return the asset key.
-    Returns the 'mp:external/...' string, or None if it failed.
-    """
     endpoint = f"https://discord.com/api/v9/applications/{application_id}/external-assets"
     headers = {
         "Authorization": token,
@@ -638,11 +620,6 @@ async def register_external_image(url: str, application_id: str, token: str) -> 
     return None
 
 async def resolve_rpc_image(url: str, application_id: str, token: str) -> str | None:
-    """
-    If url is already a valid asset key (no scheme), pass it through.
-    If it's an http(s) URL, register it with Discord and return the mp:external key.
-    Local cache keyed by app_id:url so repeat sets don't re-hit the API.
-    """
     if not url:
         return None
     if not (url.startswith("http://") or url.startswith("https://")):
@@ -656,7 +633,6 @@ async def resolve_rpc_image(url: str, application_id: str, token: str) -> str | 
     if key:
         _rpc_asset_cache[cache_key] = key
         return key
-    # registration failed — return None so caller can decide
     return None
 
 async def update_rpc():
@@ -683,7 +659,6 @@ async def update_rpc():
         if cfg.get("state"):   kw["state"]   = cfg["state"]
         if cfg.get("details"): kw["details"] = cfg["details"]
 
-        # Resolve image URLs → external-asset keys when needed
         ak = {}
         for slot in ("large_image", "small_image"):
             raw = cfg.get(slot)
@@ -692,7 +667,6 @@ async def update_rpc():
                 if resolved:
                     ak[slot] = resolved
                 else:
-                    # registration failed — fall through with raw, Discord will drop it
                     ak[slot] = raw
         for slot in ("large_text", "small_text"):
             if cfg.get(slot):
@@ -737,10 +711,6 @@ async def rpc_prompt(channel, author, label: str) -> str | None:
 # ─────────────────────────────────────────────
 # BRAND RPC
 # ─────────────────────────────────────────────
-# Icons are Discord CDN app-icon URLs belonging to Discord's OWN
-# integrations (Spotify, YouTube, etc). They get registered against
-# YOUR application_id at runtime and swapped for mp:external keys,
-# because Discord refuses to render arbitrary URLs inline.
 
 BRAND_ICONS = {
     "spotify":     "https://cdn.discordapp.com/app-icons/367827983903490050/c1aac7c70a2df8bf5b50b88e2de36ff2.webp?size=256",
@@ -751,9 +721,6 @@ BRAND_ICONS = {
     "playstation": "https://cdn.discordapp.com/app-icons/473226677884194826/2dd91e54b57ad2cb4949dc4b24feae0d.webp?size=256",
 }
 
-# NOTE: the "app ids" below are what we pass to Discord as the activity's
-# application_id. They are set to YOUR app so that mp:external keys we
-# register actually belong to the presence we're pushing.
 BRAND_APP_IDS = {b: DEFAULT_APP_ID for b in BRAND_ICONS}
 
 async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
@@ -780,19 +747,13 @@ async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
         while len(p) < n: p.append("")
         return p
 
-    # resolve icon URL against OUR app id
     app_id = DEFAULT_APP_ID
     raw_icon = BRAND_ICONS.get(brand, "")
     icon_key = None
     if raw_icon:
         icon_key = await resolve_rpc_image(raw_icon, app_id, TOKEN)
-    if not icon_key:
-        # registration failed; no image will render, but presence still sets
-        icon_key = None
 
-    kw: dict = {
-        "application_id": int(app_id),
-    }
+    kw: dict = {"application_id": int(app_id)}
     ak = {}
     if icon_key:
         ak["large_image"] = icon_key
@@ -1591,13 +1552,13 @@ async def on_message(message):
         e = entries[-idx]
         atts = "\n".join(e.get("attachments", [])) or "none"
         rows = [
-            f"  {DIM}author{RESET}     {WHITE}{e['author']}{RESET}  {DIM}({e['author_id']}){RESET}",
-            f"  {DIM}deleted{RESET}    {e['time']}",
+            f"  {DIM}author{RESET}      {WHITE}{e['author']}{RESET}  {DIM}({e['author_id']}){RESET}",
+            f"  {DIM}deleted{RESET}     {e['time']}",
             f"  {DIM}attachments{RESET} {atts}",
-            f"  {GREEN}{'─'*40}{RESET}",
+            "",
             f"  {WHITE}{e['content'] or '(no content)'}{RESET}",
         ]
-        await message.channel.send(ui_box(f"sniped message #{idx}/{len(entries)}", rows))
+        await message.channel.send(ui_box(f"sniped message  #{idx}/{len(entries)}", rows))
 
     elif cmd in ("editsnipe", "esnipe"):
         try: await message.delete()
@@ -1618,15 +1579,16 @@ async def on_message(message):
             return await message.channel.send(ui_err(f"index out of range (1–{len(entries)})"), delete_after=5)
         e = entries[-idx]
         rows = [
-            f"  {DIM}author{RESET}     {WHITE}{e['author']}{RESET}  {DIM}({e['author_id']}){RESET}",
-            f"  {DIM}edited{RESET}     {e['time']}",
-            f"  {GREEN}{'─'*40}{RESET}",
+            f"  {DIM}author{RESET}  {WHITE}{e['author']}{RESET}  {DIM}({e['author_id']}){RESET}",
+            f"  {DIM}edited{RESET}  {e['time']}",
+            "",
             f"  {DIM}before:{RESET}",
             f"  {WHITE}{e['before'] or '(empty)'}{RESET}",
+            "",
             f"  {DIM}after:{RESET}",
             f"  {WHITE}{e['after'] or '(empty)'}{RESET}",
         ]
-        await message.channel.send(ui_box(f"sniped edit #{idx}/{len(entries)}", rows))
+        await message.channel.send(ui_box(f"sniped edit  #{idx}/{len(entries)}", rows))
 
     elif cmd == "copycat":
         if len(args) < 2:
@@ -2124,8 +2086,8 @@ async def on_message(message):
             epoch = int.from_bytes(ts_bytes[:4], "big")
             created = datetime.utcfromtimestamp(epoch + 1293840000).strftime("%Y-%m-%d %H:%M:%S")
             await message.edit(content=ui_box("token info", [
-                f"  {DIM}user_id{RESET}    {uid}",
-                f"  {DIM}created{RESET}    {created} UTC",
+                f"  {DIM}user_id{RESET}  {uid}",
+                f"  {DIM}created{RESET}  {created} UTC",
             ]))
         except Exception as e:
             await message.edit(content=ui_err(f"decode failed: {e}"))
@@ -2175,9 +2137,9 @@ async def on_message(message):
             after_tax = int(amount * 0.7)
             fee = amount - after_tax
             await message.edit(content=ui_box("roblox marketplace fee", [
-                f"  {DIM}listed price{RESET}   {amount:,} R$",
+                f"  {DIM}listed price{RESET}    {amount:,} R$",
                 f"  {DIM}marketplace fee{RESET} {fee:,} R$ (30%)",
-                f"  {DIM}you receive{RESET}    {after_tax:,} R$",
+                f"  {DIM}you receive{RESET}     {after_tax:,} R$",
             ]))
         except ValueError:
             await message.edit(content=ui_err("invalid amount"))
@@ -2186,6 +2148,8 @@ async def on_message(message):
         try: await message.delete()
         except Exception: pass
         ch = client.get_channel(int(args[1])) if len(args) > 1 and args[1].isdigit() else message.channel
+        if not ch:
+            return await message.channel.send(ui_err("channel not found"), delete_after=5)
         count = 0
         out = []
         async for msg in ch.history(limit=2000):
@@ -2289,7 +2253,7 @@ async def on_message(message):
             status = "▶ now playing" if t["playing"] else "⏸ last played"
             rows = [
                 f"  {DIM}{status}{RESET}",
-                f"  {GREEN}{'─'*30}{RESET}",
+                "",
                 f"  {WHITE}{loved}{t['title']}{RESET}",
                 f"  {DIM}by{RESET} {t['artist']}",
             ]
@@ -2363,11 +2327,12 @@ async def on_message(message):
                 return await message.channel.send(ui_err("user not found"), delete_after=6)
             rows = [
                 f"  {WHITE}{u}{RESET}",
-                f"  {DIM}scrobbles{RESET}   {ud.get('playcount','?')}",
-                f"  {DIM}artists{RESET}     {ud.get('artist_count','?')}",
-                f"  {DIM}albums{RESET}      {ud.get('album_count','?')}",
-                f"  {DIM}tracks{RESET}      {ud.get('track_count','?')}",
-                f"  {DIM}country{RESET}     {ud.get('country','?')}",
+                "",
+                f"  {DIM}scrobbles{RESET}  {ud.get('playcount','?')}",
+                f"  {DIM}artists{RESET}    {ud.get('artist_count','?')}",
+                f"  {DIM}albums{RESET}     {ud.get('album_count','?')}",
+                f"  {DIM}tracks{RESET}     {ud.get('track_count','?')}",
+                f"  {DIM}country{RESET}    {ud.get('country','?')}",
             ]
             await message.channel.send(_ansi_block(rows))
 
@@ -2390,6 +2355,7 @@ async def on_message(message):
                 f"  {bar}  {DIM}{score:.1f}% compatible{RESET}",
             ]
             if artists:
+                rows.append("")
                 rows.append(f"  {DIM}shared:{RESET}")
                 for a in artists[:5]:
                     rows.append(f"    {GREY}•{RESET} {a.get('name','?') if isinstance(a,dict) else a}")
@@ -2616,17 +2582,52 @@ async def on_message(message):
             u = p.get("user", {})
             badges = [b.get("id","") for b in p.get("badges", [])]
             rows = [
-                f"  {DIM}username{RESET}   {u.get('username','?')}",
-                f"  {DIM}id{RESET}         {uid}",
-                f"  {DIM}bio{RESET}        {u.get('bio','') or '-'}",
-                f"  {DIM}badges{RESET}     {', '.join(badges) or 'none'}",
-                f"  {DIM}nitro{RESET}      {'yes' if p.get('premium_since') else 'no'}",
+                f"  {DIM}username{RESET}       {u.get('username','?')}",
+                f"  {DIM}id{RESET}             {uid}",
+                f"  {DIM}bio{RESET}            {u.get('bio','') or '-'}",
+                f"  {DIM}badges{RESET}         {', '.join(badges) or 'none'}",
+                f"  {DIM}nitro{RESET}          {'yes' if p.get('premium_since') else 'no'}",
                 f"  {DIM}mutual servers{RESET} {len(p.get('mutual_guilds', []))}",
                 f"  {DIM}mutual friends{RESET} {len(p.get('mutual_friends', []))}",
             ]
             await message.edit(content=ui_box("whois", rows))
         except Exception as e:
             await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "channelinfo":
+        cid = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.channel.id
+        ch = client.get_channel(cid)
+        if not ch:
+            return await message.edit(content=ui_err("channel not found"))
+        rows = [
+            f"  {DIM}name{RESET}    #{getattr(ch, 'name', cid)}",
+            f"  {DIM}id{RESET}      {ch.id}",
+            f"  {DIM}type{RESET}    {str(ch.type)}",
+        ]
+        try:
+            rows.append(f"  {DIM}created{RESET} {ch.created_at.strftime('%Y-%m-%d')}")
+        except Exception: pass
+        if getattr(ch, "guild", None):
+            rows.append(f"  {DIM}guild{RESET}   {ch.guild.name}")
+        else:
+            rows.append(f"  {DIM}guild{RESET}   DM")
+        await message.edit(content=ui_box("channel info", rows))
+
+    elif cmd == "roleinfo":
+        if not message.guild or len(args) < 2:
+            return await message.edit(content=ui_err("usage: roleinfo <role_id>"))
+        role = message.guild.get_role(int(args[1]))
+        if not role:
+            return await message.edit(content=ui_err("role not found"))
+        await message.edit(content=ui_box("role info", [
+            f"  {DIM}name{RESET}        {role.name}",
+            f"  {DIM}id{RESET}          {role.id}",
+            f"  {DIM}color{RESET}       #{role.color.value:06x}",
+            f"  {DIM}members{RESET}     {len(role.members)}",
+            f"  {DIM}position{RESET}    {role.position}",
+            f"  {DIM}mentionable{RESET} {'yes' if role.mentionable else 'no'}",
+            f"  {DIM}hoisted{RESET}     {'yes' if role.hoist else 'no'}",
+        ]))
 
     # ─────────────────────────────────
     # GROUP CHAT
@@ -3195,7 +3196,7 @@ async def on_message(message):
                 return await message.edit(content=ui_info("pool is empty"))
             rows = [f"  {GREY}{i:2}.{RESET}  {e}" for i, e in enumerate(_multireact_pool, 1)]
             state = "ON" if _multireact_enabled else "OFF"
-            await message.edit(content=ui_box(f"multi-react pool — {state}", rows))
+            await message.edit(content=ui_box(f"multi-react pool  —  {state}", rows))
         elif sub in ("on","enable"):
             if not _multireact_pool:
                 return await message.edit(content=ui_err("pool is empty — add emojis first"))
@@ -3343,6 +3344,7 @@ async def on_message(message):
                 f"  {PREFIX}setstatus <text>",
                 f"  {PREFIX}setstatus <emoji>, <text>",
                 f"  {PREFIX}setstatus <:name:id>, <text>",
+                "",
                 f"  {DIM}examples:{RESET}",
                 f"  {PREFIX}setstatus Gaming now",
                 f"  {PREFIX}setstatus 🎮, Gaming now",
