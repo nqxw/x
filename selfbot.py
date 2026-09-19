@@ -26,6 +26,9 @@ from uuid import uuid4
 os.makedirs("config", exist_ok=True)
 os.makedirs("database", exist_ok=True)
 
+# default app id — used for RPC external-asset registration
+DEFAULT_APP_ID = "1550836202091843684"
+
 def load_config():
     if os.path.exists("config.json"):
         try:
@@ -57,7 +60,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
@@ -167,15 +170,16 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("rpc enable",                        "turn on rich presence"),
         ("rpc disable / stop / clear",        "clear rich presence"),
         ("rpc status",                        "show current rpc config"),
+        ("rpc application_id <id>",           "set the app id for asset registration"),
         ("rpc type",                          "playing/streaming/watching/listening/competing"),
         ("rpc name",                          "activity name"),
         ("rpc details",                       "details line"),
         ("rpc state",                         "state line"),
         ("rpc url",                           "streaming url"),
         ("rpc start / end",                   "timestamps (unix/MM:SS/none)"),
-        ("rpc large_image <url>",             "large image (discord cdn url or external)"),
+        ("rpc large_image <url or key>",      "large image (auto-registers url)"),
         ("rpc large_text",                    "large image hover text"),
-        ("rpc small_image <url>",             "small image (discord cdn url or external)"),
+        ("rpc small_image <url or key>",      "small image (auto-registers url)"),
         ("rpc small_text",                    "small image hover text"),
         ("rpc button1/2_name/url",            "rpc buttons"),
         ("rpc party enable/disable/current/max", "party config"),
@@ -486,19 +490,15 @@ _afk_enabled   = False
 _typing_tasks:  dict[int, asyncio.Task] = {}
 _autoreact_emoji: str | None = None
 
-# multi-autoreact pool — fires every emoji in the pool on your own messages
 _multireact_pool: list[str] = []
 _multireact_enabled = False
 
-# spam task handles — channel_id → task
 _spam_tasks: dict[int, asyncio.Task] = {}
 
-# snipe caches
 _snipe_cache:      dict[int, list[dict]] = {}
 _editsnipe_cache:  dict[int, list[dict]] = {}
 SNIPE_LIMIT = 20
 
-# rpc external-asset cache — "app_id:url" → "mp:external/..."
 _rpc_asset_cache: dict[str, str] = {}
 
 _autoaddback   = False
@@ -582,7 +582,8 @@ def load_rpc_cfg():
     path = "config/rpc_config.json"
     default = {
         "enabled": False, "type": "playing", "name": "selfbot",
-        "state": "", "details": "", "url": "", "application_id": None,
+        "state": "", "details": "", "url": "",
+        "application_id": DEFAULT_APP_ID,
         "large_image": "", "large_text": "", "small_image": "", "small_text": "",
         "start_timestamp": None, "end_timestamp": None,
         "party": {"enabled": False, "current": 1, "max": 5},
@@ -595,6 +596,9 @@ def load_rpc_cfg():
     try:
         with open(path) as f:
             d = json.load(f)
+        # migrate old configs: inject default app id if missing
+        if not d.get("application_id"):
+            d["application_id"] = DEFAULT_APP_ID
         for k, v in default.items():
             if k not in d:
                 d[k] = v
@@ -623,6 +627,8 @@ async def register_external_image(url: str, application_id: str, token: str) -> 
         async with aiohttp.ClientSession() as session:
             async with session.post(endpoint, json=body, headers=headers) as resp:
                 if resp.status != 200:
+                    txt = await resp.text()
+                    print(f"[RPC asset] register failed {resp.status}: {txt[:200]}")
                     return None
                 data = await resp.json()
                 if data and isinstance(data, list):
@@ -640,10 +646,8 @@ async def resolve_rpc_image(url: str, application_id: str, token: str) -> str | 
     if not url:
         return None
     if not (url.startswith("http://") or url.startswith("https://")):
-        # already an asset key
         return url
     if not application_id:
-        # no app id — can't register, return as-is (will likely fail silently on discord side)
         return url
     cache_key = f"{application_id}:{url}"
     if cache_key in _rpc_asset_cache:
@@ -651,7 +655,9 @@ async def resolve_rpc_image(url: str, application_id: str, token: str) -> str | 
     key = await register_external_image(url, str(application_id), token)
     if key:
         _rpc_asset_cache[cache_key] = key
-    return key
+        return key
+    # registration failed — return None so caller can decide
+    return None
 
 async def update_rpc():
     try:
@@ -668,10 +674,10 @@ async def update_rpc():
         act_type = tmap.get(t, ActivityType.playing)
         kw: dict = {"name": cfg.get("name") or "selfbot", "type": act_type}
 
-        app_id = cfg.get("application_id")
-        if app_id:
-            try: kw["application_id"] = int(app_id)
-            except Exception: pass
+        app_id = cfg.get("application_id") or DEFAULT_APP_ID
+        try: kw["application_id"] = int(app_id)
+        except Exception: pass
+
         if act_type == ActivityType.streaming and cfg.get("url"):
             kw["url"] = cfg["url"]
         if cfg.get("state"):   kw["state"]   = cfg["state"]
@@ -682,9 +688,12 @@ async def update_rpc():
         for slot in ("large_image", "small_image"):
             raw = cfg.get(slot)
             if raw:
-                resolved = await resolve_rpc_image(raw, str(app_id) if app_id else "", TOKEN)
+                resolved = await resolve_rpc_image(raw, str(app_id), TOKEN)
                 if resolved:
                     ak[slot] = resolved
+                else:
+                    # registration failed — fall through with raw, Discord will drop it
+                    ak[slot] = raw
         for slot in ("large_text", "small_text"):
             if cfg.get(slot):
                 ak[slot] = cfg[slot]
@@ -728,6 +737,10 @@ async def rpc_prompt(channel, author, label: str) -> str | None:
 # ─────────────────────────────────────────────
 # BRAND RPC
 # ─────────────────────────────────────────────
+# Icons are Discord CDN app-icon URLs belonging to Discord's OWN
+# integrations (Spotify, YouTube, etc). They get registered against
+# YOUR application_id at runtime and swapped for mp:external keys,
+# because Discord refuses to render arbitrary URLs inline.
 
 BRAND_ICONS = {
     "spotify":     "https://cdn.discordapp.com/app-icons/367827983903490050/c1aac7c70a2df8bf5b50b88e2de36ff2.webp?size=256",
@@ -738,13 +751,10 @@ BRAND_ICONS = {
     "playstation": "https://cdn.discordapp.com/app-icons/473226677884194826/2dd91e54b57ad2cb4949dc4b24feae0d.webp?size=256",
 }
 
-BRAND_APP_IDS = {
-    "spotify":     367827983903490050,
-    "youtube":     880218394199220334,
-    "xbox":        438122941302046720,
-    "roblox":      363445589247131668,
-    "crunchyroll": 1020123345567822899,
-}
+# NOTE: the "app ids" below are what we pass to Discord as the activity's
+# application_id. They are set to YOUR app so that mp:external keys we
+# register actually belong to the presence we're pushing.
+BRAND_APP_IDS = {b: DEFAULT_APP_ID for b in BRAND_ICONS}
 
 async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
     try:
@@ -754,11 +764,6 @@ async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
         print(f"[RPC] import error: {e}")
         return False
 
-    type_map = {
-        "playing": ActivityType.playing, "streaming": ActivityType.streaming,
-        "listening": ActivityType.listening, "watching": ActivityType.watching,
-        "competing": ActivityType.competing,
-    }
     now = datetime.now(timezone.utc)
 
     def _ts(start=None, end=None):
@@ -775,11 +780,25 @@ async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
         while len(p) < n: p.append("")
         return p
 
-    icon = BRAND_ICONS.get(brand, "")
-    app_id = BRAND_APP_IDS.get(brand)
-    kw: dict = {}
-    if app_id: kw["application_id"] = app_id
-    ak = {"large_image": icon, "large_text": brand.capitalize(), "small_image": icon, "small_text": brand.capitalize()}
+    # resolve icon URL against OUR app id
+    app_id = DEFAULT_APP_ID
+    raw_icon = BRAND_ICONS.get(brand, "")
+    icon_key = None
+    if raw_icon:
+        icon_key = await resolve_rpc_image(raw_icon, app_id, TOKEN)
+    if not icon_key:
+        # registration failed; no image will render, but presence still sets
+        icon_key = None
+
+    kw: dict = {
+        "application_id": int(app_id),
+    }
+    ak = {}
+    if icon_key:
+        ak["large_image"] = icon_key
+        ak["small_image"] = icon_key
+    ak["large_text"] = brand.capitalize()
+    ak["small_text"] = brand.capitalize()
 
     if brand == "spotify":
         p = _parts(3)
@@ -860,13 +879,11 @@ async def apply_brand_rpc(brand: str, user_args: list[str]) -> bool:
 
     if ak:
         try:
-            from discord.activity import ActivityAssets
             kw["assets"] = ActivityAssets(**ak)
         except Exception as e:
             print(f"[RPC] assets: {e}")
 
     try:
-        from discord import Activity
         await client.change_presence(activity=Activity(**kw))
         return True
     except Exception as e:
@@ -1112,7 +1129,6 @@ async def snipe_nitro(code, channel_id):
 # ─────────────────────────────────────────────
 
 async def _spam_worker(channel, count: int, text: str):
-    """Send `count` copies of `text` to `channel`, cancellable mid-flight."""
     try:
         for _ in range(count):
             await channel.send(text)
@@ -1350,7 +1366,6 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # ── HOISTED GLOBALS ──
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
     global _autoreact_emoji, _autoaddback, _current_platform
@@ -1359,18 +1374,15 @@ async def on_message(message):
     global _autorpc_enabled, _autorpc_task, _vsniper_task
     global _multireact_enabled, _multireact_pool
 
-    # ── LOGGER ──
     if LOGGER_ENABLED and message.guild:
         try:
             log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | {message.author}: {message.content[:100]}")
         except Exception: pass
 
-    # ── NITRO SNIPER ──
     if _nitrosniper_enabled and message.author.id != client.user.id:
         for _, code in GIFT_RE.findall(message.content):
             asyncio.create_task(snipe_nitro(code, message.channel.id))
 
-    # ── GIVEAWAY SNIPER ──
     if _giveaway_enabled and message.author.id != client.user.id:
         if message.components and "🎉" in message.content:
             for row in message.components:
@@ -1379,12 +1391,10 @@ async def on_message(message):
                         try: await btn.click()
                         except Exception: pass
 
-    # ── AFK RESPONDER ──
     if _afk_enabled and client.user in message.mentions and message.author.id != client.user.id:
         try: await message.reply(_afk_msg or "I'm AFK right now.", mention_author=False)
         except Exception: pass
 
-    # ── AUTO-RESPONDER ──
     if message.author.id != client.user.id:
         cl = message.content.lower()
         for trig, resp in AUTO_RESPONSES.items():
@@ -1393,7 +1403,6 @@ async def on_message(message):
                 except Exception: pass
                 break
 
-    # ── MIMIC ──
     if message.author.id != client.user.id:
         cid = message.channel.id
         if cid in _mimic_dict and message.author.id in _mimic_dict[cid]:
@@ -1401,7 +1410,6 @@ async def on_message(message):
                 try: await message.channel.send(message.content)
                 except Exception: pass
 
-    # ── TRACKING ──
     if message.author.id in _tracked_users and message.author.id != client.user.id:
         if message.author.id not in _tracking:
             _tracking[message.author.id] = []
@@ -1413,7 +1421,6 @@ async def on_message(message):
         if len(_tracking[message.author.id]) > 200:
             _tracking[message.author.id] = _tracking[message.author.id][-200:]
 
-    # ── SPEAK / AUTO-TRANSLATE OUTGOING ──
     if message.author.id == client.user.id and _speak_lang and not message.content.startswith(PREFIX):
         try:
             translated = await translate_text(message.content, _speak_lang)
@@ -1422,7 +1429,6 @@ async def on_message(message):
                 await message.edit(content=translated)
         except Exception: pass
 
-    # ── AUTOREACT (single + multi) ──
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
         if _autoreact_emoji:
             try: await message.add_reaction(_autoreact_emoji)
@@ -1500,7 +1506,6 @@ async def on_message(message):
     elif cmd == "say":
         await message.edit(content=" ".join(args[1:]))
 
-    # ── SPAM + SPAMSTOP ──
     elif cmd == "spam":
         if len(args) < 3:
             return await message.edit(content=ui_err("usage: spam <n> <text>"))
@@ -1510,7 +1515,6 @@ async def on_message(message):
         count = min(count, 200)
         text = " ".join(args[2:])
         cid = message.channel.id
-        # kill an existing spam in this channel first
         existing = _spam_tasks.get(cid)
         if existing and not existing.done():
             existing.cancel()
@@ -1524,7 +1528,6 @@ async def on_message(message):
         cid = message.channel.id
         task = _spam_tasks.get(cid)
         if not task or task.done():
-            # also try killing every running spam task, not just this channel
             killed = 0
             for ch_id, t in list(_spam_tasks.items()):
                 if t and not t.done():
@@ -1568,7 +1571,6 @@ async def on_message(message):
         try: await message.delete()
         except Exception: pass
 
-    # ── SNIPE (deleted) ──
     elif cmd == "snipe":
         try: await message.delete()
         except Exception: pass
@@ -1597,7 +1599,6 @@ async def on_message(message):
         ]
         await message.channel.send(ui_box(f"sniped message #{idx}/{len(entries)}", rows))
 
-    # ── EDIT SNIPE ──
     elif cmd in ("editsnipe", "esnipe"):
         try: await message.delete()
         except Exception: pass
@@ -1846,13 +1847,25 @@ async def on_message(message):
         elif sub == "status":
             cfg = load_rpc_cfg()
             await message.edit(content=ui_box("rpc", [
-                f"  {DIM}enabled{RESET}     {'yes' if cfg.get('enabled') else 'no'}",
-                f"  {DIM}type{RESET}        {cfg.get('type')}",
-                f"  {DIM}name{RESET}        {cfg.get('name') or '-'}",
-                f"  {DIM}details{RESET}     {cfg.get('details') or '-'}",
-                f"  {DIM}state{RESET}       {cfg.get('state') or '-'}",
-                f"  {DIM}large_image{RESET} {cfg.get('large_image') or '-'}",
+                f"  {DIM}enabled{RESET}        {'yes' if cfg.get('enabled') else 'no'}",
+                f"  {DIM}application_id{RESET} {cfg.get('application_id') or '-'}",
+                f"  {DIM}type{RESET}           {cfg.get('type')}",
+                f"  {DIM}name{RESET}           {cfg.get('name') or '-'}",
+                f"  {DIM}details{RESET}        {cfg.get('details') or '-'}",
+                f"  {DIM}state{RESET}          {cfg.get('state') or '-'}",
+                f"  {DIM}large_image{RESET}    {cfg.get('large_image') or '-'}",
+                f"  {DIM}small_image{RESET}    {cfg.get('small_image') or '-'}",
             ]))
+
+        elif sub == "application_id":
+            try: await message.delete()
+            except Exception: pass
+            val = await rpc_prompt(message.channel, message.author, "application_id (numeric)")
+            if val == "__TIMEOUT__": return
+            cfg = load_rpc_cfg(); cfg["application_id"] = val or DEFAULT_APP_ID; save_rpc_cfg(cfg)
+            _rpc_asset_cache.clear()
+            await update_rpc()
+            await message.channel.send(ui_ok(f"application_id → {cfg['application_id']}"), delete_after=4)
 
         elif sub == "type":
             try: await message.delete()
@@ -3149,7 +3162,6 @@ async def on_message(message):
         _nitrosniper_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
         await message.edit(content=ui_ok(f"nitro sniper → {'on' if _nitrosniper_enabled else 'off'}"))
 
-    # ── AUTOREACT (single) ──
     elif cmd == "autoreact":
         if len(args) < 2:
             return await message.edit(content=ui_err("usage: autoreact <emoji>"))
@@ -3160,7 +3172,6 @@ async def on_message(message):
         _autoreact_emoji = None
         await message.edit(content=ui_ok("auto-react stopped"))
 
-    # ── MULTI-AUTOREACT ──
     elif cmd in ("multireact", "multiautoreact"):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "add":
@@ -3454,7 +3465,6 @@ async def on_message(message):
 async def on_message_delete(message):
     if message.author.id == client.user.id:
         return
-    # snipe cache
     cid = message.channel.id
     _snipe_cache.setdefault(cid, [])
     _snipe_cache[cid].append({
@@ -3466,7 +3476,6 @@ async def on_message_delete(message):
     })
     if len(_snipe_cache[cid]) > SNIPE_LIMIT:
         _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
-    # logger
     if not LOGGER_ENABLED:
         return
     log_msg("DEL", f"{message.author} in #{getattr(message.channel,'name','DM')}: {message.content[:100]}")
@@ -3477,7 +3486,6 @@ async def on_message_edit(before, after):
         return
     if before.content == after.content:
         return
-    # editsnipe cache
     cid = before.channel.id
     _editsnipe_cache.setdefault(cid, [])
     _editsnipe_cache[cid].append({
@@ -3489,7 +3497,6 @@ async def on_message_edit(before, after):
     })
     if len(_editsnipe_cache[cid]) > SNIPE_LIMIT:
         _editsnipe_cache[cid] = _editsnipe_cache[cid][-SNIPE_LIMIT:]
-    # logger
     if not LOGGER_ENABLED:
         return
     log_msg("EDIT", f"{before.author}: '{before.content[:60]}' → '{after.content[:60]}'")
@@ -3507,7 +3514,6 @@ async def on_relationship_add(relationship):
 
 @client.event
 async def on_group_channel_create(channel):
-    """AGC — anti group chat trap"""
     if not _agc_state["enabled"]:
         return
 
