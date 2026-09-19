@@ -191,6 +191,10 @@ HELP_DATA: dict[str, list[tuple]] = {
         ("vckick <user_id>",         "kick user from vc"),
         ("vcmove <user> <ch_id>",    "move user to channel"),
         ("vcmoveall <ch1> <ch2>",    "move all users ch1 → ch2"),
+        ("selfmute",                 "toggle your own server mute"),
+        ("selfdeaf",                 "toggle your own server deafen"),
+        ("selfstream",               "toggle your stream (go live)"),
+        ("selfcamera",               "toggle your camera/video"),
     ],
     "fun": [
         ("gayrate [user_id]",     "gay percentage"),
@@ -1512,6 +1516,80 @@ async def on_message(message):
             await message.channel.send(ui_ok(f"moved all from {ch1.name} → {ch2.name}"), delete_after=5)
         except Exception as e:
             await message.channel.send(ui_err(str(e)), delete_after=5)
+
+
+    elif cmd == "selfmute":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild:
+            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
+        vc = message.guild.voice_client
+        if not vc:
+            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
+        # Toggle self-mute via the gateway VOICE_STATE_UPDATE
+        currently_muted = vc.self_mute
+        await vc.channel.guild.change_voice_state(
+            channel=vc.channel,
+            self_mute=not currently_muted,
+            self_deaf=vc.self_deaf,
+        )
+        state = "muted" if not currently_muted else "unmuted"
+        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
+
+    elif cmd == "selfdeaf":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild:
+            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
+        vc = message.guild.voice_client
+        if not vc:
+            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
+        currently_deafened = vc.self_deaf
+        await vc.channel.guild.change_voice_state(
+            channel=vc.channel,
+            self_mute=vc.self_mute,
+            self_deaf=not currently_deafened,
+        )
+        state = "deafened" if not currently_deafened else "undeafened"
+        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
+
+    elif cmd == "selfstream":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild:
+            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
+        vc = message.guild.voice_client
+        if not vc:
+            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
+        # discord.py-self exposes self_stream on VoiceClient
+        currently_streaming = getattr(vc, "self_stream", False)
+        await vc.channel.guild.change_voice_state(
+            channel=vc.channel,
+            self_mute=vc.self_mute,
+            self_deaf=vc.self_deaf,
+            self_stream=not currently_streaming,
+        )
+        state = "streaming" if not currently_streaming else "stopped stream"
+        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
+
+    elif cmd == "selfcamera":
+        try: await message.delete()
+        except Exception: pass
+        if not message.guild:
+            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
+        vc = message.guild.voice_client
+        if not vc:
+            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
+        # self_video is camera on/off
+        currently_video = getattr(vc, "self_video", False)
+        await vc.channel.guild.change_voice_state(
+            channel=vc.channel,
+            self_mute=vc.self_mute,
+            self_deaf=vc.self_deaf,
+            self_video=not currently_video,
+        )
+        state = "camera on" if not currently_video else "camera off"
+        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
 
     # ─────────────────────────────────
     # FUN
