@@ -1518,78 +1518,55 @@ async def on_message(message):
             await message.channel.send(ui_err(str(e)), delete_after=5)
 
 
-    elif cmd == "selfmute":
+    elif cmd in ("selfmute", "selfdeaf", "selfstream", "selfcamera"):
         try: await message.delete()
         except Exception: pass
         if not message.guild:
             return await message.channel.send(ui_err("must be in a server"), delete_after=5)
-        vc = message.guild.voice_client
-        if not vc:
-            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
-        # Toggle self-mute via the gateway VOICE_STATE_UPDATE
-        currently_muted = vc.self_mute
-        await vc.channel.guild.change_voice_state(
-            channel=vc.channel,
-            self_mute=not currently_muted,
-            self_deaf=vc.self_deaf,
-        )
-        state = "muted" if not currently_muted else "unmuted"
-        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
 
-    elif cmd == "selfdeaf":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild:
-            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
-        vc = message.guild.voice_client
-        if not vc:
-            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
-        currently_deafened = vc.self_deaf
-        await vc.channel.guild.change_voice_state(
-            channel=vc.channel,
-            self_mute=vc.self_mute,
-            self_deaf=not currently_deafened,
-        )
-        state = "deafened" if not currently_deafened else "undeafened"
-        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
+        # Get current voice state from the member (works whether we used vcjoin or joined naturally)
+        me = message.guild.me
+        vs = me.voice if me else None
+        if not vs or not vs.channel:
+            return await message.channel.send(ui_err("you are not in a voice channel"), delete_after=5)
 
-    elif cmd == "selfstream":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild:
-            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
-        vc = message.guild.voice_client
-        if not vc:
-            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
-        # discord.py-self exposes self_stream on VoiceClient
-        currently_streaming = getattr(vc, "self_stream", False)
-        await vc.channel.guild.change_voice_state(
-            channel=vc.channel,
-            self_mute=vc.self_mute,
-            self_deaf=vc.self_deaf,
-            self_stream=not currently_streaming,
-        )
-        state = "streaming" if not currently_streaming else "stopped stream"
-        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
+        # Read current state, defaulting False for each flag
+        cur_mute   = vs.self_mute   if vs else False
+        cur_deaf   = vs.self_deaf   if vs else False
+        cur_stream = vs.self_stream if vs else False
+        cur_video  = vs.self_video  if vs else False
 
-    elif cmd == "selfcamera":
-        try: await message.delete()
-        except Exception: pass
-        if not message.guild:
-            return await message.channel.send(ui_err("must be in a server"), delete_after=5)
-        vc = message.guild.voice_client
-        if not vc:
-            return await message.channel.send(ui_err("not in a voice channel"), delete_after=5)
-        # self_video is camera on/off
-        currently_video = getattr(vc, "self_video", False)
-        await vc.channel.guild.change_voice_state(
-            channel=vc.channel,
-            self_mute=vc.self_mute,
-            self_deaf=vc.self_deaf,
-            self_video=not currently_video,
-        )
-        state = "camera on" if not currently_video else "camera off"
-        await message.channel.send(ui_ok(f"self {state}"), delete_after=5)
+        # Determine what changes
+        new_mute   = (not cur_mute)   if cmd == "selfmute"   else cur_mute
+        new_deaf   = (not cur_deaf)   if cmd == "selfdeaf"   else cur_deaf
+        new_stream = (not cur_stream) if cmd == "selfstream" else cur_stream
+        new_video  = (not cur_video)  if cmd == "selfcamera" else cur_video
+
+        # Send raw gateway OP 4 — VOICE_STATE_UPDATE
+        # This is the only reliable method for selfbots; VoiceClient.change_voice_state
+        # only works when the bot explicitly connected via channel.connect()
+        try:
+            await client.ws.send_as_json({
+                "op": 4,
+                "d": {
+                    "guild_id": str(message.guild.id),
+                    "channel_id": str(vs.channel.id),
+                    "self_mute":   new_mute,
+                    "self_deaf":   new_deaf,
+                    "self_stream": new_stream,
+                    "self_video":  new_video,
+                }
+            })
+
+            state_map = {
+                "selfmute":   "muted"        if new_mute   else "unmuted",
+                "selfdeaf":   "deafened"     if new_deaf   else "undeafened",
+                "selfstream": "streaming"    if new_stream else "stopped stream",
+                "selfcamera": "camera on"    if new_video  else "camera off",
+            }
+            await message.channel.send(ui_ok(f"self {state_map[cmd]}"), delete_after=5)
+        except Exception as e:
+            await message.channel.send(ui_err(f"failed: {e}"), delete_after=6)
 
     # ─────────────────────────────────
     # FUN
