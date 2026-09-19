@@ -1,8 +1,4 @@
-# discord selfbot core
 discord.py-self[voice]
-
-# async http — all API calls, last.fm, nekos.life, meme api, etc
 aiohttp
-
-# voice channel support (vcjoin, vcleave, etc)
 PyNaCl
+yt-dlp

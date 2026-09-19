@@ -1,5 +1,8 @@
+[phases.setup]
+nixPkgs = ["python313", "ffmpeg"]
+
 [phases.install]
-cmds = ["pip install discord.py-self aiohttp"]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
 
 [start]
 cmd = "python selfbot.py"

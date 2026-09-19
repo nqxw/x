@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# sy's selfbot — full rewrite
+# sy's selfbot — full rewrite (Railway-fixed)
 
 import discord
 import asyncio
@@ -61,7 +61,7 @@ VERSION = "1.0.0"
 LOG_FILE = "message_log.txt"
 
 # ─────────────────────────────────────────────
-# UI HELPER — ascii_helper style > ```ansi blocks
+# UI HELPER — ansi block formatting
 # ─────────────────────────────────────────────
 
 ESC = "\x1b"
@@ -84,7 +84,6 @@ def _ansi_block(lines: list[str]) -> str:
         else:
             result += f"> {line}\n"
     result += "> ```"
-    # clean empty quote lines
     cleaned = []
     for l in result.split("\n"):
         if re.match(r'^>\s*$', l):
@@ -130,7 +129,7 @@ def ui_progress(label: str, pct: int) -> str:
 # PAGINATED HELP SYSTEM
 # ─────────────────────────────────────────────
 
-PAGE_SIZE = 8   # rows per help page
+PAGE_SIZE = 8
 
 def _paginate(title: str, subtitle: str, rows: list[str], page: int = 1) -> str:
     total_pages = max(1, math.ceil(len(rows) / PAGE_SIZE))
@@ -143,7 +142,6 @@ def _paginate(title: str, subtitle: str, rows: list[str], page: int = 1) -> str:
     lines = [bar, header, bar, *chunk, bar, footer, bar]
     return _ansi_block(lines)
 
-# All help sections: name → list of (cmd, desc)
 HELP_DATA: dict[str, list[tuple]] = {
     "general": [
         ("ping",              "latency check"),
@@ -472,8 +470,8 @@ client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
 AUTO_RESPONSES:  dict[str, str] = {}
 SNIPER_ENABLED  = True
 LOGGER_ENABLED  = True
-_mimic_dict:    dict[int, list[int]] = {}   # channel_id -> [user_ids]
-_tracking:      dict[int, list[dict]] = {}  # user_id -> [{time, content, channel}]
+_mimic_dict:    dict[int, list[int]] = {}
+_tracking:      dict[int, list[dict]] = {}
 _tracked_users: set[int] = set()
 _afk_msg:       str | None = None
 _afk_enabled   = False
@@ -481,17 +479,17 @@ _typing_tasks:  dict[int, asyncio.Task] = {}
 _autoreact_emoji: str | None = None
 _autoaddback   = False
 _giveaway_enabled = False
-_nitrosniper_enabled = True
+_nitrosniper_enabled = True     # ← MOVED UP (was at the bottom, referenced by on_message)
 _autorpc_enabled = False
 _autorpc_task:  asyncio.Task | None = None
 _captcha_key:   str = ""
 _autoclaim_enabled = False
-_speak_lang:    str | None = None   # auto-translate outgoing
-_vsniper_list:  list[dict] = []     # [{code, guild_id}]
+_speak_lang:    str | None = None
+_vsniper_list:  list[dict] = []
 _vsniper_task:  asyncio.Task | None = None
 
 # ─────────────────────────────────────────────
-# AGC STATE (anti group-chat trap)
+# AGC STATE
 # ─────────────────────────────────────────────
 
 _agc_state = {
@@ -645,11 +643,8 @@ async def rpc_prompt(channel, author, label: str) -> str | None:
         return "__TIMEOUT__"
 
 # ─────────────────────────────────────────────
-# BRAND RPC — Discord CDN images
+# BRAND RPC
 # ─────────────────────────────────────────────
-# Using Discord CDN hosted images for brand icons.
-# These are stable Discord-hosted assets that work as large_image values
-# when passed directly to Activity (discord.py-self forwards them as-is).
 
 BRAND_ICONS = {
     "spotify":     "https://cdn.discordapp.com/app-icons/367827983903490050/c1aac7c70a2df8bf5b50b88e2de36ff2.webp?size=256",
@@ -940,7 +935,6 @@ class QuestService:
         return await self._heartbeat(session, quest, payloads)
 
     async def _video(self, session, quest):
-        # fastest possible — send progress every 2 seconds
         interval = 2.0
         last = quest.progress_value()
         started = int(datetime.now(timezone.utc).timestamp()) - int(last)
@@ -961,7 +955,6 @@ class QuestService:
         return "completed" if quest.is_completed() or quest.progress_value() >= quest.target else "recovering"
 
     async def _heartbeat(self, session, quest, payloads):
-        # fastest: 15 second intervals
         interval = 15
         active = payloads[0]
         while True:
@@ -977,7 +970,6 @@ class QuestService:
             if quest.is_completed() or quest.progress_value() >= quest.target:
                 break
             await asyncio.sleep(interval)
-        # send terminal
         try:
             t = dict(active); t["terminal"] = True
             await _api(session, "POST",
@@ -1149,7 +1141,6 @@ def aesthetic(text):
 def clap_text(text):
     return " 👏 ".join(text.split())
 
-# nekos.life roleplay actions — correct v2 endpoints
 NEKO_ACTIONS = {
     "feed": "feed", "tickle": "tickle", "slap": "slap", "hug": "hug",
     "cuddle": "cuddle", "pat": "pat", "kiss": "kiss", "poke": "poke",
@@ -1171,7 +1162,6 @@ async def neko_gif(action: str) -> str | None:
         print(f"[Neko] {e}")
     return None
 
-# translation helper
 async def translate_text(text: str, target_lang: str) -> str:
     try:
         url = f"https://translate.googleapis.com/translate_a/single"
@@ -1183,7 +1173,6 @@ async def translate_text(text: str, target_lang: str) -> str:
     except Exception as e:
         return f"error: {e}"
 
-# vanity sniper loop
 async def vsniper_loop():
     while _vsniper_task and not _vsniper_task.cancelled():
         for entry in list(_vsniper_list):
@@ -1193,7 +1182,6 @@ async def vsniper_loop():
                     h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
                     async with s.get(f"https://discord.com/api/v9/invites/{code}", headers=h) as r:
                         if r.status == 404:
-                            # vanity is free — claim it
                             async with s.patch(
                                 f"https://discord.com/api/v9/guilds/{guild_id}/vanity-url",
                                 headers=h, json={"code": code}) as r2:
@@ -1202,7 +1190,6 @@ async def vsniper_loop():
             except Exception: pass
         await asyncio.sleep(0.5)
 
-# typing loop
 async def typing_loop(channel):
     while True:
         try:
@@ -1210,23 +1197,6 @@ async def typing_loop(channel):
                 await asyncio.sleep(9)
         except Exception:
             await asyncio.sleep(5)
-
-# AGC helpers (ported from agc.py to discord.py-self)
-async def _agc_discord_request(method, path, json_body=None):
-    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
-    async with aiohttp.ClientSession() as s:
-        async with s.request(method, f"https://discord.com/api/v9{path}", headers=h, json=json_body) as r:
-            try: return await r.json(), r.status
-            except Exception: return {}, r.status
-
-async def _agc_notify_webhook(channel_id, owner_id, members):
-    url = _agc_state.get("webhook_url")
-    if not url: return
-    body = {"content": f"**AGC Alert**\nowner: `{owner_id}`\nchannel: `{channel_id}`\nmembers: `{', '.join(members)}`"}
-    try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(url, json=body)
-    except Exception: pass
 
 # ─────────────────────────────────────────────
 # PLATFORM SPOOFER
@@ -1270,20 +1240,24 @@ async def clear_hypesquad():
 
 @client.event
 async def on_ready():
-    global _autoreact_emoji
+    global _autoreact_emoji, _autoaddback
     print(f"[+] {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
     await update_rpc()
     cfg = load_config()
     if cfg.get("autoquest_enabled"):
         asyncio.create_task(autoquest_run(TOKEN))
     if cfg.get("autoaddback"):
-        global _autoaddback
         _autoaddback = True
 
 @client.event
 async def on_message(message):
+    # ── HOISTED GLOBALS (this is the fix for the SyntaxError) ──
+    global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
     global _autoreact_emoji, _autoaddback, _current_platform
+    global _autoclaim_enabled, _captcha_key, _speak_lang
+    global _giveaway_enabled, _nitrosniper_enabled
+    global _autorpc_enabled, _autorpc_task, _vsniper_task
 
     # ── LOGGER ──
     if LOGGER_ENABLED and message.guild:
@@ -1376,7 +1350,24 @@ async def on_message(message):
         else:
             await message.channel.send(build_help_section(sub, page))
 
-    #
+    # ─────────────────────────────────
+    # SETTINGS
+    # ─────────────────────────────────
+
+    elif cmd == "prefix":
+        if len(args) < 2:
+            return await message.edit(content=ui_info(f"current prefix: {PREFIX}"))
+        PREFIX = args[1]
+        cfg = load_config(); cfg["prefix"] = PREFIX; save_config(cfg)
+        await message.edit(content=ui_ok(f"prefix changed to `{PREFIX}`"))
+
+    elif cmd == "version":
+        await message.edit(content=ui_info(f"sy's selfbot v{VERSION}"))
+
+    elif cmd == "reload":
+        _cfg = load_config()
+        await message.edit(content=ui_ok("config reloaded"))
+
     # ─────────────────────────────────
     # GENERAL
     # ─────────────────────────────────
@@ -1408,7 +1399,6 @@ async def on_message(message):
         text = " ".join(args[2:])
         try: await message.delete()
         except Exception: pass
-        # fastest possible — no sleep, just rapid sends
         tasks = [message.channel.send(text) for _ in range(count)]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1609,12 +1599,10 @@ async def on_message(message):
         await message.channel.send(ui_ok(f"autoquest → {'on' if on else 'off'}"), delete_after=5)
 
     elif cmd == "autoclaim":
-        global _autoclaim_enabled
         _autoclaim_enabled = len(args) < 2 or args[1].lower() in ("on", "enable")
         await message.edit(content=ui_ok(f"autoclaim → {'on' if _autoclaim_enabled else 'off'}"))
 
     elif cmd == "captcha":
-        global _captcha_key
         if len(args) < 3 or args[1].lower() != "set":
             return await message.edit(content=ui_err("usage: captcha set <2captcha_api_key>"))
         _captcha_key = args[2].strip()
@@ -2210,7 +2198,6 @@ async def on_message(message):
                 delete_after=6)
 
         elif sub == "autorpc":
-            global _autorpc_enabled, _autorpc_task
             opt = args[2].lower() if len(args) > 2 else ""
             if opt == "on":
                 u = _lfm.get("username","")
@@ -2460,6 +2447,59 @@ async def on_message(message):
         except Exception as e:
             await message.edit(content=ui_err(str(e)))
 
+    elif cmd == "gccreate":
+        if len(args) < 2:
+            return await message.edit(content=ui_err("usage: gccreate <user_id> [user_id2...]"))
+        try:
+            users = []
+            for uid_str in args[1:]:
+                u = await client.fetch_user(int(uid_str))
+                if u: users.append(u)
+            if not users:
+                return await message.edit(content=ui_err("no valid users"))
+            gc = await client.user.create_group(*users)
+            await message.edit(content=ui_ok(f"group DM created: {gc.id}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcadd":
+        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
+            return await message.edit(content=ui_err("run in group DM: gcadd <user_id>"))
+        try:
+            u = await client.fetch_user(int(args[1]))
+            await message.channel.add_recipients(u)
+            await message.edit(content=ui_ok(f"added {u}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcremove":
+        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
+            return await message.edit(content=ui_err("run in group DM: gcremove <user_id>"))
+        try:
+            u = await client.fetch_user(int(args[1]))
+            await message.channel.remove_recipients(u)
+            await message.edit(content=ui_ok(f"removed {u}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
+    elif cmd == "gcicon":
+        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
+            return await message.edit(content=ui_err("run in group DM: gcicon <url>"))
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(args[1]) as r:
+                    img = await r.read()
+            ext = args[1].split(".")[-1].split("?")[0].lower()
+            mime = {"gif":"gif","png":"png","jpg":"jpeg","jpeg":"jpeg","webp":"webp"}.get(ext,"png")
+            b64 = base64.b64encode(img).decode()
+            h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+            async with aiohttp.ClientSession() as s:
+                async with s.patch(f"https://discord.com/api/v9/channels/{message.channel.id}",
+                    headers=h, json={"icon": f"data:image/{mime};base64,{b64}"}) as resp:
+                    await message.edit(content=ui_ok("gc icon set") if resp.status == 200 else ui_err(f"failed {resp.status}"))
+        except Exception as e:
+            await message.edit(content=ui_err(str(e)))
+
     elif cmd == "agc":
         sub = args[1].lower() if len(args) > 1 else ""
         if not sub:
@@ -2594,7 +2634,6 @@ async def on_message(message):
         await message.edit(content=f"```\n{result}\n```")
 
     elif cmd == "speaklanguage":
-        global _speak_lang
         if len(args) < 2:
             return await message.edit(content=ui_err("usage: speaklanguage <lang_code>"))
         _speak_lang = args[1]
@@ -2905,7 +2944,6 @@ async def on_message(message):
             await message.edit(content=ui_err(str(e)))
 
     elif cmd == "autoaddback":
-        global _autoaddback
         _autoaddback = len(args) < 2 or args[1].lower() in ("on","enable")
         cfg = load_config(); cfg["autoaddback"] = _autoaddback; save_config(cfg)
         await message.edit(content=ui_ok(f"autoaddback → {'on' if _autoaddback else 'off'}"))
@@ -2915,12 +2953,10 @@ async def on_message(message):
     # ─────────────────────────────────
 
     elif cmd == "giveaway":
-        global _giveaway_enabled
         _giveaway_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
         await message.edit(content=ui_ok(f"giveaway sniper → {'on' if _giveaway_enabled else 'off'}"))
 
     elif cmd == "nitrosniper":
-        global _nitrosniper_enabled
         _nitrosniper_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
         await message.edit(content=ui_ok(f"nitro sniper → {'on' if _nitrosniper_enabled else 'off'}"))
 
@@ -2932,7 +2968,6 @@ async def on_message(message):
             _vsniper_list.append({"code": args[2], "guild_id": args[3]})
             await message.edit(content=ui_ok(f"watching vanity: {args[2]}"))
         elif sub == "start":
-            global _vsniper_task
             if _vsniper_task and not _vsniper_task.done():
                 return await message.edit(content=ui_info("vsniper already running"))
             _vsniper_task = asyncio.create_task(vsniper_loop())
@@ -3045,157 +3080,6 @@ async def on_message(message):
             json.dump(backup, f, indent=2)
         await message.channel.send(ui_ok(f"account backed up to {fname}"), delete_after=8)
 
-# ─────────────────────────────────────────────
-# OTHER EVENTS
-# ─────────────────────────────────────────────
-
-
-    # ─────────────────────────────────
-    # SERVER — missing commands
-    # ─────────────────────────────────
-
-    elif cmd == "createrole":
-        g = message.guild
-        if not g or len(args) < 2:
-            return await message.edit(content=ui_err("usage: createrole <name>"))
-        try:
-            role = await g.create_role(name=" ".join(args[1:]))
-            await message.edit(content=ui_ok(f"role created: {role.name} ({role.id})"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "delrole":
-        g = message.guild
-        if not g or len(args) < 2:
-            return await message.edit(content=ui_err("usage: delrole <role_id>"))
-        try:
-            role = g.get_role(int(args[1]))
-            await role.delete()
-            await message.edit(content=ui_ok(f"role deleted: {role.name}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "createchannel":
-        g = message.guild
-        if not g or len(args) < 2:
-            return await message.edit(content=ui_err("usage: createchannel <name>"))
-        try:
-            ch = await g.create_text_channel(name=" ".join(args[1:]))
-            await message.edit(content=ui_ok(f"channel created: #{ch.name} ({ch.id})"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "deletechannel":
-        g = message.guild
-        if not g or len(args) < 2:
-            return await message.edit(content=ui_err("usage: deletechannel <ch_id>"))
-        try:
-            ch = client.get_channel(int(args[1]))
-            name = ch.name
-            await ch.delete()
-            await message.edit(content=ui_ok(f"deleted #{name}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "ban":
-        g = message.guild
-        if not g or len(args) < 2:
-            return await message.edit(content=ui_err("usage: ban <user_id> [reason]"))
-        try:
-            user = await client.fetch_user(int(args[1]))
-            reason = " ".join(args[2:]) or "no reason"
-            await g.ban(user, reason=reason)
-            await message.edit(content=ui_ok(f"banned {user}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "channelinfo":
-        ch_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else message.channel.id
-        ch = client.get_channel(ch_id)
-        if not ch:
-            return await message.edit(content=ui_err("channel not found"))
-        await message.edit(content=ui_box("channel info", [
-            f"  {DIM}name{RESET}    #{ch.name}",
-            f"  {DIM}id{RESET}      {ch.id}",
-            f"  {DIM}type{RESET}    {str(ch.type)}",
-            f"  {DIM}created{RESET} {ch.created_at.strftime('%Y-%m-%d')}",
-            f"  {DIM}guild{RESET}   {ch.guild.name if hasattr(ch,'guild') else 'DM'}",
-        ]))
-
-    elif cmd == "roleinfo":
-        if not message.guild or len(args) < 2:
-            return await message.edit(content=ui_err("usage: roleinfo <role_id>"))
-        role = message.guild.get_role(int(args[1]))
-        if not role:
-            return await message.edit(content=ui_err("role not found"))
-        await message.edit(content=ui_box("role info", [
-            f"  {DIM}name{RESET}     {role.name}",
-            f"  {DIM}id{RESET}       {role.id}",
-            f"  {DIM}color{RESET}    #{role.color.value:06x}",
-            f"  {DIM}members{RESET}  {len(role.members)}",
-            f"  {DIM}position{RESET} {role.position}",
-            f"  {DIM}mentionable{RESET} {'yes' if role.mentionable else 'no'}",
-            f"  {DIM}hoisted{RESET}  {'yes' if role.hoist else 'no'}",
-        ]))
-
-    # ─────────────────────────────────
-    # GROUPCHAT — missing commands
-    # ─────────────────────────────────
-
-    elif cmd == "gccreate":
-        if len(args) < 2:
-            return await message.edit(content=ui_err("usage: gccreate <user_id> [user_id2...]"))
-        try:
-            users = []
-            for uid_str in args[1:]:
-                u = await client.fetch_user(int(uid_str))
-                if u: users.append(u)
-            if not users:
-                return await message.edit(content=ui_err("no valid users"))
-            gc = await client.user.create_group(*users)
-            await message.edit(content=ui_ok(f"group DM created: {gc.id}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "gcadd":
-        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
-            return await message.edit(content=ui_err("run in group DM: gcadd <user_id>"))
-        try:
-            u = await client.fetch_user(int(args[1]))
-            await message.channel.add_recipients(u)
-            await message.edit(content=ui_ok(f"added {u}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "gcremove":
-        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
-            return await message.edit(content=ui_err("run in group DM: gcremove <user_id>"))
-        try:
-            u = await client.fetch_user(int(args[1]))
-            await message.channel.remove_recipients(u)
-            await message.edit(content=ui_ok(f"removed {u}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-    elif cmd == "gcicon":
-        if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
-            return await message.edit(content=ui_err("run in group DM: gcicon <url>"))
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(args[1]) as r:
-                    img = await r.read()
-            ext = args[1].split(".")[-1].split("?")[0].lower()
-            mime = {"gif":"gif","png":"png","jpg":"jpeg","jpeg":"jpeg","webp":"webp"}.get(ext,"png")
-            b64 = base64.b64encode(img).decode()
-            h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
-            async with aiohttp.ClientSession() as s:
-                async with s.patch(f"https://discord.com/api/v9/channels/{message.channel.id}",
-                    headers=h, json={"icon": f"data:image/{mime};base64,{b64}"}) as resp:
-                    await message.edit(content=ui_ok("gc icon set") if resp.status == 200 else ui_err(f"failed {resp.status}"))
-        except Exception as e:
-            await message.edit(content=ui_err(str(e)))
-
-
     # ─────────────────────────────────
     # STATUS
     # ─────────────────────────────────
@@ -3213,8 +3097,6 @@ async def on_message(message):
                 f"  {PREFIX}setstatus <:pepe:123456789>, vibing",
             ]))
 
-        import re as _re
-
         full_text = " ".join(args[1:])
         emoji_name = None
         emoji_id = None
@@ -3228,8 +3110,7 @@ async def on_message(message):
             if not text_part:
                 return await message.edit(content=ui_err("provide status text after the comma"))
 
-            # custom emoji <:name:id>
-            ce_match = _re.match(r"<:([a-zA-Z0-9_]+):([0-9]+)>", emoji_part)
+            ce_match = re.match(r"<:([a-zA-Z0-9_]+):([0-9]+)>", emoji_part)
             if ce_match:
                 emoji_name = ce_match.group(1)
                 emoji_id   = ce_match.group(2)
@@ -3251,7 +3132,6 @@ async def on_message(message):
                     headers=h, json=payload) as r:
                     if r.status == 200:
                         emoji_display = f"{emoji_name} " if emoji_name else ""
-                        # Save to history
                         cfg = load_config()
                         hist = cfg.get("status_history", [])
                         hist.insert(0, {"text": text, "emoji": emoji_name, "time": datetime.now().strftime("%H:%M %d/%m")})
@@ -3284,25 +3164,17 @@ async def on_message(message):
         h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
         try:
             async with aiohttp.ClientSession() as s:
-                # Fetch user profile to get their custom status
                 async with s.get(f"https://discord.com/api/v9/users/{uid}/profile", headers=h) as r:
                     if r.status != 200:
                         return await message.edit(content=ui_err("could not fetch user profile"))
                     profile = await r.json()
 
                 username = profile.get("user", {}).get("username", "?")
-
-                # Try to get custom status from presence
                 user_profile = profile.get("user_profile", {})
-                activity_data = profile.get("user", {})
-
-                # Custom status lives in the activities or user_profile
                 custom_text  = user_profile.get("bio", "") or ""
                 emoji_name   = None
                 emoji_id     = None
 
-                # Also try fetching from user settings if it's our own
-                # For other users, bio is the closest we get via profile endpoint
                 if not custom_text:
                     return await message.edit(content=ui_err(f"{username} has no visible custom status"))
 
@@ -3333,6 +3205,10 @@ async def on_message(message):
             rows.append(f"  {GREY}{i:2}.{RESET} {WHITE}{emoji}{entry['text']}{RESET}  {DIM}{entry['time']}{RESET}{stolen}")
         await message.edit(content=_paginate("status history", "recent statuses", rows))
 
+# ─────────────────────────────────────────────
+# OTHER EVENTS
+# ─────────────────────────────────────────────
+
 @client.event
 async def on_message_delete(message):
     if not LOGGER_ENABLED or message.author.id == client.user.id:
@@ -3360,7 +3236,7 @@ async def on_relationship_add(relationship):
 
 @client.event
 async def on_group_channel_create(channel):
-    """AGC — anti group chat trap (ported from agc.py)"""
+    """AGC — anti group chat trap"""
     if not _agc_state["enabled"]:
         return
 
@@ -3423,8 +3299,6 @@ async def on_group_channel_create(channel):
 # ─────────────────────────────────────────────
 # RUN
 # ─────────────────────────────────────────────
-
-_nitrosniper_enabled = True
 
 print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
