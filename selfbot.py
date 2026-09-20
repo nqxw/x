@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# sy's selfbot — v2.2.6
+# sy's selfbot — v2.2.7
 
 import discord
 import asyncio
@@ -121,7 +121,6 @@ except ImportError as _e:
     async def async_hosted_token_remove(token):
         hosted_token_remove(token)
 
-# ── hcaptcha-challenger ──────────────────────
 try:
     from hcaptcha_challenger.agent import AgentV, AgentConfig
     HAS_HCAPTCHA = True
@@ -165,7 +164,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.6"
+VERSION = "2.2.7"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -282,13 +281,24 @@ HELP_DATA = {
         ("archivechannel [ch_id]","save channel messages to txt"),
     ],
     "host": [
-        ("host add <token>","add account to host list"),
-        ("host remove <token_or_index>","remove by index or token"),
-        ("host list","list hosted accounts"),
-        ("host info <idx>","show account details + token preview"),
-        ("host say <idx> <msg>","force hosted account to say something"),
-        ("host broadcast <msg>","send msg from all hosted accounts"),
-        ("host clear","remove all hosted accounts"),
+        ("host add <token>","add a token to hosted list"),
+        ("host list","list hosted tokens from DB"),
+        ("host sessions","list live sessions with uptime"),
+        ("host start <idx_or_token>","spawn a hosted client"),
+        ("host stop <idx_or_uid>","close one hosted client"),
+        ("host stopall","close every hosted client"),
+        ("host all","spawn every token in the list"),
+        ("host info <idx>","token preview + user info"),
+        ("host say <idx> <msg>","send as a hosted account"),
+        ("host broadcast <msg>","send as all hosted accounts"),
+        ("host remove <idx_or_token>","remove from hosted list"),
+        ("host clear","wipe hosted list + stop sessions"),
+    ],
+    "admin": [
+        ("admin add <uid>","add an admin"),
+        ("admin remove <uid>","remove an admin"),
+        ("admin list","list admins + owner"),
+        ("admin setowner <uid>","set owner (bootstraps admin system)"),
     ],
     "lastfm": [
         ("lastfm set <user> [key]","link your last.fm account"),("lastfm np","now playing track"),
@@ -619,6 +629,7 @@ def build_help_root(page=1):
         "general":"utilities, platform & status","quests":"quest completer & orb badge",
         "sniper":"nitro sniper & logger","ar":"auto-responder","voice":"voice channel controls",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
+        "admin":"owner / admin management",
         "lastfm":"last.fm integration","settings":"prefix, aliases, cooldowns, profiles",
         "guards":"blacklists, whitelists, restrictions, per-cmd toggles",
         "resilience":"auto-reconnect, session log, rate limits, cache, queue",
@@ -755,6 +766,11 @@ _trigger_fired_counts = defaultdict(int)
 _TASK_STORE = "database/tasks.json"
 _TRIGGER_STORE = "database/triggers.json"
 
+# ── host state ──
+_host_sessions: list[dict] = []   # live sessions: {"token","client","user","started","status","prefix"}
+_host_lock: "asyncio.Lock | None" = None
+_host_extra_clients: list = []    # kept alongside _hosted_clients
+
 PLATFORM_MAP = {
     "desktop":  "Windows",
     "web":      "Web",
@@ -810,7 +826,7 @@ def _agc_save_wl():
 _agc_load_wl()
 
 # ─────────────────────────────────────────────
-# HOSTED ACCOUNTS
+# HOSTED ACCOUNTS (legacy path — kept for compat)
 # ─────────────────────────────────────────────
 
 async def load_hosted_tokens_async():
@@ -823,10 +839,6 @@ async def load_hosted_tokens_async():
         HOSTED_TOKENS = []
 
 HOSTED_TOKENS: list[str] = []
-
-# ─────────────────────────────────────────────
-# HOSTED GATEWAY CLIENTS
-# ─────────────────────────────────────────────
 
 _hosted_clients: list[discord.Client] = []
 _hosted_spawned = False
@@ -878,6 +890,125 @@ async def _spawn_hosted_clients():
         except Exception as e:
             print(f"[hosted:{i+1}] spawn failed: {type(e).__name__}: {e}")
             traceback.print_exc()
+
+# ─────────────────────────────────────────────
+# HOST HELPERS (new — for the ported commands)
+# ─────────────────────────────────────────────
+
+def _load_admins() -> list[str]:
+    cfg = load_config()
+    admins = cfg.get("admins", [])
+    if not isinstance(admins, list):
+        return []
+    return [str(x) for x in admins]
+
+def _save_admins(admins: list[str]):
+    cfg = load_config()
+    cfg["admins"] = [str(x) for x in admins]
+    save_config(cfg)
+
+def _owner_id() -> str:
+    cfg = load_config()
+    return str(cfg.get("owner_id", "") or "")
+
+def _set_owner(uid: str):
+    cfg = load_config()
+    cfg["owner_id"] = str(uid)
+    save_config(cfg)
+
+def _is_owner(user_id) -> bool:
+    o = _owner_id()
+    return bool(o) and str(user_id) == o
+
+def _is_admin(user_id) -> bool:
+    if _is_owner(user_id):
+        return True
+    # fallback: if no owner is set yet, first caller becomes admin so bootstrapping is possible
+    if not _owner_id():
+        return True
+    return str(user_id) in _load_admins()
+
+def _parse_uid_str(user: str):
+    if not user:
+        return None
+    if user.startswith("<@") and user.endswith(">"):
+        return user.strip("<@!>")
+    if user.isdigit():
+        return user
+    return None
+
+async def _validate_token(token: str):
+    headers = {
+        "Authorization": token,
+        "User-Agent": USER_AGENT,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://discord.com/api/v10/users/@me",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+    except Exception:
+        return None
+
+def _get_host_session(identifier: str):
+    # by index (1-based) first
+    try:
+        idx = int(identifier) - 1
+        if 0 <= idx < len(_host_sessions):
+            return _host_sessions[idx]
+    except (ValueError, TypeError):
+        pass
+    # then by user id
+    for s in _host_sessions:
+        u = s.get("user")
+        uid = getattr(u, "id", None) if u is not None else None
+        if uid is not None and str(uid) == str(identifier):
+            return s
+    return None
+
+async def _spawn_one_hosted(token: str, prefix: str = PREFIX):
+    """Create, wire, and start a single hosted client. Returns session dict or None."""
+    try:
+        hc = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
+        hc._host_prefix = prefix
+
+        @hc.event
+        async def _hc_on_ready(_hc=hc):
+            print(f"[host] \u2713 {_hc.user} online (prefix {prefix})")
+
+        @hc.event
+        async def _hc_on_message(_m, _hc=hc):
+            try:
+                await _dispatch_message(_hc, _m)
+            except Exception as e:
+                print(f"[host] dispatch error: {e}")
+                traceback.print_exc()
+
+        asyncio.create_task(_run_hosted_client(hc, token))
+
+        # wait up to 15s for ready so we can populate user info
+        for _ in range(30):
+            if hc.user is not None:
+                break
+            await asyncio.sleep(0.5)
+
+        return {
+            "token": token,
+            "client": hc,
+            "user": hc.user,
+            "started": time.time(),
+            "status": "online",
+            "prefix": prefix,
+        }
+    except Exception as e:
+        print(f"[host] spawn failed: {e}")
+        traceback.print_exc()
+        return None
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -1164,7 +1295,6 @@ DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
 _hcaptcha_agent = None
 _hcaptcha_lock = asyncio.Lock()
 
-
 async def _get_hcaptcha_agent():
     global _hcaptcha_agent
     if _hcaptcha_agent is not None:
@@ -1188,8 +1318,7 @@ async def _get_hcaptcha_agent():
             _hcaptcha_agent = None
         return _hcaptcha_agent
 
-
-async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None) -> str | None:
+async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None):
     if not HAS_HCAPTCHA:
         print("[hcaptcha] library not available")
         return None
@@ -1232,7 +1361,6 @@ async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None) -> str | N
         print(f"[hcaptcha] solve failed: {type(e).__name__}: {e}")
         traceback.print_exc()
         return None
-
 
 class QuestRecord:
     def __init__(self, data):
@@ -1341,7 +1469,6 @@ class QuestService:
     async def _mission(self, session, quest):
         task = quest.selected_task
         print(f"[Quest] mission task: {task} | quest: {quest.name}")
-
         try:
             target = quest.target or 1.0
             for ts in [target * 0.25, target * 0.5, target * 0.75, target]:
@@ -1357,16 +1484,13 @@ class QuestService:
                     break
         except Exception as e:
             print(f"[Quest] video-progress attempt: {e}")
-
         if quest.is_completed(): return "completed"
-
         payloads = []
         if quest.app_id:
             payloads.append({"application_id": quest.app_id, "terminal": False})
         payloads.append({"stream_key": f"call:{quest.id}:1", "terminal": False})
         if self.uid:
             payloads.append({"stream_key": f"call:{self.uid}:1", "terminal": False})
-
         end_time = datetime.now(timezone.utc).timestamp() + 60
         while datetime.now(timezone.utc).timestamp() < end_time:
             for p in payloads:
@@ -1379,9 +1503,7 @@ class QuestService:
                 except APIError: continue
             if quest.is_completed(): break
             await asyncio.sleep(5)
-
         if quest.is_completed(): return "completed"
-
         try:
             d = await _api(session, "POST",
                 f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
@@ -1393,9 +1515,7 @@ class QuestService:
             print(f"[Quest] external-task-progress: {e.status}")
         except Exception as e:
             print(f"[Quest] external-task-progress error: {e}")
-
         if quest.is_completed(): return "completed"
-
         for p in payloads:
             try:
                 terminal = dict(p); terminal["terminal"] = True
@@ -1403,9 +1523,7 @@ class QuestService:
                     f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
                     headers=self.headers, json_body=terminal, retries=1)
             except Exception: pass
-
         return "completed" if quest.is_completed() else "recovering"
-
     async def _heartbeat(self, session, quest, payloads):
         interval = 15
         active = payloads[0]
@@ -1427,11 +1545,9 @@ class QuestService:
         except Exception: pass
         return "completed" if quest.is_completed() else "recovering"
 
-
 async def _claim_quest(token: str, quest_id: str):
     url = f"https://discord.com/api/v9/quests/{quest_id}/claim"
     h = _quest_headers(token)
-
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(url, headers=h, json={}) as r:
@@ -1444,18 +1560,15 @@ async def _claim_quest(token: str, quest_id: str):
                     return False, f"http {r.status}: {text[:140]}"
         except Exception as e:
             return False, f"request failed: {e}"
-
         try:
             body_json = json.loads(text)
         except Exception:
             body_json = {}
         sitekey = body_json.get("captcha_sitekey") or DISCORD_HCAPTCHA_SITEKEY
         rqdata = body_json.get("captcha_rqdata")
-
         captcha_token = await _solve_hcaptcha(sitekey, "https://discord.com/quest-home", rqdata)
         if not captcha_token:
             return False, "captcha solve failed"
-
         retry_headers = {**h, "x-captcha-key": captcha_token}
         try:
             async with session.post(url, headers=retry_headers,
@@ -1465,7 +1578,6 @@ async def _claim_quest(token: str, quest_id: str):
         except Exception as e:
             return False, f"retry failed: {e}"
 
-
 async def _autoclaim_loop():
     await asyncio.sleep(60)
     while True:
@@ -1474,7 +1586,6 @@ async def _autoclaim_loop():
             if not cfg.get("autoclaim_enabled"):
                 await asyncio.sleep(300)
                 continue
-
             svc = QuestService(TOKEN)
             async with aiohttp.ClientSession() as session:
                 quests = await svc.fetch(session)
@@ -1492,7 +1603,6 @@ async def _autoclaim_loop():
             print(f"[autoclaim loop] {e}")
             traceback.print_exc()
             await asyncio.sleep(120)
-
 
 async def autoquest_run(token):
     svc = QuestService(token)
@@ -1524,18 +1634,15 @@ async def claim_orb(token):
                     return False, text
         except Exception as e:
             return False, str(e)
-
         try:
             body_json = json.loads(text)
         except Exception:
             body_json = {}
         sitekey = body_json.get("captcha_sitekey") or DISCORD_HCAPTCHA_SITEKEY
         rqdata = body_json.get("captcha_rqdata")
-
         captcha_token = await _solve_hcaptcha(sitekey, "https://discord.com", rqdata)
         if not captcha_token:
             return False, "captcha solve failed"
-
         retry_headers = {**h, "x-captcha-key": captcha_token}
         try:
             async with session.post(f"https://discord.com/api/v9/virtual-currency/skus/{ORB_SKU}/redeem",
@@ -1599,17 +1706,8 @@ async def lfm_np(username):
             "total": d.get("recenttracks",{}).get("@attr",{}).get("total","?")}
 
 # ─────────────────────────────────────────────
-# HOSTED / UTIL HELPERS
+# UTILITY HELPERS
 # ─────────────────────────────────────────────
-
-async def hosted_send(token, channel_id, content):
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://discord.com/api/v9/channels/{channel_id}/messages",
-                headers={"Authorization": token.strip(), "Content-Type":"application/json", "User-Agent":USER_AGENT},
-                json={"content": content}) as r:
-                return r.status in (200,201)
-    except Exception: return False
 
 async def hosted_username(token):
     try:
@@ -1632,6 +1730,30 @@ async def hosted_info(token):
                 return {"username": "invalid token", "id": "?", "valid": False}
     except Exception as e:
         return {"username": f"error: {e}", "id": "?", "valid": False}
+
+async def hosted_send_via_client(session, channel_id: int, content: str):
+    """Send a message using a hosted session's live discord client."""
+    cl = session.get("client")
+    if cl is None:
+        return False
+    try:
+        ch = cl.get_channel(channel_id)
+        if ch is None:
+            ch = await cl.fetch_channel(channel_id)
+        await ch.send(content)
+        return True
+    except Exception as e:
+        print(f"[host say] {e}")
+        return False
+
+async def hosted_send(token, channel_id, content):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"https://discord.com/api/v9/channels/{channel_id}/messages",
+                headers={"Authorization": token.strip(), "Content-Type":"application/json", "User-Agent":USER_AGENT},
+                json={"content": content}) as r:
+                return r.status in (200,201)
+    except Exception: return False
 
 def uwuify(text):
     text = re.sub(r'[rRlL]', 'w', text)
@@ -1997,7 +2119,9 @@ async def _load_rpc_cog():
 
 @client.event
 async def on_ready():
-    global _autoaddback, _autoreact_emoji, _last_ready_ts, _cmd_queue, _queue_worker_tasks, HOSTED_TOKENS
+    global _autoaddback, _autoreact_emoji, _last_ready_ts, _cmd_queue, _queue_worker_tasks, HOSTED_TOKENS, _host_lock
+    if _host_lock is None:
+        _host_lock = asyncio.Lock()
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
 
@@ -2263,6 +2387,236 @@ async def _dispatch_message(_client, message):
             page = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1
             await message.channel.send(build_help_section(sub, page)); return
         await message.channel.send(build_help_root(1))
+
+    # ── ADMIN ──
+    elif cmd == "admin":
+        try: await message.delete()
+        except Exception: pass
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "setowner":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: admin setowner <uid>"), delete_after=6)
+            uid = _parse_uid_str(args[2])
+            if not uid: return await message.channel.send(ui_err("invalid uid"), delete_after=6)
+            current_owner = _owner_id()
+            if current_owner and not _is_owner(message.author.id):
+                return await message.channel.send(ui_err("owner already set — owner only"), delete_after=6)
+            _set_owner(uid)
+            await message.channel.send(ui_ok(f"owner set to {uid}"), delete_after=8)
+        elif sub == "add":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: admin add <uid>"), delete_after=6)
+            if not _is_owner(message.author.id):
+                return await message.channel.send(ui_err("owner only"), delete_after=6)
+            uid = _parse_uid_str(args[2])
+            if not uid: return await message.channel.send(ui_err("invalid uid"), delete_after=6)
+            admins = _load_admins()
+            if uid in admins: return await message.channel.send(ui_warn("already admin"), delete_after=6)
+            admins.append(uid); _save_admins(admins)
+            await message.channel.send(ui_ok(f"added {uid}"), delete_after=6)
+        elif sub == "remove":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: admin remove <uid>"), delete_after=6)
+            if not _is_owner(message.author.id):
+                return await message.channel.send(ui_err("owner only"), delete_after=6)
+            uid = _parse_uid_str(args[2])
+            if not uid: return await message.channel.send(ui_err("invalid uid"), delete_after=6)
+            admins = _load_admins()
+            if uid not in admins: return await message.channel.send(ui_warn("not admin"), delete_after=6)
+            admins.remove(uid); _save_admins(admins)
+            await message.channel.send(ui_ok(f"removed {uid}"), delete_after=6)
+        elif sub == "list" or not sub:
+            o = _owner_id()
+            admins = _load_admins()
+            rows = []
+            if o: rows.append(f"  {DIM}owner{RESET}  <@{o}>")
+            for a in admins:
+                if a != o: rows.append(f"  {DIM}admin{RESET}  <@{a}>")
+            await message.channel.send(ui_box("admins", rows) if rows else ui_info("no admins configured"), delete_after=15)
+        else:
+            await message.channel.send(build_help_section("admin"), delete_after=15)
+
+    # ── HOST ──
+    elif cmd == "host":
+        try: await message.delete()
+        except Exception: pass
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        # host add <token>
+        if sub == "add":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: host add <token>"), delete_after=6)
+            t = args[2].strip().strip('"').strip("'")
+            if t in HOSTED_TOKENS:
+                return await message.channel.send(ui_warn("already in hosted list"), delete_after=6)
+            uname = await hosted_username(t)
+            if not uname or uname == "?":
+                return await message.channel.send(ui_err("invalid or dead token"), delete_after=6)
+            try:
+                await async_hosted_token_add(t, username=uname)
+                HOSTED_TOKENS.append(t)
+                await message.channel.send(ui_ok(f"hosted {uname}"), delete_after=8)
+            except Exception as e:
+                await message.channel.send(ui_err(f"write failed: {e}"), delete_after=8)
+
+        # host remove <idx|token>
+        elif sub in ("remove", "rem"):
+            if len(args) < 3: return await message.channel.send(ui_err("usage: host remove <idx_or_token>"), delete_after=6)
+            ref = args[2].strip().strip('"').strip("'")
+            target = None
+            if ref.isdigit():
+                i = int(ref)
+                if 0 <= i < len(HOSTED_TOKENS): target = HOSTED_TOKENS[i]
+            elif ref in HOSTED_TOKENS:
+                target = ref
+            if not target:
+                return await message.channel.send(ui_err("not in list"), delete_after=6)
+            try:
+                await async_hosted_token_remove(target)
+                if target in HOSTED_TOKENS: HOSTED_TOKENS.remove(target)
+                await message.channel.send(ui_ok("removed"), delete_after=6)
+            except Exception as e:
+                await message.channel.send(ui_err(f"delete failed: {e}"), delete_after=6)
+
+        # host list — tokens from DB
+        elif sub == "list" or (not sub and len(args) == 1):
+            if not HOSTED_TOKENS:
+                return await message.channel.send(ui_info("no hosted tokens"), delete_after=6)
+            rows = []
+            for i, t in enumerate(HOSTED_TOKENS):
+                uname = await hosted_username(t)
+                rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{uname}{RESET}  {DIM}{t[:20]}...{RESET}")
+            await message.channel.send(_paginate("host", "hosted accounts", rows), delete_after=20)
+
+        # host sessions — live
+        elif sub == "sessions":
+            if not _host_sessions:
+                return await message.channel.send(ui_info("no live sessions"), delete_after=6)
+            rows = []
+            for i, s in enumerate(_host_sessions, 1):
+                u = s.get("user")
+                name = getattr(u, "display_name", None) or getattr(u, "name", "?") if u else "?"
+                up = int(time.time() - s.get("started", time.time()))
+                rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{name}{RESET}  {DIM}{s.get('status','?')} {up}s{RESET}")
+            await message.channel.send(_paginate("sessions", "live", rows), delete_after=20)
+
+        # host info <idx>
+        elif sub == "info":
+            if len(args) < 3 or not args[2].isdigit():
+                return await message.channel.send(ui_err("usage: host info <idx>"), delete_after=6)
+            i = int(args[2])
+            if i >= len(HOSTED_TOKENS):
+                return await message.channel.send(ui_err("index out of range"), delete_after=6)
+            t = HOSTED_TOKENS[i]
+            info = await hosted_info(t)
+            await message.channel.send(ui_box("hosted account", [
+                f"  {DIM}index{RESET}     [{i}]",
+                f"  {DIM}username{RESET}  {info['username']}",
+                f"  {DIM}id{RESET}        {info['id']}",
+                f"  {DIM}valid{RESET}     {'yes' if info['valid'] else 'no'}",
+                f"  {DIM}token{RESET}     {t[:12]}...{t[-6:]}",
+            ]), delete_after=20)
+
+        # host start <idx|token>
+        elif sub == "start":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: host start <idx_or_token>"), delete_after=6)
+            ref = args[2].strip().strip('"').strip("'")
+            token = None
+            if ref.isdigit():
+                i = int(ref)
+                if 0 <= i < len(HOSTED_TOKENS): token = HOSTED_TOKENS[i]
+            elif len(ref) > 50:
+                token = ref
+            if not token:
+                return await message.channel.send(ui_err("no token found"), delete_after=6)
+            if any(s.get("token") == token for s in _host_sessions):
+                return await message.channel.send(ui_warn("already running"), delete_after=6)
+            st = await _spawn_one_hosted(token, PREFIX)
+            if not st:
+                return await message.channel.send(ui_err("spawn failed"), delete_after=6)
+            _host_sessions.append(st)
+            u = st.get("user")
+            name = getattr(u, "display_name", None) or getattr(u, "name", "?") if u else "?"
+            await message.channel.send(ui_ok(f"started {name} as session #{len(_host_sessions)}"), delete_after=8)
+
+        # host stop <idx|uid>
+        elif sub == "stop":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: host stop <idx_or_uid>"), delete_after=6)
+            s = _get_host_session(args[2])
+            if not s:
+                return await message.channel.send(ui_err("no such session"), delete_after=6)
+            cl = s.get("client")
+            if cl:
+                try: await cl.close()
+                except Exception: pass
+            _host_sessions.remove(s)
+            u = s.get("user")
+            name = getattr(u, "display_name", None) or getattr(u, "name", "?") if u else "?"
+            await message.channel.send(ui_ok(f"stopped {name}"), delete_after=6)
+
+        # host stopall
+        elif sub == "stopall":
+            if not _host_sessions:
+                return await message.channel.send(ui_info("nothing to stop"), delete_after=6)
+            n = len(_host_sessions)
+            for s in list(_host_sessions):
+                cl = s.get("client")
+                if cl:
+                    try: await cl.close()
+                    except Exception: pass
+            _host_sessions.clear()
+            await message.channel.send(ui_ok(f"stopped {n} session(s)"), delete_after=6)
+
+        # host all — spawn every token
+        elif sub == "all":
+            if not HOSTED_TOKENS:
+                return await message.channel.send(ui_warn("no tokens"), delete_after=6)
+            await message.channel.send(ui_info(f"hosting {len(HOSTED_TOKENS)} token(s)..."), delete_after=6)
+            hosted = 0; failed = 0
+            for t in HOSTED_TOKENS:
+                if any(s.get("token") == t for s in _host_sessions):
+                    continue
+                st = await _spawn_one_hosted(t, PREFIX)
+                if not st:
+                    failed += 1; continue
+                _host_sessions.append(st)
+                hosted += 1
+                await asyncio.sleep(0.5)
+            await message.channel.send(ui_ok(f"hosted {hosted}, failed {failed}"), delete_after=10)
+
+        # host say <idx> <msg>
+        elif sub == "say":
+            if len(args) < 4: return await message.channel.send(ui_err("usage: host say <idx> <msg>"), delete_after=6)
+            s = _get_host_session(args[2])
+            if not s: return await message.channel.send(ui_err("no such session"), delete_after=6)
+            ok = await hosted_send_via_client(s, message.channel.id, " ".join(args[3:]))
+            if not ok:
+                ok = await hosted_send(s["token"], message.channel.id, " ".join(args[3:]))
+            await message.channel.send(ui_ok("sent") if ok else ui_err("failed"), delete_after=6)
+
+        # host broadcast <msg>
+        elif sub == "broadcast":
+            if len(args) < 3: return await message.channel.send(ui_err("usage: host broadcast <msg>"), delete_after=6)
+            text = " ".join(args[2:])
+            if not _host_sessions and not HOSTED_TOKENS:
+                return await message.channel.send(ui_warn("no hosted accounts"), delete_after=6)
+            ok = 0; total = 0; failed = 0
+            for s in _host_sessions:
+                total += 1
+                if await hosted_send_via_client(s, message.channel.id, text):
+                    ok += 1
+                else:
+                    failed += 1
+                await asyncio.sleep(0.5)
+            await message.channel.send(ui_ok(f"sent from {ok}/{total}" + (f" ({failed} failed)" if failed else "")), delete_after=10)
+
+        # host clear
+        elif sub == "clear":
+            n = len(HOSTED_TOKENS)
+            for t in list(HOSTED_TOKENS):
+                try: await async_hosted_token_remove(t)
+                except Exception: pass
+            HOSTED_TOKENS.clear()
+            await message.channel.send(ui_ok(f"cleared {n} token(s)"), delete_after=6)
+
+        else:
+            await message.channel.send(build_help_section("host"), delete_after=15)
 
     # SETTINGS
     elif cmd == "prefix":
@@ -3120,110 +3474,6 @@ async def _dispatch_message(_client, message):
         fname = f"exports/archive_{ch.id}.txt"
         with open(fname, "w", encoding="utf-8") as f: f.write("\n".join(reversed(out)))
         await message.channel.send(ui_ok(f"archived {count} → {fname}"), delete_after=8)
-
-    # HOST
-    elif cmd == "host":
-        sub = args[1].lower() if len(args) > 1 else ""
-        if sub == "add":
-            if len(args) < 3: return await message.edit(content=ui_err("usage: host add <token>"))
-            t = args[2].strip().strip('"').strip("'")
-            if t in HOSTED_TOKENS:
-                return await message.edit(content=ui_err("already in hosted list"))
-            uname = await hosted_username(t)
-            if not uname or uname == "?":
-                return await message.edit(content=ui_err("invalid or dead token"))
-            try:
-                await async_hosted_token_add(t, username=uname)
-                HOSTED_TOKENS.append(t)
-                await message.edit(content=ui_ok(f"✓ hosted {uname}"))
-                print(f"[host] added {uname} ({t[:20]}...)")
-            except Exception as e:
-                await message.edit(content=ui_err(f"write failed: {e}"))
-                print(f"[host] error adding token: {e}")
-
-        elif sub == "remove":
-            if len(args) < 3: return await message.edit(content=ui_err("usage: host remove <token_or_index>"))
-            ref = args[2].strip().strip('"').strip("'")
-            target = None
-            if ref.isdigit():
-                idx = int(ref)
-                if 0 <= idx < len(HOSTED_TOKENS): target = HOSTED_TOKENS[idx]
-            elif ref in HOSTED_TOKENS:
-                target = ref
-            if not target:
-                return await message.edit(content=ui_err("not in hosted list"))
-            try:
-                await async_hosted_token_remove(target)
-                HOSTED_TOKENS.remove(target)
-                await message.edit(content=ui_ok("✓ removed"))
-                print("[host] removed token")
-            except Exception as e:
-                await message.edit(content=ui_err(f"delete failed: {e}"))
-                print(f"[host] error removing token: {e}")
-
-        elif sub == "list":
-            if not HOSTED_TOKENS:
-                return await message.edit(content=ui_err("no hosted accounts"))
-            rows = []
-            for i, t in enumerate(HOSTED_TOKENS):
-                uname = await hosted_username(t)
-                rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{uname}{RESET}  {DIM}{t[:20]}...{RESET}")
-            await message.edit(content=_paginate("host", "hosted accounts", rows))
-
-        elif sub == "info":
-            if len(args) < 3 or not args[2].isdigit():
-                return await message.edit(content=ui_err("usage: host info <index>"))
-            idx = int(args[2])
-            if idx >= len(HOSTED_TOKENS):
-                return await message.edit(content=ui_err("index out of range"))
-            t = HOSTED_TOKENS[idx]
-            info = await hosted_info(t)
-            await message.edit(content=ui_box("hosted account", [
-                f"  {DIM}index{RESET}     [{idx}]",
-                f"  {DIM}username{RESET}  {info['username']}",
-                f"  {DIM}id{RESET}        {info['id']}",
-                f"  {DIM}valid{RESET}     {'yes' if info['valid'] else 'no'}",
-                f"  {DIM}token{RESET}     {t[:12]}...{t[-6:]}",
-            ]))
-
-        elif sub == "broadcast":
-            if len(args) < 3: return await message.edit(content=ui_err("usage: host broadcast <msg>"))
-            text = " ".join(args[2:]); ok = 0; failed = 0
-            if not HOSTED_TOKENS:
-                return await message.edit(content=ui_err("no hosted tokens"))
-            for t in HOSTED_TOKENS:
-                try:
-                    if await hosted_send(t, message.channel.id, text):
-                        ok += 1
-                    else:
-                        failed += 1
-                except Exception:
-                    failed += 1
-                await asyncio.sleep(0.5)
-            await message.edit(content=ui_ok(f"sent from {ok}/{len(HOSTED_TOKENS)}" + (f" ({failed} failed)" if failed else "")))
-
-        elif sub == "say":
-            if len(args) < 4: return await message.edit(content=ui_err("usage: host say <idx> <msg>"))
-            try:
-                idx = int(args[2])
-                if idx < 0 or idx >= len(HOSTED_TOKENS):
-                    return await message.edit(content=ui_err(f"index 0–{len(HOSTED_TOKENS)-1}"))
-                t = HOSTED_TOKENS[idx]
-            except ValueError:
-                return await message.edit(content=ui_err("invalid index"))
-            ok = await hosted_send(t, message.channel.id, " ".join(args[3:]))
-            await message.edit(content=ui_ok("sent") if ok else ui_err("failed"))
-
-        elif sub == "clear":
-            count = len(HOSTED_TOKENS)
-            for t in list(HOSTED_TOKENS):
-                try: await async_hosted_token_remove(t)
-                except Exception: pass
-            HOSTED_TOKENS.clear()
-            await message.edit(content=ui_ok(f"cleared {count} hosted account(s)"))
-
-        else:
-            await message.edit(content=build_help_section("host"))
 
     # LASTFM
     elif cmd == "lastfm":
