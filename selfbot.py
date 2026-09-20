@@ -1,8 +1,7 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# sy's selfbot — v2.2.5
+# sy's selfbot — v2.2.6
 
 import discord
-from discord.ext import commands as _cmds_ext
 import asyncio
 import aiohttp
 import json
@@ -42,7 +41,7 @@ try:
     print("[boot] selfbot_ipc loaded")
 except ImportError as _e:
     print(f"[boot] selfbot_ipc NOT found ({_e}) — IPC server disabled")
-    async def start_ipc_server(_globals):
+    def start_ipc_server(_globals):
         print("[ipc] start_ipc_server called but IPC is unavailable")
 
 try:
@@ -155,7 +154,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.5"
+VERSION = "2.2.6"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -568,42 +567,35 @@ HELP_DATA = {
         ("interact clear","clear pending interactions"),
     ],
     "rpc": [
-        ("rpc1 <name|details|state|type|platform>","slot 1 rich presence"),
-        ("rpc1 name <text>","set slot 1 activity name"),
-        ("rpc1 details <text>","set slot 1 details line"),
-        ("rpc1 state <text>","set slot 1 state line"),
-        ("rpc1 type <type>","playing/streaming/listening/watching/competing/purplestream"),
-        ("rpc1 platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta"),
-        ("rpc1 large_image <url>","set slot 1 large image"),
-        ("rpc1 small_image <url>","set slot 1 small image"),
-        ("rpc1 timestamp <val>","3600 | 1:00:00 | clear"),
-        ("rpc1 btn1 <label> <url>","slot 1 first button"),
-        ("rpc1 btn2 <label> <url>","slot 1 second button"),
-        ("rpc1 spotify <song - artist>","slot 1 spotify presence"),
-        ("rpc1 youtube <video - channel>","slot 1 youtube presence"),
-        ("rpc1 xbox <game - details>","slot 1 xbox presence"),
-        ("rpc1 ps <game - details>","slot 1 playstation presence"),
-        ("rpc1 ps4 <game - details>","slot 1 ps4 presence"),
-        ("rpc1 crunchy <anime - ep>","slot 1 crunchyroll presence"),
-        ("rpc1 clear","clear slot 1"),
-        ("rpc2..rpc6 ...","same for slots 2–6"),
-        ("spotify <song - artist> [slot]","quick spotify to slot"),
-        ("youtube <video - channel> [slot]","quick youtube to slot"),
-        ("xbox <game - details> [slot]","quick xbox to slot"),
-        ("ps <game - details> [slot]","quick playstation to slot"),
-        ("ps4 <game - details> [slot]","quick ps4 to slot"),
-        ("crunchy <anime - ep> [slot]","quick crunchyroll to slot"),
+        ("rpc <1-6> <field> <value>","set a rich presence slot"),
+        ("rpc <slot> name <text>","activity name"),
+        ("rpc <slot> details <text>","details line"),
+        ("rpc <slot> state <text>","state line"),
+        ("rpc <slot> type <type>","playing/streaming/listening/watching/competing/purplestream"),
+        ("rpc <slot> platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta"),
+        ("rpc <slot> large_image <url>","large image"),
+        ("rpc <slot> small_image <url>","small image"),
+        ("rpc <slot> large_text <text>","large image hover text"),
+        ("rpc <slot> small_text <text>","small image hover text"),
+        ("rpc <slot> timestamp <val>","3600 | 1:00:00 | clear"),
+        ("rpc <slot> btn1 <label> <url>","first button"),
+        ("rpc <slot> btn2 <label> <url>","second button"),
+        ("rpc <slot> clear","wipe that slot"),
+        ("rpc status","show all 6 slots"),
+        ("rpc clearall","wipe every slot"),
+        ("spotify <song - artist> [slot]","quick spotify presence"),
+        ("youtube <video - channel> [slot]","quick youtube presence"),
+        ("xbox <game - details> [slot]","quick xbox presence"),
+        ("ps <game - details> [slot]","quick playstation presence"),
+        ("ps4 <game - details> [slot]","quick ps4 presence"),
+        ("crunchy <anime - ep> [slot]","quick crunchyroll presence"),
         ("vrchat <state - world> [slot]","quick vrchat presence"),
         ("meta <state - world> [slot] [image]","quick meta quest presence"),
-        ("playing <text>","simple playing activity"),("listening <text>","simple listening activity"),
-        ("watching <text>","simple watching activity"),("competing <text>","simple competing activity"),
-        ("stopactivity","clear current activity"),("setstatus <status>","online/dnd/idle/invisible"),
-        ("aoff","quick activity off"),
-        ("clear_multi_rpc","wipe all 6 rpc slots"),
-        ("rpc_status","show all 6 rpc slots"),
-        ("rstatus <s1, s2, ...>","rotate custom statuses"),
-        ("remoji <e1, e2, ...>","rotate custom status emojis"),
-        ("stopstatus","stop status rotation"),("stopemoji","stop emoji rotation"),
+        ("playing <text>","simple playing activity"),
+        ("listening <text>","simple listening activity"),
+        ("watching <text>","simple watching activity"),
+        ("competing <text>","simple competing activity"),
+        ("stopactivity","clear current activity"),
     ],
 }
 
@@ -657,10 +649,9 @@ def build_help_section(cat, page=1):
 # ─────────────────────────────────────────────
 
 client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
-_MAIN_CLIENT = client   # explicit reference for places that must use the primary gateway
+_MAIN_CLIENT = client
 
-# RPC cog shim — a commands.Bot that hosts the RPC cog.
-rpc_host = _cmds_ext.Bot(command_prefix=PREFIX, self_bot=True, help_command=None)
+# RPC cog — plain class, no commands.Bot. Loaded in on_ready.
 RPC_COG = None
 
 AUTO_RESPONSES = {}
@@ -828,7 +819,7 @@ HOSTED_TOKENS: list[str] = []
 # ─────────────────────────────────────────────
 
 _hosted_clients: list[discord.Client] = []
-_hosted_spawned = False   # guard against re-spawning on reconnect
+_hosted_spawned = False
 
 async def _run_hosted_client(hc, tok):
     try:
@@ -838,7 +829,6 @@ async def _run_hosted_client(hc, tok):
         traceback.print_exc()
 
 async def _spawn_hosted_clients():
-    """Log each hosted token into the gateway and wire it to the shared dispatcher."""
     global _hosted_spawned
     if _hosted_spawned:
         return
@@ -1582,7 +1572,6 @@ async def _monitor_log(guild, title, body):
     except Exception: pass
 
 def _perm_check(cmd, message):
-    # Hosted clients own their own commands — never block them on whitelist.
     for hc in _hosted_clients:
         try:
             if hc.user and hc.user.id == message.author.id:
@@ -1699,24 +1688,28 @@ async def _load_rpc_cog():
     global RPC_COG
     try:
         import importlib.util
+        if not os.path.exists("cogs/rpc.py"):
+            print("[RPC] cogs/rpc.py MISSING — push the file to the repo.")
+            return
         spec = importlib.util.spec_from_file_location("cogs.rpc", "cogs/rpc.py")
         if spec is None or spec.loader is None:
-            print("[RPC] cogs/rpc.py not found — skipping")
+            print("[RPC] cogs/rpc.py could not be loaded")
             return
         mod = importlib.util.module_from_spec(spec)
         sys.modules["cogs.rpc"] = mod
-        spec.loader.exec_module(mod)
-        cog = mod.RPCCog(rpc_host)
         try:
-            rpc_host._connection = client._connection
+            spec.loader.exec_module(mod)
         except Exception as e:
-            print(f"[RPC] could not bind connection: {e}")
-        await rpc_host.add_cog(cog)
+            print(f"[RPC] cogs/rpc.py failed to exec: {e}")
+            traceback.print_exc()
+            return
+        cog = mod.RPCCog(_MAIN_CLIENT)
         RPC_COG = cog
         try:
             await cog.on_ready()
         except Exception as e:
             print(f"[RPC] on_ready failed: {e}")
+            traceback.print_exc()
         print("[RPC] cog loaded")
     except Exception as e:
         print(f"[RPC] load failed: {e}")
@@ -1732,15 +1725,12 @@ async def on_ready():
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
 
-    # Main client has no _bot_index — that's how we know it's the primary.
     is_main = not hasattr(client, "_bot_index")
     idx = getattr(client, "_bot_index", "main")
     print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
 
-    # Load hosted tokens
     await load_hosted_tokens_async()
 
-    # Spawn hosted gateway clients (only from the main client, once)
     if is_main and not _hosted_spawned:
         asyncio.create_task(_spawn_hosted_clients())
 
@@ -1754,7 +1744,6 @@ async def on_ready():
     triggers_load()
     tasks_load()
 
-    # ── IPC global state (once per session) ──
     if is_main and not globals().get("_ipc_initialized"):
         print("[ipc] initializing global state...")
         globals()["_ipc_initialized"] = True
@@ -1788,7 +1777,6 @@ async def on_ready():
         globals()["_autoquest_enabled"] = cfg.get("autoquest_enabled", False)
         globals()["_custom_status"] = None
 
-    # ── Start IPC server (once, in background) ──
     if is_main and not globals().get("_ipc_server_started"):
         globals()["_ipc_server_started"] = True
         try:
@@ -1800,7 +1788,6 @@ async def on_ready():
         except Exception as e:
             print(f"[ipc] ✗ failed to start: {e}")
 
-    # ── Task management ──
     if not any("scheduler" in str(t) for t in asyncio.all_tasks()):
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
@@ -1811,7 +1798,6 @@ async def on_ready():
         for i in range(_queue_workers):
             _queue_worker_tasks.append(asyncio.create_task(_queue_worker(f"w{i}")))
 
-    # ── Guild invites caching ──
     try:
         for g in client.guilds:
             if not _monitor["invites"]:
@@ -1823,13 +1809,11 @@ async def on_ready():
     except Exception:
         pass
 
-    # ── Sync config ──
     try:
         sync_local_to_supabase()
     except Exception as e:
         print(f"[db] sync error: {e}")
 
-    # ── Load RPC cog once ──
     if is_main and RPC_COG is None:
         await _load_rpc_cog()
 
@@ -1846,11 +1830,8 @@ async def on_resumed():
     _session_events.append({"ts": time.time(), "event": "resumed"})
 
 async def _dispatch_message(_client, message):
-    # Local alias — every unqualified `client.*` inside this function refers
-    # to the caller. Lets hosted clients reuse the same command table.
     client = _client
 
-    # ── ALL GLOBALS HOISTED TO THE TOP ──
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
     global _autoreact_emoji, _autoaddback, _current_platform
@@ -1869,16 +1850,19 @@ async def _dispatch_message(_client, message):
     global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
     global _managed_tasks, _multireact_enabled
 
-    # ── RPC COG FORWARDING (main client only) ──
-    # Hosted clients run their own copy of this dispatcher; letting them also
-    # forward into rpc_host double-processes messages and deadlocks pagination.
+    # ── RPC COG DISPATCH (main client only) ──
     if RPC_COG is not None and _client is _MAIN_CLIENT:
-        try:
-            rpc_host.command_prefix = PREFIX   # keep the shim in sync with runtime prefix
-            rpc_host._connection.user = _MAIN_CLIENT.user
-            await rpc_host.process_commands(message)
-        except Exception as e:
-            print(f"[rpc dispatch] {e}")
+        if message.content and message.content.startswith(PREFIX):
+            _raw = message.content[len(PREFIX):].strip()
+            _args = _raw.split()
+            _cmd = _args[0].lower() if _args else ""
+            if _cmd in RPC_COG.COMMANDS:
+                try:
+                    await RPC_COG.handle(message, _cmd, _args[1:])
+                except Exception as e:
+                    print(f"[rpc dispatch] {e}")
+                    traceback.print_exc()
+                return
 
     if LOGGER_ENABLED and message.guild:
         try: log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | {message.author}: {message.content[:100]}")
@@ -1987,20 +1971,8 @@ async def _dispatch_message(_client, message):
     args = raw.split()
     cmd = args[0].lower() if args else ""
 
-    # ── RPC COG COMMANDS — main client only ──
-    # Hosted clients have no RPC cog, so they fall through and handle these
-    # via the local dispatcher (which will say the command doesn't exist).
-    if RPC_COG is not None and _client is _MAIN_CLIENT:
-        rpc_cmds = {
-            "rpc1","rpc2","rpc3","rpc4","rpc5","rpc6",
-            "spotify","youtube","xbox","ps","ps4","crunchy","vrchat","meta",
-            "playing","listening","listen","watching","watch","competing",
-            "stopactivity","aoff",
-            "clear_multi_rpc","rpc_status",
-            "rstatus","remoji","stopstatus","stopemoji",
-        }
-        if cmd in rpc_cmds:
-            return
+    if RPC_COG is not None and cmd in RPC_COG.COMMANDS:
+        return
 
     if cmd in _aliases: cmd = _aliases[cmd]
 
