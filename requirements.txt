@@ -3,3 +3,4 @@ cryptography
 aiohttp
 PyNaCl
 modifyself==0.4.1
+supabase
