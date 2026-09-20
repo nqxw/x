@@ -1,8 +1,7 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
 # sy's selfbot — v2.2.6
 
-import modifyself
-import discord
+import modifyself_compat as discord
 import asyncio
 import aiohttp
 import json
