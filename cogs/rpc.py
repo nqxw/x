@@ -3,6 +3,7 @@ import discord
 import asyncio
 import time
 import re
+import os
 import json
 import io
 import aiohttp
@@ -58,7 +59,7 @@ class RPCCog:
         self._interceptor_active = False
         self._clearing = False
         self._ready = False
-        self._asset_channel = None   # cached DM channel for asset uploads
+        self._asset_channel = None
 
     # ── lifecycle ────────────────────────────────────
 
@@ -240,69 +241,39 @@ class RPCCog:
         return float(value) * 3600
 
     async def _get_asset_channel(self):
-        """Return a DM channel belonging to the bot for asset storage.
+        """Return a text channel for asset storage.
 
-        `ClientUser.create_dm()` exists on newer discord.py-self but the
-        attribute lookup can fail on the proxy object the library exposes.
-        Fetch the bot's own User via the HTTP cache and open the DM from there.
+        Discord blocks self-DMs (error code 50007), so a DM channel owned
+        by the bot is not usable as a scratch sink. Set RPC_ASSET_CHANNEL_ID
+        to any private text channel the account can post in.
         """
         if self._asset_channel is not None:
             return self._asset_channel
 
-        # Preferred path: ClientUser.dm_channel already exists
-        cu = self.client.user
-        if cu is not None and getattr(cu, "dm_channel", None):
-            self._asset_channel = cu.dm_channel
-            return self._asset_channel
+        raw = os.environ.get("RPC_ASSET_CHANNEL_ID", "").strip()
+        if not raw:
+            print("[RPC] RPC_ASSET_CHANNEL_ID not set — asset upload disabled")
+            return None
+        try:
+            ch_id = int(raw)
+        except ValueError:
+            print(f"[RPC] RPC_ASSET_CHANNEL_ID invalid: {raw!r}")
+            return None
 
-        # Try create_dm on the ClientUser object (no arguments — returns own DM)
-        if cu is not None and hasattr(cu, "create_dm"):
+        ch = self.client.get_channel(ch_id)
+        if ch is None:
             try:
-                self._asset_channel = await cu.create_dm()
-                return self._asset_channel
-            except TypeError:
-                # Older signature confusion — fall through
-                pass
+                ch = await self.client.fetch_channel(ch_id)
             except Exception as e:
-                print(f"[RPC] ClientUser.create_dm failed: {e}")
+                print(f"[RPC] fetch_channel({ch_id}) failed: {e}")
+                return None
 
-        # Fallback: fetch own User via the client cache and open from there
-        try:
-            me = await self.client.fetch_user(self.client.user.id)
-            if hasattr(me, "create_dm"):
-                self._asset_channel = await me.create_dm()
-                return self._asset_channel
-            if getattr(me, "dm_channel", None):
-                self._asset_channel = me.dm_channel
-                return self._asset_channel
-        except Exception as e:
-            print(f"[RPC] fetch_user fallback failed: {e}")
+        if ch is None:
+            print(f"[RPC] channel {ch_id} not accessible")
+            return None
 
-        # Last resort: raw HTTP — open the DM channel with the bot's own id
-        try:
-            h = {
-                "Authorization": self.client.http.token,
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "discord/1.0.9044 Chrome/120.0.6099.291 "
-                              "Electron/28.2.10 Safari/537.36",
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.post("https://discord.com/api/v9/users/@me/channels",
-                                  headers=h, json={"recipient_id": str(self.client.user.id)}) as r:
-                    if r.status in (200, 201):
-                        data = await r.json()
-                        ch_id = int(data["id"])
-                        self._asset_channel = self.client.get_channel(ch_id) or \
-                            await self.client.fetch_channel(ch_id)
-                        return self._asset_channel
-                    else:
-                        print(f"[RPC] raw create_dm returned {r.status}")
-        except Exception as e:
-            print(f"[RPC] raw create_dm failed: {e}")
-
-        return None
+        self._asset_channel = ch
+        return ch
 
     async def upload_asset(self, image_url: str):
         if not image_url:
@@ -318,20 +289,21 @@ class RPCCog:
                 self._asset_cache[image_url] = key
                 return key
 
-            self_dm = await self._get_asset_channel()
-            if self_dm is None:
+            sink = await self._get_asset_channel()
+            if sink is None:
                 print("[RPC] asset upload failed: no asset channel available")
                 return None
 
             async with aiohttp.ClientSession() as s:
                 async with s.get(image_url) as r:
                     if r.status != 200:
+                        print(f"[RPC] asset fetch status {r.status}")
                         return None
                     img_bytes = await r.read()
                     filename = image_url.split("/")[-1].split("?")[0]
                     if "." not in filename or len(filename) > 50:
                         filename = "asset.png"
-                    msg = await self_dm.send(
+                    msg = await sink.send(
                         file=discord.File(io.BytesIO(img_bytes), filename=filename))
                     if msg.attachments:
                         new_url = msg.attachments[0].url
@@ -341,6 +313,8 @@ class RPCCog:
                             key = f"mp:attachments/{cid}/{aid}/{fname}"
                             self._asset_cache[image_url] = key
                             return key
+                        self._asset_cache[image_url] = new_url
+                        return new_url
         except Exception as e:
             print(f"[RPC] asset upload failed: {e}")
         return None
