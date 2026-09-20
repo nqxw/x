@@ -1,6 +1,7 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
 # sy's selfbot — v2.2.6
 
+import modifyself
 import discord
 import asyncio
 import aiohttp
@@ -1126,8 +1127,40 @@ async def _api(session, method, url, headers=None, json_body=None, retries=3):
         raise last
     return {}
 
-SUPPORTED_TASKS = ("WATCH_VIDEO","WATCH_VIDEO_ON_MOBILE","PLAY_ON_DESKTOP",
-                   "PLAY_ON_DESKTOP_V2","PLAY_ACTIVITY","STREAM_ON_DESKTOP")
+# Standard tasks (video/stream/play)
+SUPPORTED_TASKS = (
+    "WATCH_VIDEO",
+    "WATCH_VIDEO_ON_MOBILE",
+    "PLAY_ON_DESKTOP",
+    "PLAY_ON_DESKTOP_V2",
+    "PLAY_ACTIVITY",
+    "STREAM_ON_DESKTOP",
+    # Mission/collect quest tasks (Runescape, Forgotten Island, etc)
+    "COLLECT_ITEM",
+    "COLLECT",
+    "MISSION_COMPLETE",
+    "COMPLETE_QUEST",
+    "COMPLETE_ACTIVITY",
+    "EXTERNAL_TASK",
+    "LAUNCH_GAME",
+    "LAUNCH_QUEST",
+)
+
+# Tasks handled via video-progress endpoint
+VIDEO_TASKS = ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE")
+
+# Tasks handled via heartbeat endpoint
+HEARTBEAT_TASKS = (
+    "PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2",
+    "PLAY_ACTIVITY", "STREAM_ON_DESKTOP",
+)
+
+# Mission/external tasks — use dedicated progress push + heartbeat combo
+MISSION_TASKS = (
+    "COLLECT_ITEM", "COLLECT", "MISSION_COMPLETE",
+    "COMPLETE_QUEST", "COMPLETE_ACTIVITY",
+    "EXTERNAL_TASK", "LAUNCH_GAME", "LAUNCH_QUEST",
+)
 
 class QuestRecord:
     def __init__(self, data):
@@ -1160,15 +1193,20 @@ class QuestRecord:
     def expires_at(self): return self.cfg.get("expires_at") or ""
     def is_completed(self): return bool(self.user_status.get("completed_at"))
     def is_enrolled(self): return bool(self.user_status.get("enrolled_at"))
-    def is_supported(self): return self.selected_task in SUPPORTED_TASKS
+    def is_supported(self): return self.selected_task in SUPPORTED_TASKS or self.selected_task in MISSION_TASKS
     def progress_value(self):
         p = self.user_status.get("progress", {}).get(self.selected_task, {})
         return float(p.get("value", 0) or 0) if p else 0.0
     def progress_pct(self):
         return min(100, int(self.progress_value() / self.target * 100)) if self.target else 0
     def _pick(self):
+        # Prefer known supported tasks first
         for t in SUPPORTED_TASKS:
             if t in self.tasks: return t
+        # Then mission/external tasks
+        for t in MISSION_TASKS:
+            if t in self.tasks: return t
+        # Fall back to whatever is in the task config
         return next(iter(self.tasks.keys()), "UNKNOWN")
 
 class QuestService:
@@ -1199,11 +1237,26 @@ class QuestService:
         if not quest.is_enrolled(): await self.enroll(session, quest)
         if not quest.is_supported(): return "unsupported"
         task = quest.selected_task
-        if task in ("WATCH_VIDEO","WATCH_VIDEO_ON_MOBILE"): return await self._video(session, quest)
+
+        # Video tasks (watch video quests)
+        if task in VIDEO_TASKS:
+            return await self._video(session, quest)
+
+        # Standard heartbeat tasks (play on desktop / stream)
+        if task in HEARTBEAT_TASKS:
+            payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
+            if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
+            if task == "PLAY_ACTIVITY":
+                payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
+            return await self._heartbeat(session, quest, payloads)
+
+        # Mission/collect/external quests (Runescape, Forgotten Island, etc)
+        if task in MISSION_TASKS or task not in (*VIDEO_TASKS, *HEARTBEAT_TASKS):
+            return await self._mission(session, quest)
+
+        # Fallback
         payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
         if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
-        if task == "PLAY_ACTIVITY":
-            payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
         return await self._heartbeat(session, quest, payloads)
     async def _video(self, session, quest):
         interval = 2.0
@@ -1222,6 +1275,90 @@ class QuestService:
                 break
             await asyncio.sleep(interval)
         return "completed" if quest.is_completed() or quest.progress_value() >= quest.target else "recovering"
+    async def _mission(self, session, quest):
+        """
+        Handle mission/collect/external quests (Runescape Dragonwilds, Forgotten Island, etc).
+        These quests use a combination of:
+        1. Direct progress push via video-progress endpoint (simulates completion progress)
+        2. Heartbeat with application_id payload (for game-linked quests)
+        3. External task progress endpoint
+        Strategy: try all approaches, return completed if any works.
+        """
+        task = quest.selected_task
+        print(f"[Quest] mission task: {task} | quest: {quest.name}")
+
+        # Strategy 1: Try video-progress simulation
+        # Some mission quests accept video-progress calls to push progress
+        try:
+            target = quest.target or 1.0
+            for ts in [target * 0.25, target * 0.5, target * 0.75, target]:
+                try:
+                    d = await _api(session, "POST",
+                        f"https://discord.com/api/v9/quests/{quest.id}/video-progress",
+                        headers=self.headers, json_body={"timestamp": float(ts)}, retries=2)
+                    if d: quest.data["user_status"] = d
+                    if quest.is_completed(): return "completed"
+                    await asyncio.sleep(1.5)
+                except APIError as e:
+                    if e.status not in (400, 404): raise
+                    break
+        except Exception as e:
+            print(f"[Quest] video-progress attempt: {e}")
+
+        if quest.is_completed(): return "completed"
+
+        # Strategy 2: Heartbeat with application_id (for game-linked mission quests)
+        payloads = []
+        if quest.app_id:
+            payloads.append({"application_id": quest.app_id, "terminal": False})
+        payloads.append({"stream_key": f"call:{quest.id}:1", "terminal": False})
+        if self.uid:
+            payloads.append({"stream_key": f"call:{self.uid}:1", "terminal": False})
+
+        # Send heartbeats for up to 60 seconds
+        end_time = datetime.now(timezone.utc).timestamp() + 60
+        while datetime.now(timezone.utc).timestamp() < end_time:
+            for p in payloads:
+                try:
+                    d = await _api(session, "POST",
+                        f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                        headers=self.headers, json_body=p, retries=1)
+                    if d: quest.data["user_status"] = d
+                    if quest.is_completed(): break
+                except APIError: continue
+            if quest.is_completed(): break
+            await asyncio.sleep(5)
+
+        if quest.is_completed(): return "completed"
+
+        # Strategy 3: Try external-task progress endpoint
+        try:
+            d = await _api(session, "POST",
+                f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
+                headers=self.headers,
+                json_body={
+                    "task_id": task,
+                    "progress": {"value": quest.target or 1},
+                }, retries=2)
+            if d: quest.data["user_status"] = d
+        except APIError as e:
+            print(f"[Quest] external-task-progress: {e.status}")
+        except Exception as e:
+            print(f"[Quest] external-task-progress error: {e}")
+
+        if quest.is_completed(): return "completed"
+
+        # Strategy 4: Send terminal heartbeat to finalize
+        for p in payloads:
+            try:
+                terminal = dict(p); terminal["terminal"] = True
+                await _api(session, "POST",
+                    f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                    headers=self.headers, json_body=terminal, retries=1)
+            except Exception: pass
+
+        return "completed" if quest.is_completed() else "recovering"
+
     async def _heartbeat(self, session, quest, payloads):
         interval = 15
         active = payloads[0]
@@ -2554,7 +2691,14 @@ async def _dispatch_message(_client, message):
         if not quests: return await message.channel.send(ui_err("no quests"), delete_after=8)
         rows = []
         for i, q in enumerate(quests):
-            tag = f"{GREEN}done{RESET}" if q.is_completed() else (f"{CYAN}ok{RESET}" if q.is_supported() else f"{RED}unsupported{RESET}")
+            if q.is_completed():
+                tag = f"{GREEN}done{RESET}"
+            elif q.selected_task in MISSION_TASKS:
+                tag = f"{YELLOW}mission{RESET}"
+            elif q.is_supported():
+                tag = f"{CYAN}ok{RESET}"
+            else:
+                tag = f"{RED}unsupported{RESET}"
             rows.append(f"  {GREY}[{i}]{RESET} {WHITE}{q.name}{RESET}  {tag}")
             rows.append(f"       {ui_progress(q.reward, q.progress_pct())}")
         await message.channel.send(_paginate("quests", "active", rows))
