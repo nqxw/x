@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# sy's selfbot — v2.2.4
+# sy's selfbot — v2.2.5
 
 import discord
 from discord.ext import commands as _cmds_ext
@@ -155,7 +155,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.4"
+VERSION = "2.2.5"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -1869,9 +1869,12 @@ async def _dispatch_message(_client, message):
     global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
     global _managed_tasks, _multireact_enabled
 
-    # ── RPC COG FORWARDING ──
-    if RPC_COG is not None:
+    # ── RPC COG FORWARDING (main client only) ──
+    # Hosted clients run their own copy of this dispatcher; letting them also
+    # forward into rpc_host double-processes messages and deadlocks pagination.
+    if RPC_COG is not None and _client is _MAIN_CLIENT:
         try:
+            rpc_host.command_prefix = PREFIX   # keep the shim in sync with runtime prefix
             rpc_host._connection.user = _MAIN_CLIENT.user
             await rpc_host.process_commands(message)
         except Exception as e:
@@ -1984,8 +1987,10 @@ async def _dispatch_message(_client, message):
     args = raw.split()
     cmd = args[0].lower() if args else ""
 
-    # ── RPC COG COMMANDS SKIP THE LOCAL DISPATCHER ──
-    if RPC_COG is not None:
+    # ── RPC COG COMMANDS — main client only ──
+    # Hosted clients have no RPC cog, so they fall through and handle these
+    # via the local dispatcher (which will say the command doesn't exist).
+    if RPC_COG is not None and _client is _MAIN_CLIENT:
         rpc_cmds = {
             "rpc1","rpc2","rpc3","rpc4","rpc5","rpc6",
             "spotify","youtube","xbox","ps","ps4","crunchy","vrchat","meta",
