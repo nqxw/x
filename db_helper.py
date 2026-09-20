@@ -1,36 +1,4 @@
 # db_helper.py | Python 3.10+ | supabase-py 2.x
-# Supabase-backed storage for selfbot.py
-# Replaces: config.json, HOSTED_TOKENS list, and per-user data in /data/*.json
-#
-# Schema (run once in Supabase SQL editor):
-# ─────────────────────────────────────────────────────────────────────────────
-# CREATE TABLE IF NOT EXISTS selfbot_config (
-#     key   TEXT PRIMARY KEY,
-#     value JSONB NOT NULL,
-#     updated_at TIMESTAMPTZ DEFAULT now()
-# );
-#
-# CREATE TABLE IF NOT EXISTS hosted_tokens (
-#     id         BIGSERIAL PRIMARY KEY,
-#     token      TEXT UNIQUE NOT NULL,
-#     username   TEXT,
-#     user_id    TEXT,
-#     added_at   TIMESTAMPTZ DEFAULT now(),
-#     active     BOOLEAN DEFAULT TRUE
-# );
-#
-# CREATE TABLE IF NOT EXISTS sessions (
-#     session_token TEXT PRIMARY KEY,
-#     discord_token TEXT NOT NULL,
-#     user_id       TEXT NOT NULL,
-#     username      TEXT,
-#     global_name   TEXT,
-#     avatar        TEXT,
-#     state         JSONB DEFAULT '{}'::jsonb,
-#     connected_at  TIMESTAMPTZ DEFAULT now(),
-#     last_seen     TIMESTAMPTZ DEFAULT now()
-# );
-# ─────────────────────────────────────────────────────────────────────────────
 
 import os
 import json
