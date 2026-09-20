@@ -1,7 +1,6 @@
-# selfbot.py | Python 3.10+ | discord.py-self + aiohttp
+# selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
 # sy's selfbot — v2.2.6
 
-import modifyself
 import discord
 import asyncio
 import aiohttp
@@ -35,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 HAS_IPC = False
 HAS_DB = False
+HAS_HCAPTCHA = False
 
 try:
     from selfbot_ipc import start_ipc_server
@@ -120,6 +120,16 @@ except ImportError as _e:
 
     async def async_hosted_token_remove(token):
         hosted_token_remove(token)
+
+# ── hcaptcha-challenger ──────────────────────
+try:
+    from hcaptcha_challenger.agent import AgentV, AgentConfig
+    HAS_HCAPTCHA = True
+    print("[boot] hcaptcha-challenger loaded — autoclaim captcha solver active")
+except ImportError as _e:
+    print(f"[boot] hcaptcha-challenger NOT found ({_e}) — autoclaim will fail on captcha")
+    AgentV = None
+    AgentConfig = None
 
 # ─────────────────────────────────────────────
 # BOOTSTRAP
@@ -231,8 +241,8 @@ HELP_DATA = {
     "quests": [
         ("quest","list active quests + progress"),("questrun <index>","solve specific quest"),
         ("questall","solve all quests at once"),("autoquest on/off","auto-run quests on startup"),
-        ("autoclaim on/off","auto-claim completed quests"),("orbbadge","claim orb badge"),
-        ("captcha set <key>","set 2captcha api key"),
+        ("autoclaim on/off","auto-claim completed quests"),("autoclaim run","sweep and claim now"),
+        ("orbbadge","claim orb badge"),
     ],
     "sniper": [
         ("sniper on/off","toggle nitro gift sniper"),("logger on/off","toggle message logger"),
@@ -1162,6 +1172,84 @@ MISSION_TASKS = (
     "EXTERNAL_TASK", "LAUNCH_GAME", "LAUNCH_QUEST",
 )
 
+# Discord's hcaptcha sitekey for shop/quest endpoints
+DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
+
+# hcaptcha-challenger agent — lazy singleton
+_hcaptcha_agent = None
+_hcaptcha_lock = asyncio.Lock()
+
+
+async def _get_hcaptcha_agent():
+    global _hcaptcha_agent
+    if _hcaptcha_agent is not None:
+        return _hcaptcha_agent
+    if not HAS_HCAPTCHA:
+        return None
+    async with _hcaptcha_lock:
+        if _hcaptcha_agent is not None:
+            return _hcaptcha_agent
+        try:
+            config = AgentConfig(
+                DISABLE_ANONYMIZED_TELEMETRY=True,
+                user_data_dir=os.path.abspath("data/hcaptcha_profile"),
+                HEADLESS=True,
+            )
+            _hcaptcha_agent = AgentV(config=config)
+            print("[hcaptcha] agent initialized")
+        except Exception as e:
+            print(f"[hcaptcha] agent init failed: {e}")
+            traceback.print_exc()
+            _hcaptcha_agent = None
+        return _hcaptcha_agent
+
+
+async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None) -> str | None:
+    """Solve an hCaptcha challenge via hcaptcha-challenger. Returns token or None."""
+    if not HAS_HCAPTCHA:
+        print("[hcaptcha] library not available")
+        return None
+
+    agent = await _get_hcaptcha_agent()
+    if agent is None:
+        print("[hcaptcha] agent unavailable")
+        return None
+
+    try:
+        payload = {
+            "sitekey": sitekey,
+            "url": url,
+            "rqdata": rqdata or "",
+            "type": "hsl",
+        }
+        print(f"[hcaptcha] solving challenge for {sitekey} ({url})")
+        async with _hcaptcha_lock:
+            captcha_resp = await agent.solve(payload)
+
+        token = None
+        if captcha_resp is not None:
+            if hasattr(captcha_resp, "generated_pass_UUID"):
+                token = captcha_resp.generated_pass_UUID
+            elif hasattr(captcha_resp, "token"):
+                token = captcha_resp.token
+            elif isinstance(captcha_resp, dict):
+                token = (captcha_resp.get("generated_pass_UUID")
+                         or captcha_resp.get("token")
+                         or captcha_resp.get("response"))
+            elif isinstance(captcha_resp, str):
+                token = captcha_resp
+
+        if token:
+            print(f"[hcaptcha] solved — token {str(token)[:24]}...")
+            return token
+        print("[hcaptcha] solver returned no token")
+        return None
+    except Exception as e:
+        print(f"[hcaptcha] solve failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return None
+
+
 class QuestRecord:
     def __init__(self, data):
         self.data = data
@@ -1192,6 +1280,7 @@ class QuestRecord:
     @property
     def expires_at(self): return self.cfg.get("expires_at") or ""
     def is_completed(self): return bool(self.user_status.get("completed_at"))
+    def is_claimed(self): return bool(self.user_status.get("claimed_at"))
     def is_enrolled(self): return bool(self.user_status.get("enrolled_at"))
     def is_supported(self): return self.selected_task in SUPPORTED_TASKS or self.selected_task in MISSION_TASKS
     def progress_value(self):
@@ -1200,13 +1289,10 @@ class QuestRecord:
     def progress_pct(self):
         return min(100, int(self.progress_value() / self.target * 100)) if self.target else 0
     def _pick(self):
-        # Prefer known supported tasks first
         for t in SUPPORTED_TASKS:
             if t in self.tasks: return t
-        # Then mission/external tasks
         for t in MISSION_TASKS:
             if t in self.tasks: return t
-        # Fall back to whatever is in the task config
         return next(iter(self.tasks.keys()), "UNKNOWN")
 
 class QuestService:
@@ -1238,11 +1324,9 @@ class QuestService:
         if not quest.is_supported(): return "unsupported"
         task = quest.selected_task
 
-        # Video tasks (watch video quests)
         if task in VIDEO_TASKS:
             return await self._video(session, quest)
 
-        # Standard heartbeat tasks (play on desktop / stream)
         if task in HEARTBEAT_TASKS:
             payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
             if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
@@ -1250,11 +1334,9 @@ class QuestService:
                 payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
             return await self._heartbeat(session, quest, payloads)
 
-        # Mission/collect/external quests (Runescape, Forgotten Island, etc)
         if task in MISSION_TASKS or task not in (*VIDEO_TASKS, *HEARTBEAT_TASKS):
             return await self._mission(session, quest)
 
-        # Fallback
         payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
         if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
         return await self._heartbeat(session, quest, payloads)
@@ -1276,19 +1358,9 @@ class QuestService:
             await asyncio.sleep(interval)
         return "completed" if quest.is_completed() or quest.progress_value() >= quest.target else "recovering"
     async def _mission(self, session, quest):
-        """
-        Handle mission/collect/external quests (Runescape Dragonwilds, Forgotten Island, etc).
-        These quests use a combination of:
-        1. Direct progress push via video-progress endpoint (simulates completion progress)
-        2. Heartbeat with application_id payload (for game-linked quests)
-        3. External task progress endpoint
-        Strategy: try all approaches, return completed if any works.
-        """
         task = quest.selected_task
         print(f"[Quest] mission task: {task} | quest: {quest.name}")
 
-        # Strategy 1: Try video-progress simulation
-        # Some mission quests accept video-progress calls to push progress
         try:
             target = quest.target or 1.0
             for ts in [target * 0.25, target * 0.5, target * 0.75, target]:
@@ -1307,7 +1379,6 @@ class QuestService:
 
         if quest.is_completed(): return "completed"
 
-        # Strategy 2: Heartbeat with application_id (for game-linked mission quests)
         payloads = []
         if quest.app_id:
             payloads.append({"application_id": quest.app_id, "terminal": False})
@@ -1315,7 +1386,6 @@ class QuestService:
         if self.uid:
             payloads.append({"stream_key": f"call:{self.uid}:1", "terminal": False})
 
-        # Send heartbeats for up to 60 seconds
         end_time = datetime.now(timezone.utc).timestamp() + 60
         while datetime.now(timezone.utc).timestamp() < end_time:
             for p in payloads:
@@ -1331,15 +1401,12 @@ class QuestService:
 
         if quest.is_completed(): return "completed"
 
-        # Strategy 3: Try external-task progress endpoint
         try:
             d = await _api(session, "POST",
                 f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
                 headers=self.headers,
-                json_body={
-                    "task_id": task,
-                    "progress": {"value": quest.target or 1},
-                }, retries=2)
+                json_body={"task_id": task, "progress": {"value": quest.target or 1}},
+                retries=2)
             if d: quest.data["user_status"] = d
         except APIError as e:
             print(f"[Quest] external-task-progress: {e.status}")
@@ -1348,7 +1415,6 @@ class QuestService:
 
         if quest.is_completed(): return "completed"
 
-        # Strategy 4: Send terminal heartbeat to finalize
         for p in payloads:
             try:
                 terminal = dict(p); terminal["terminal"] = True
@@ -1380,6 +1446,81 @@ class QuestService:
         except Exception: pass
         return "completed" if quest.is_completed() else "recovering"
 
+
+async def _claim_quest(token: str, quest_id: str):
+    """
+    Claim a completed quest reward. Handles hCaptcha challenge by invoking
+    hcaptcha-challenger and retrying with the solved token.
+    Returns (success: bool, response_text: str).
+    """
+    url = f"https://discord.com/api/v9/quests/{quest_id}/claim"
+    h = _quest_headers(token)
+
+    async with aiohttp.ClientSession() as session:
+        # Attempt 1 — straight claim
+        try:
+            async with session.post(url, headers=h, json={}) as r:
+                text = await r.text()
+                if r.status in (200, 201, 204):
+                    return True, text
+                if r.status == 429:
+                    return False, f"rate limited: {text[:140]}"
+                if r.status != 400 or "captcha" not in text.lower():
+                    return False, f"http {r.status}: {text[:140]}"
+        except Exception as e:
+            return False, f"request failed: {e}"
+
+        # Attempt 2 — solve captcha, retry with token
+        try:
+            body_json = json.loads(text)
+        except Exception:
+            body_json = {}
+        sitekey = body_json.get("captcha_sitekey") or DISCORD_HCAPTCHA_SITEKEY
+        rqdata = body_json.get("captcha_rqdata")
+
+        captcha_token = await _solve_hcaptcha(sitekey, "https://discord.com/quest-home", rqdata)
+        if not captcha_token:
+            return False, "captcha solve failed"
+
+        retry_headers = {**h, "x-captcha-key": captcha_token}
+        try:
+            async with session.post(url, headers=retry_headers,
+                                    json={"captcha_key": captcha_token}) as r2:
+                text2 = await r2.text()
+                return r2.status in (200, 201, 204), text2[:200]
+        except Exception as e:
+            return False, f"retry failed: {e}"
+
+
+async def _autoclaim_loop():
+    """Background loop: every 5 minutes, claim any newly-completed quests."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            cfg = load_config()
+            if not cfg.get("autoclaim_enabled"):
+                await asyncio.sleep(300)
+                continue
+
+            svc = QuestService(TOKEN)
+            async with aiohttp.ClientSession() as session:
+                quests = await svc.fetch(session)
+            pending = [q for q in quests if q.is_completed() and not q.is_claimed()]
+            for q in pending:
+                print(f"[autoclaim] claiming {q.name}")
+                ok, detail = await _claim_quest(TOKEN, q.id)
+                if not ok:
+                    print(f"[autoclaim] {q.name} failed: {detail[:140]}")
+                await asyncio.sleep(3)
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[autoclaim loop] {e}")
+            traceback.print_exc()
+            await asyncio.sleep(120)
+
+
 async def autoquest_run(token):
     svc = QuestService(token)
     async with aiohttp.ClientSession() as session:
@@ -1397,14 +1538,43 @@ async def autoquest_run(token):
 ORB_SKU = "1342211853484429445"
 
 async def claim_orb(token):
+    """
+    Redeem the orb SKU. Handles Discord's hCaptcha challenge by invoking
+    hcaptcha-challenger and retrying with the solved token.
+    """
     h = {"authorization": token, "content-type": "application/json", "user-agent": USER_AGENT,
          "origin": "https://discord.com", "referer": "https://discord.com/shop?tab=orbs"}
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(f"https://discord.com/api/v9/virtual-currency/skus/{ORB_SKU}/redeem",
                                     headers=h, json={}) as r:
-                return r.status in (200,201,204), await r.text()
-        except Exception as e: return False, str(e)
+                text = await r.text()
+                if r.status in (200, 201, 204):
+                    return True, text
+                if r.status != 400 or "captcha" not in text.lower():
+                    return False, text
+        except Exception as e:
+            return False, str(e)
+
+        try:
+            body_json = json.loads(text)
+        except Exception:
+            body_json = {}
+        sitekey = body_json.get("captcha_sitekey") or DISCORD_HCAPTCHA_SITEKEY
+        rqdata = body_json.get("captcha_rqdata")
+
+        captcha_token = await _solve_hcaptcha(sitekey, "https://discord.com", rqdata)
+        if not captcha_token:
+            return False, "captcha solve failed"
+
+        retry_headers = {**h, "x-captcha-key": captcha_token}
+        try:
+            async with session.post(f"https://discord.com/api/v9/virtual-currency/skus/{ORB_SKU}/redeem",
+                                    headers=retry_headers,
+                                    json={"captcha_key": captcha_token}) as r2:
+                return r2.status in (200, 201, 204), await r2.text()
+        except Exception as e:
+            return False, str(e)
 
 GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
 
@@ -1929,6 +2099,8 @@ async def on_ready():
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
         task_register("cache_cleanup", _cache_cleanup_loop())
+    if cfg.get("autoclaim_enabled") and not any("autoclaim" in str(t) for t in asyncio.all_tasks()):
+        task_register("autoclaim_loop", _autoclaim_loop())
 
     if _cmd_queue is None:
         _cmd_queue = asyncio.Queue()
@@ -2557,8 +2729,7 @@ async def _dispatch_message(_client, message):
             return
         t.cancel()
         try: await t
-        except Exception: pass
-        _spam_tasks.pop(cid, None)
+        except Exception: pass        _spam_tasks.pop(cid, None)
         await message.edit(content=ui_ok("spam stopped"))
     elif cmd == "purge":
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
@@ -2691,7 +2862,9 @@ async def _dispatch_message(_client, message):
         if not quests: return await message.channel.send(ui_err("no quests"), delete_after=8)
         rows = []
         for i, q in enumerate(quests):
-            if q.is_completed():
+            if q.is_claimed():
+                tag = f"{GREEN}claimed{RESET}"
+            elif q.is_completed():
                 tag = f"{GREEN}done{RESET}"
             elif q.selected_task in MISSION_TASKS:
                 tag = f"{YELLOW}mission{RESET}"
@@ -2736,12 +2909,46 @@ async def _dispatch_message(_client, message):
         if on: asyncio.create_task(autoquest_run(TOKEN))
         await message.channel.send(ui_ok(f"autoquest → {'on' if on else 'off'}"), delete_after=5)
     elif cmd == "autoclaim":
-        _autoclaim_enabled = len(args) < 2 or args[1].lower() in ("on","enable")
-        await message.edit(content=ui_ok(f"autoclaim → {'on' if _autoclaim_enabled else 'off'}"))
-    elif cmd == "captcha":
-        if len(args) < 3 or args[1].lower() != "set": return await message.edit(content=ui_err("usage: captcha set <key>"))
-        _captcha_key = args[2].strip(); cfg = load_config(); cfg["captcha_key"] = _captcha_key; save_config(cfg)
-        await message.edit(content=ui_ok("2captcha key saved"))
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        if sub in ("run", "now"):
+            try: await message.delete()
+            except Exception: pass
+            await message.channel.send(ui_info("autoclaim: sweeping completed quests..."), delete_after=6)
+
+            svc = QuestService(TOKEN)
+            claimed = []
+            failed = []
+            async with aiohttp.ClientSession() as session:
+                quests = await svc.fetch(session)
+                for q in quests:
+                    if not q.is_completed() or q.is_claimed():
+                        continue
+                    ok, detail = await _claim_quest(TOKEN, q.id)
+                    if ok:
+                        claimed.append(q.name)
+                    else:
+                        failed.append((q.name, detail[:80]))
+                    await asyncio.sleep(1.5)
+
+            if claimed:
+                await message.channel.send(ui_ok(f"claimed {len(claimed)}: {', '.join(claimed[:5])}" +
+                                                 ("..." if len(claimed) > 5 else "")))
+            if failed:
+                lines = [f"  {DIM}•{RESET} {n}  {DIM}{d}{RESET}" for n, d in failed[:5]]
+                await message.channel.send(ui_box("autoclaim failures", lines))
+            if not claimed and not failed:
+                await message.channel.send(ui_info("nothing to claim"))
+            return
+
+        on = (sub in ("on", "enable")) if sub else not _autoclaim_enabled
+        _autoclaim_enabled = on
+        cfg = load_config()
+        cfg["autoclaim_enabled"] = on
+        save_config(cfg)
+        if on and not any("autoclaim" in str(t) for t in asyncio.all_tasks()):
+            task_register("autoclaim_loop", _autoclaim_loop())
+        await message.edit(content=ui_ok(f"autoclaim → {'on' if on else 'off'}"))
     elif cmd == "orbbadge":
         try: await message.delete()
         except Exception: pass
@@ -4653,14 +4860,13 @@ async def on_group_channel_create(channel):
             except Exception: pass
 
 # ─────────────────────────────────────────────
-# SIGNAL HANDLING + RUN WITH AUTO-RESTART
+# SIGNAL HANDLING + RUN
 # ─────────────────────────────────────────────
 
 def _install_signal_handlers():
     def _sig(sig, frame):
-        print(f"[signal] {sig} received — graceful exit")
-        try: asyncio.get_event_loop().stop()
-        except Exception: pass
+        print(f"[signal] {sig} received — exiting for platform restart")
+        os._exit(0)
     try:
         signal.signal(signal.SIGINT, _sig)
         signal.signal(signal.SIGTERM, _sig)
@@ -4670,21 +4876,10 @@ def _install_signal_handlers():
 _install_signal_handlers()
 
 print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
-_attempt = 0
-while True:
-    try:
-        client.run(TOKEN)
-        break
-    except discord.LoginFailure as e:
-        print(f"[FATAL] login failed: {e}"); sys.exit(1)
-    except KeyboardInterrupt:
-        print("[shutdown]"); break
-    except Exception as e:
-        _attempt += 1
-        if not _auto_restart:
-            print(f"[FATAL] {e}"); raise
-        backoff = min(2 ** _attempt, _MAX_RESTART_BACKOFF)
-        print(f"[crash] attempt {_attempt} — restarting in {backoff}s — {e}")
-        traceback.print_exc()
-        time.sleep(backoff)
-        continue
+try:
+    client.run(TOKEN)
+except discord.LoginFailure as e:
+    print(f"[FATAL] login failed: {e}")
+    sys.exit(1)
+except KeyboardInterrupt:
+    print("[shutdown]")

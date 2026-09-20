@@ -2,5 +2,6 @@ discord.py-self[voice]
 cryptography
 aiohttp
 PyNaCl
-modifyself==0.4.1
 supabase
+hcaptcha-challenger>=0.6.0
+patchright>=1.40.0
