@@ -1,6 +1,5 @@
-# cogs/rpc.py | rich presence — 6 slots via $rpc, plus quick shortcuts
+# cogs/rpc.py | rich presence — plain class, no discord.ext.commands
 import discord
-from discord.ext import commands
 import asyncio
 import time
 import re
@@ -40,20 +39,41 @@ def _err(msg):  return f"```ansi\n> \x1b[31m✗\x1b[0m  {msg}\n> ```"
 def _info(msg): return f"```ansi\n> \x1b[36m•\x1b[0m  {msg}\n> ```"
 
 
-class RPCCog(commands.Cog, name="Rich Presence"):
-    def __init__(self, bot):
-        self.bot = bot
+class RPCCog:
+    """Rich presence manager. Not a discord.ext.commands.Cog — plain class."""
+
+    COMMANDS = {
+        "rpc", "spotify", "youtube", "xbox", "ps", "ps4",
+        "crunchy", "vrchat", "meta",
+        "playing", "listening", "listen", "watching", "watch",
+        "competing", "stopactivity", "aoff",
+    }
+
+    def __init__(self, client):
+        self.client = client
         self.rpc_slots = [None] * 6
         self._slot_platform_preset = [None] * 6
         self._asset_cache = {}
         self._original_ws_send = None
         self._interceptor_active = False
         self._clearing = False
+        self._ready = False
+
+    # ── lifecycle ────────────────────────────────────
+
+    async def on_ready(self):
+        await asyncio.sleep(3)
+        self._load_rpc_slots()
+        await self._start_presence_interceptor()
+        if any(a is not None for a in self.rpc_slots):
+            await self._push()
+            print("[RPC] restored saved slots")
+        self._ready = True
 
     # ── persistence ──────────────────────────────────
 
     def _get_user_file(self, filename):
-        uid = str(self.bot.user.id) if self.bot.user else "unknown"
+        uid = str(self.client.user.id) if self.client.user else "unknown"
         path = Path(f"data/{uid}.json")
         path.parent.mkdir(exist_ok=True)
         return path
@@ -105,11 +125,15 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         active = [a for a in self.rpc_slots if a is not None]
         if not active:
             return
+        ws = getattr(self.client, "ws", None)
+        if ws is None:
+            print("[RPC] push skipped — ws not ready")
+            return
         try:
-            current_status = str(self.bot.status) if hasattr(self.bot, "status") else "online"
+            current_status = str(self.client.status) if hasattr(self.client, "status") else "online"
             payload = {"op": 3, "d": {"since": 0, "activities": active,
                                       "status": current_status, "afk": False}}
-            await self.bot.ws.send(json.dumps(payload))
+            await ws.send(json.dumps(payload))
             self._save_rpc_slots()
         except Exception as e:
             print(f"[RPC] push failed: {e}")
@@ -118,14 +142,15 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         if self._interceptor_active:
             return
         for _ in range(30):
-            if self.bot.ws and hasattr(self.bot.ws, "send"):
+            ws = getattr(self.client, "ws", None)
+            if ws and hasattr(ws, "send"):
                 break
             await asyncio.sleep(0.5)
-        if not self.bot.ws:
+        ws = getattr(self.client, "ws", None)
+        if not ws:
             print("[RPC] no websocket — interceptor skipped")
             return
-        self._original_ws_send = self.bot.ws.send
-        bot_ws = self.bot.ws
+        self._original_ws_send = ws.send
 
         async def patched_send(data, *args, **kwargs):
             if isinstance(data, str) and '"op":3' in data:
@@ -143,17 +168,28 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                     pass
             return await self._original_ws_send(data, *args, **kwargs)
 
-        bot_ws.send = patched_send
+        ws.send = patched_send
         self._interceptor_active = True
         print("[RPC] presence interceptor active")
 
-    async def on_ready(self):
-        await asyncio.sleep(3)
-        self._load_rpc_slots()
-        await self._start_presence_interceptor()
-        if any(a is not None for a in self.rpc_slots):
-            await self._push()
-            print("[RPC] restored saved slots")
+    # ── dispatch ─────────────────────────────────────
+
+    async def handle(self, message, cmd: str, args: list) -> bool:
+        """Called from selfbot's on_message. Returns True if handled."""
+        if cmd == "rpc":
+            await self._cmd_rpc(message, args)
+            return True
+        if cmd in ("spotify", "youtube", "xbox", "ps", "ps4", "crunchy", "vrchat", "meta"):
+            await self._cmd_quick(message, cmd, args)
+            return True
+        if cmd in ("playing", "listening", "listen", "watching", "watch", "competing"):
+            await self._cmd_activity(message, cmd, args)
+            return True
+        if cmd in ("stopactivity", "aoff"):
+            await self.client.change_presence(activity=None, status=discord.Status.online)
+            await message.channel.send(_ok("activity cleared"))
+            return True
+        return False
 
     # ── helpers ──────────────────────────────────────
 
@@ -215,7 +251,7 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 key = f"mp:attachments/{cid}/{aid}/{fname}"
                 self._asset_cache[image_url] = key
                 return key
-            self_dm = await self.bot.user.create_dm()
+            self_dm = await self.client.user.create_dm()
             async with aiohttp.ClientSession() as s:
                 async with s.get(image_url) as r:
                     if r.status != 200:
@@ -338,30 +374,64 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             "instance": True
         }
 
-    # ── main $rpc command family ─────────────────────
+    # ── $rpc handler ─────────────────────────────────
 
-    @commands.group(name="rpc", invoke_without_command=True)
-    async def rpc(self, ctx, slot: str = None, field: str = None, *, value: str = None):
-        """$rpc <1-6> <field> <value> — set a rich presence slot."""
-        if not slot:
-            await ctx.send(_info("usage: $rpc <slot 1-6> <field> <value>\n"
-                                 "fields: name details state type platform large_image small_image "
-                                 "large_text small_text timestamp btn1 btn2 clear"))
+    async def _cmd_rpc(self, message, args):
+        if not args:
+            await message.channel.send(_info(
+                "usage: $rpc <slot 1-6> <field> <value>\n"
+                "fields: name details state type platform large_image small_image "
+                "large_text small_text timestamp btn1 btn2 clear status clearall"))
             return
-        idx = self._slot(slot)
+
+        head = args[0].lower()
+
+        if head == "status":
+            type_names = {0: "Playing", 1: "Streaming", 2: "Listening", 3: "Watching", 5: "Competing"}
+            lines = ["> ```ansi"]
+            for i, a in enumerate(self.rpc_slots):
+                if a is None:
+                    lines.append(f"> \x1b[2;37mslot {i+1} — empty\x1b[0m")
+                else:
+                    t = type_names.get(a.get("type", 0), "?")
+                    lines.append(f"> \x1b[2;37mslot {i+1} [{t}] "
+                                 f"{a.get('name', '—')} | {a.get('details', '—')} | "
+                                 f"{a.get('state', '—')}\x1b[0m")
+            lines.append("> ```")
+            await message.channel.send("\n".join(lines))
+            return
+
+        if head == "clearall":
+            self._clearing = True
+            self.rpc_slots = [None] * 6
+            ws = getattr(self.client, "ws", None)
+            if ws:
+                try:
+                    await ws.send(json.dumps({"op": 3, "d": {"since": 0, "activities": [],
+                                                            "status": "online", "afk": False}}))
+                except Exception:
+                    pass
+            self._save_rpc_slots()
+            self._clearing = False
+            await message.channel.send(_ok("all 6 slots cleared"))
+            return
+
+        idx = self._slot(head)
         if idx < 0:
-            await ctx.send(_err(f"slot must be 1-6, got `{slot}`"))
-            return
-        if not field:
-            await ctx.send(_err("missing field — usage: $rpc <slot> <field> <value>"))
+            await message.channel.send(_err(f"slot must be 1-6, got `{head}`"))
             return
 
-        field = field.lower()
+        if len(args) < 2:
+            await message.channel.send(_err("missing field"))
+            return
+
+        field = args[1].lower()
+        value = " ".join(args[2:]) if len(args) > 2 else None
 
         if field == "clear":
             self.rpc_slots[idx] = None
             await self._push()
-            await ctx.send(_ok(f"slot {idx+1} cleared"))
+            await message.channel.send(_ok(f"slot {idx+1} cleared"))
             return
 
         self._ensure_slot(idx)
@@ -380,19 +450,19 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         elif field == "large_image":
             key = await self.upload_asset(value)
             if not key:
-                await ctx.send(_err("image upload failed"))
+                await message.channel.send(_err("image upload failed"))
                 return
             act.setdefault("assets", {})["large_image"] = key
         elif field == "small_image":
             key = await self.upload_asset(value)
             if not key:
-                await ctx.send(_err("image upload failed"))
+                await message.channel.send(_err("image upload failed"))
                 return
             act.setdefault("assets", {})["small_image"] = key
         elif field == "type":
             t = (value or "").lower()
             if t not in TYPE_MAP:
-                await ctx.send(_err(f"type must be one of: {', '.join(TYPE_MAP)}"))
+                await message.channel.send(_err(f"type must be one of: {', '.join(TYPE_MAP)}"))
                 return
             act["type"] = TYPE_MAP[t]
             if t == "purplestream":
@@ -401,7 +471,7 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 del act["url"]
         elif field == "platform":
             if not self._apply_platform_preset(idx, (value or "").lower()):
-                await ctx.send(_err(f"unknown platform: {value}"))
+                await message.channel.send(_err(f"unknown platform: {value}"))
                 return
         elif field == "timestamp":
             if (value or "").lower() == "clear":
@@ -413,12 +483,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                     act["timestamps"] = {"start": int(now * 1000),
                                          "end": int((now + secs) * 1000)}
                 except Exception:
-                    await ctx.send(_err("use format: 3600 or 1:00:00 or clear"))
+                    await message.channel.send(_err("use format: 3600 or 1:00:00 or clear"))
                     return
         elif field == "btn1":
             parts = (value or "").split()
             if len(parts) < 2:
-                await ctx.send(_err("format: <label> <url>"))
+                await message.channel.send(_err("format: <label> <url>"))
                 return
             btns = act.setdefault("buttons", [])
             entry = {"label": " ".join(parts[:-1]), "url": parts[-1]}
@@ -427,211 +497,91 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         elif field == "btn2":
             parts = (value or "").split()
             if len(parts) < 2:
-                await ctx.send(_err("format: <label> <url>"))
+                await message.channel.send(_err("format: <label> <url>"))
                 return
             btns = act.setdefault("buttons", [])
             while len(btns) < 2: btns.append(None)
             btns[1] = {"label": " ".join(parts[:-1]), "url": parts[-1]}
             act["buttons"] = [b for b in btns if b]
         else:
-            await ctx.send(_err(f"unknown field: {field}"))
+            await message.channel.send(_err(f"unknown field: {field}"))
             return
 
         await self._push()
-        await ctx.send(_ok(f"slot {idx+1} {field} set"))
+        await message.channel.send(_ok(f"slot {idx+1} {field} set"))
 
-    @rpc.command(name="status")
-    async def rpc_status(self, ctx):
-        """$rpc status — show all 6 slots."""
-        type_names = {0: "Playing", 1: "Streaming", 2: "Listening", 3: "Watching", 5: "Competing"}
-        lines = ["> ```ansi"]
-        for i, a in enumerate(self.rpc_slots):
-            if a is None:
-                lines.append(f"> \x1b[2;37mslot {i+1} — empty\x1b[0m")
-            else:
-                t = type_names.get(a.get("type", 0), "?")
-                lines.append(f"> \x1b[2;37mslot {i+1} [{t}] "
-                             f"{a.get('name', '—')} | {a.get('details', '—')} | {a.get('state', '—')}\x1b[0m")
-        lines.append("> ```")
-        await ctx.send("\n".join(lines))
+    # ── quick shortcuts handler ──────────────────────
 
-    @rpc.command(name="clearall")
-    async def rpc_clearall(self, ctx):
-        """$rpc clearall — wipe every slot."""
-        self._clearing = True
-        self.rpc_slots = [None] * 6
-        try:
-            await self.bot.ws.send(json.dumps({"op": 3, "d": {"since": 0, "activities": [],
-                                                              "status": "online", "afk": False}}))
-        except Exception:
-            pass
-        self._save_rpc_slots()
-        self._clearing = False
-        await ctx.send(_ok("all 6 slots cleared"))
-
-    # ── quick shortcuts ──────────────────────────────
-
-    @commands.command(name="spotify")
-    async def quick_spotify(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(_err("usage: $spotify Song - Artist [slot 1-6]"))
-            return
-        words = args.strip().split()
+    async def _cmd_quick(self, message, cmd, args):
+        raw = " ".join(args)
+        words = raw.strip().split() if raw else []
         slot = 0
         if words and words[-1] in ("1","2","3","4","5","6"):
             slot = int(words[-1]) - 1
-            args = " ".join(words[:-1])
-        parts = [p.strip() for p in args.split("-")]
-        if len(parts) < 2: parts.append("Unknown")
-        act = await self.build_spotify(parts)
-        if not act:
-            await ctx.send(_err("format: Song - Artist"))
-            return
-        self.rpc_slots[slot] = act
-        await self._push()
-        await ctx.send(_ok(f"Spotify → slot {slot+1}: {parts[0]}"))
+            raw = " ".join(words[:-1])
 
-    @commands.command(name="youtube")
-    async def quick_youtube(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(_err("usage: $youtube Video - Channel [slot 1-6]"))
-            return
-        words = args.strip().split()
-        slot = 0
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1])
-        parts = [p.strip() for p in args.split("-")]
-        if len(parts) < 2: parts.append("Default Channel")
-        act = await self.build_youtube(parts)
-        if not act:
-            await ctx.send(_err("format: Video - Channel"))
-            return
-        self.rpc_slots[slot] = act
-        await self._push()
-        await ctx.send(_ok(f"YouTube → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="xbox")
-    async def quick_xbox(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []
-        slot = 0
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[slot] = await self.build_xbox(parts)
-        await self._push()
-        await ctx.send(_ok(f"Xbox → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="ps")
-    async def quick_ps(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []
-        slot = 0
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[slot] = await self.build_playstation(parts)
-        await self._push()
-        await ctx.send(_ok(f"PS → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="ps4")
-    async def quick_ps4(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []
-        slot = 0
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[slot] = await self.build_playstation(parts, ps4=True)
-        await self._push()
-        await ctx.send(_ok(f"PS4 → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="crunchy")
-    async def quick_crunchy(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []
-        slot = 0
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[slot] = await self.build_crunchyroll(parts)
-        await self._push()
-        await ctx.send(_ok(f"Crunchyroll → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="vrchat")
-    async def quick_vrchat(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []
-        slot = 0
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Exploring VRChat", "VRChat"]
-        self.rpc_slots[slot] = await self.build_vrchat(parts)
-        await self._push()
-        await ctx.send(_ok(f"VRChat → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="meta")
-    async def quick_meta(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(_err("usage: $meta State - World [slot] [image_url]"))
-            return
-        words = args.strip().split()
-        slot = 0
         image_url = None
-        for i, w in enumerate(words):
-            if w.startswith(("http://", "https://")):
-                image_url = w
-                words = words[:i]
-                break
-        if words and words[-1] in ("1","2","3","4","5","6"):
-            slot = int(words[-1]) - 1
-            words = words[:-1]
-        args_str = " ".join(words) if words else None
-        parts = [p.strip() for p in args_str.split("-")] if args_str else ["Exploring VRChat", "VRChat"]
-        self.rpc_slots[slot] = await self.build_vrchat(parts, image_url)
+        if cmd == "meta":
+            for i, w in enumerate(raw.split()):
+                if w.startswith(("http://", "https://")):
+                    image_url = w
+                    raw = " ".join(raw.split()[:i])
+                    break
+
+        parts = [p.strip() for p in raw.split("-") if p.strip()] if raw else []
+
+        if cmd == "spotify":
+            if len(parts) < 2: parts.append("Unknown")
+            act = await self.build_spotify(parts)
+            label = "Spotify"
+        elif cmd == "youtube":
+            if len(parts) < 2: parts.append("Default Channel")
+            act = await self.build_youtube(parts)
+            label = "YouTube"
+        elif cmd == "xbox":
+            if not parts: parts = ["Xbox"]
+            act = await self.build_xbox(parts)
+            label = "Xbox"
+        elif cmd in ("ps", "ps4"):
+            if not parts: parts = ["PlayStation"]
+            act = await self.build_playstation(parts, ps4=(cmd == "ps4"))
+            label = "PS4" if cmd == "ps4" else "PS"
+        elif cmd == "crunchy":
+            if not parts: parts = ["Crunchyroll"]
+            act = await self.build_crunchyroll(parts)
+            label = "Crunchyroll"
+        elif cmd in ("vrchat", "meta"):
+            if not parts: parts = ["Exploring VRChat", "VRChat"]
+            act = await self.build_vrchat(parts, image_url)
+            label = "VRChat" if cmd == "vrchat" else "Meta"
+        else:
+            return
+
+        if not act:
+            await message.channel.send(_err(f"could not build {cmd} presence"))
+            return
+
+        self.rpc_slots[slot] = act
         await self._push()
-        await ctx.send(_ok(f"Meta → slot {slot+1}: {parts[0]}"))
+        name = parts[0] if parts else "—"
+        await message.channel.send(_ok(f"{label} → slot {slot+1}: {name}"))
 
-    # ── simple activity shortcuts ────────────────────
+    # ── simple activity handler ──────────────────────
 
-    @commands.command(name="playing")
-    async def act_playing(self, ctx, *, text: str = None):
+    async def _cmd_activity(self, message, cmd, args):
+        text = " ".join(args) if args else None
         if not text:
-            await ctx.send(_err("usage: $playing <text>"))
+            await message.channel.send(_err(f"usage: ${cmd} <text>"))
             return
-        await self.bot.change_presence(activity=discord.Game(name=text))
-        await ctx.send(_ok(f"playing: {text}"))
-
-    @commands.command(name="listening", aliases=["listen"])
-    async def act_listening(self, ctx, *, text: str = None):
-        if not text:
-            await ctx.send(_err("usage: $listening <text>"))
-            return
-        await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=text))
-        await ctx.send(_ok(f"listening: {text}"))
-
-    @commands.command(name="watching", aliases=["watch"])
-    async def act_watching(self, ctx, *, text: str = None):
-        if not text:
-            await ctx.send(_err("usage: $watching <text>"))
-            return
-        await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=text))
-        await ctx.send(_ok(f"watching: {text}"))
-
-    @commands.command(name="competing")
-    async def act_competing(self, ctx, *, text: str = None):
-        if not text:
-            await ctx.send(_err("usage: $competing <text>"))
-            return
-        await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.competing, name=text))
-        await ctx.send(_ok(f"competing: {text}"))
-
-    @commands.command(name="stopactivity", aliases=["aoff"])
-    async def act_stop(self, ctx):
-        await self.bot.change_presence(activity=None, status=discord.Status.online)
-        await ctx.send(_ok("activity cleared"))
-
-
-async def setup(bot):
-    await bot.add_cog(RPCCog(bot))
+        if cmd == "playing":
+            await self.client.change_presence(activity=discord.Game(name=text))
+        elif cmd in ("listening", "listen"):
+            await self.client.change_presence(
+                activity=discord.Activity(type=discord.ActivityType.listening, name=text))
+        elif cmd in ("watching", "watch"):
+            await self.client.change_presence(
+                activity=discord.Activity(type=discord.ActivityType.watching, name=text))
+        elif cmd == "competing":
+            await self.client.change_presence(
+                activity=discord.Activity(type=discord.ActivityType.competing, name=text))
+        await message.channel.send(_ok(f"{cmd}: {text}"))
