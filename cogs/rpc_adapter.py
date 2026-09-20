@@ -16,14 +16,46 @@ class RpcAdapterCog:
         self._inner = None  # RPCCog instance, created in register()
 
     def register(self, client):
-        """Instantiate the upstream RPCCog with the live client."""
+        """Instantiate the upstream RPCCog with a Bot-shaped shim around client.
+
+        RPCCog is written against discord.ext.commands.Bot, which exposes a
+        `.loop` attribute for scheduling background tasks. discord.Client in
+        discord.py 2.x has no `.loop`. We wrap the client in a thin proxy that
+        provides `.loop` and delegates everything else through __getattr__.
+        """
         try:
             from cogs.rpc import RPCCog
         except Exception as e:
             print(f"[rpc-adapter] cannot import cogs.rpc: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            self._inner = None
             return
+
         try:
-            self._inner = RPCCog(client)
+            loop = None
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop()
+                except Exception:
+                    loop = None
+
+            outer_client = client
+
+            class _BotShim:
+                """Minimal Bot-shaped wrapper. Delegates all attribute access
+                to the underlying client, but exposes `loop` for RPCCog's
+                background task creation in __init__."""
+                def __init__(self, c, lp):
+                    self._c = c
+                    self.loop = lp
+
+                def __getattr__(self, name):
+                    return getattr(self._c, name)
+
+            shim = _BotShim(client, loop)
+            self._inner = RPCCog(shim)
             print("[rpc-adapter] RPCCog wrapped")
         except Exception as e:
             print(f"[rpc-adapter] RPCCog init failed: {type(e).__name__}: {e}")
@@ -38,8 +70,6 @@ class RpcAdapterCog:
                 pass
             return
 
-        # The upstream cog uses discord.ext.commands style invocation (ctx).
-        # We can't call those directly, so we route through the inner methods.
         try:
             await self._dispatch(message, cmd, args)
         except Exception as e:
@@ -52,6 +82,7 @@ class RpcAdapterCog:
 
     async def _dispatch(self, message, cmd, args):
         inner = self._inner
+
         # minimal ctx shim so inner methods that use ctx.send / ctx.message work
         class _Ctx:
             def __init__(self, m):
@@ -70,7 +101,6 @@ class RpcAdapterCog:
             slot = int(cmd[3:]) - 1
             if slot < 0 or slot > 5:
                 return await message.channel.send(S.ui_err("slot must be 1–6"))
-            # args[0] is the subcommand, e.g. "name" / "details" / "state" / etc.
             sub = args[1].lower() if len(args) > 1 else ""
             rest = args[2:] if len(args) > 2 else []
             return await self._rpc_slot_sub(ctx, slot, sub, rest)
@@ -98,19 +128,16 @@ class RpcAdapterCog:
             return await inner.rpc_status(ctx)
 
         if cmd in ("spotify", "youtube", "xbox", "ps", "ps4", "crunchy", "vrchat", "meta"):
-            method = getattr(inner, f"cmd_{cmd}", None)
-            if method is None:
-                # some use different names
-                method = {
-                    "spotify": inner.cmd_spotify if hasattr(inner, "cmd_spotify") else None,
-                    "youtube": inner.cmd_youtube if hasattr(inner, "cmd_youtube") else None,
-                    "xbox": inner.cmd_xbox if hasattr(inner, "cmd_xbox") else None,
-                    "ps": inner.cmd_ps if hasattr(inner, "cmd_ps") else None,
-                    "ps4": inner.cmd_ps4 if hasattr(inner, "cmd_ps4") else None,
-                    "crunchy": inner.cmd_crunchy if hasattr(inner, "cmd_crunchy") else None,
-                    "vrchat": inner.cmd_vrchat if hasattr(inner, "cmd_vrchat") else None,
-                    "meta": inner.cmd_meta if hasattr(inner, "cmd_meta") else None,
-                }.get(cmd)
+            method = {
+                "spotify": getattr(inner, "cmd_spotify", None),
+                "youtube": getattr(inner, "cmd_youtube", None),
+                "xbox":    getattr(inner, "cmd_xbox", None),
+                "ps":      getattr(inner, "cmd_ps", None),
+                "ps4":     getattr(inner, "cmd_ps4", None),
+                "crunchy": getattr(inner, "cmd_crunchy", None),
+                "vrchat":  getattr(inner, "cmd_vrchat", None),
+                "meta":    getattr(inner, "cmd_meta", None),
+            }.get(cmd)
             if method is None:
                 return await message.channel.send(S.ui_err(f"{cmd} handler missing in rpc cog"))
             rest = " ".join(args[1:]) if len(args) > 1 else None
@@ -150,58 +177,48 @@ class RpcAdapterCog:
         """Route $rpcN <sub> <args...> into the upstream RPCCog methods."""
         inner = self._inner
         msg = " ".join(rest)
-        # upstream methods take ctx and explicit named args; map by name
+
+        # maps user-facing sub → (method suffix, arg style)
         method_map = {
-            "name": ("rpc_name", "name"),
-            "details": ("rpc_details", "details"),
-            "state": ("rpc_state", "state"),
-            "type": ("rpc_type", "activity_type"),
-            "platform": ("rpc_platform", "preset"),
-            "large_image": ("rpc_large_image", "url"),
-            "small_image": ("rpc_small_image", "url"),
-            "timestamp": ("rpc_timestamp", "value"),
-            "btn1": ("rpc_btn1", None),
-            "btn2": ("rpc_btn2", None),
-            "spotify": ("rpc_spotify", "args"),
-            "youtube": ("rpc_youtube", "args"),
-            "xbox": ("rpc_xbox", "args"),
-            "ps": ("rpc_ps", "args"),
-            "ps4": ("rpc_ps4", "args"),
-            "crunchy": ("rpc_crunchy", "args"),
-            "clear": ("rpc_clear", None),
+            "name":        "name",
+            "details":     "details",
+            "state":       "state",
+            "type":        "type",
+            "platform":    "platform",
+            "large_image": "large_image",
+            "small_image": "small_image",
+            "timestamp":   "timestamp",
+            "btn1":        "btn1",
+            "btn2":        "btn2",
+            "spotify":     "spotify",
+            "youtube":     "youtube",
+            "xbox":        "xbox",
+            "ps":          "ps",
+            "ps4":         "ps4",
+            "crunchy":     "crunchy",
+            "clear":       "clear",
         }
-        entry = method_map.get(sub)
-        if entry is None:
+        suffix = method_map.get(sub)
+        if suffix is None:
             return await ctx.send(S.ui_err(f"unknown rpc field: {sub}"))
-        method_name, kw = entry
-        # the slot-numbered methods are named like rpc1_name, rpc2_name, ...
-        full = f"rpc{slot + 1}_{method_name.split('_', 1)[1]}"
+
+        full = f"rpc{slot + 1}_{suffix}"
         fn = getattr(inner, full, None)
         if fn is None:
             return await ctx.send(S.ui_err(f"{full} not found in rpc cog"))
 
         try:
             if sub in ("btn1", "btn2"):
-                # expects label + url
-                parts = rest
-                if len(parts) < 2:
+                if len(rest) < 2:
                     return await ctx.send(S.ui_err(f"usage: {sub} <label> <url>"))
-                url = parts[-1]
-                label = " ".join(parts[:-1])
+                url = rest[-1]
+                label = " ".join(rest[:-1])
                 return await fn(ctx, label, url)
-            if kw is None:
+            if sub == "clear":
                 return await fn(ctx)
-            if sub == "type":
-                return await fn(ctx, msg)
-            if sub == "platform":
-                return await fn(ctx, msg)
-            if sub in ("large_image", "small_image"):
-                return await fn(ctx, msg)
-            if sub == "timestamp":
-                return await fn(ctx, msg)
             if sub in ("spotify", "youtube", "xbox", "ps", "ps4", "crunchy"):
                 return await fn(ctx, msg or None)
-            # name/details/state
+            # name / details / state / type / platform / images / timestamp
             return await fn(ctx, msg)
         except TypeError as e:
             return await ctx.send(S.ui_err(f"arg mismatch for {full}: {e}"))
