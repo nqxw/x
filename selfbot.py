@@ -662,7 +662,6 @@ def build_help_section(cat, page=1):
 client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
 _MAIN_CLIENT = client
 
-# RPC cog — plain class, no commands.Bot. Loaded in on_ready.
 RPC_COG = None
 
 AUTO_RESPONSES = {}
@@ -1137,45 +1136,31 @@ async def _api(session, method, url, headers=None, json_body=None, retries=3):
         raise last
     return {}
 
-# Standard tasks (video/stream/play)
 SUPPORTED_TASKS = (
-    "WATCH_VIDEO",
-    "WATCH_VIDEO_ON_MOBILE",
-    "PLAY_ON_DESKTOP",
-    "PLAY_ON_DESKTOP_V2",
-    "PLAY_ACTIVITY",
-    "STREAM_ON_DESKTOP",
-    # Mission/collect quest tasks (Runescape, Forgotten Island, etc)
-    "COLLECT_ITEM",
-    "COLLECT",
-    "MISSION_COMPLETE",
-    "COMPLETE_QUEST",
-    "COMPLETE_ACTIVITY",
-    "EXTERNAL_TASK",
-    "LAUNCH_GAME",
-    "LAUNCH_QUEST",
+    "WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE",
+    "PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2",
+    "PLAY_ACTIVITY", "STREAM_ON_DESKTOP",
+    "COLLECT_ITEM", "COLLECT",
+    "MISSION_COMPLETE", "COMPLETE_QUEST",
+    "COMPLETE_ACTIVITY", "EXTERNAL_TASK",
+    "LAUNCH_GAME", "LAUNCH_QUEST",
 )
 
-# Tasks handled via video-progress endpoint
 VIDEO_TASKS = ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE")
 
-# Tasks handled via heartbeat endpoint
 HEARTBEAT_TASKS = (
     "PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2",
     "PLAY_ACTIVITY", "STREAM_ON_DESKTOP",
 )
 
-# Mission/external tasks — use dedicated progress push + heartbeat combo
 MISSION_TASKS = (
     "COLLECT_ITEM", "COLLECT", "MISSION_COMPLETE",
     "COMPLETE_QUEST", "COMPLETE_ACTIVITY",
     "EXTERNAL_TASK", "LAUNCH_GAME", "LAUNCH_QUEST",
 )
 
-# Discord's hcaptcha sitekey for shop/quest endpoints
 DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
 
-# hcaptcha-challenger agent — lazy singleton
 _hcaptcha_agent = None
 _hcaptcha_lock = asyncio.Lock()
 
@@ -1205,7 +1190,6 @@ async def _get_hcaptcha_agent():
 
 
 async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None) -> str | None:
-    """Solve an hCaptcha challenge via hcaptcha-challenger. Returns token or None."""
     if not HAS_HCAPTCHA:
         print("[hcaptcha] library not available")
         return None
@@ -1326,17 +1310,14 @@ class QuestService:
 
         if task in VIDEO_TASKS:
             return await self._video(session, quest)
-
         if task in HEARTBEAT_TASKS:
             payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
             if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
             if task == "PLAY_ACTIVITY":
                 payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
             return await self._heartbeat(session, quest, payloads)
-
         if task in MISSION_TASKS or task not in (*VIDEO_TASKS, *HEARTBEAT_TASKS):
             return await self._mission(session, quest)
-
         payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
         if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
         return await self._heartbeat(session, quest, payloads)
@@ -1448,16 +1429,10 @@ class QuestService:
 
 
 async def _claim_quest(token: str, quest_id: str):
-    """
-    Claim a completed quest reward. Handles hCaptcha challenge by invoking
-    hcaptcha-challenger and retrying with the solved token.
-    Returns (success: bool, response_text: str).
-    """
     url = f"https://discord.com/api/v9/quests/{quest_id}/claim"
     h = _quest_headers(token)
 
     async with aiohttp.ClientSession() as session:
-        # Attempt 1 — straight claim
         try:
             async with session.post(url, headers=h, json={}) as r:
                 text = await r.text()
@@ -1470,7 +1445,6 @@ async def _claim_quest(token: str, quest_id: str):
         except Exception as e:
             return False, f"request failed: {e}"
 
-        # Attempt 2 — solve captcha, retry with token
         try:
             body_json = json.loads(text)
         except Exception:
@@ -1493,7 +1467,6 @@ async def _claim_quest(token: str, quest_id: str):
 
 
 async def _autoclaim_loop():
-    """Background loop: every 5 minutes, claim any newly-completed quests."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -1538,10 +1511,6 @@ async def autoquest_run(token):
 ORB_SKU = "1342211853484429445"
 
 async def claim_orb(token):
-    """
-    Redeem the orb SKU. Handles Discord's hCaptcha challenge by invoking
-    hcaptcha-challenger and retrying with the solved token.
-    """
     h = {"authorization": token, "content-type": "application/json", "user-agent": USER_AGENT,
          "origin": "https://discord.com", "referer": "https://discord.com/shop?tab=orbs"}
     async with aiohttp.ClientSession() as session:
@@ -2058,24 +2027,13 @@ async def on_ready():
         globals()["_latency"] = 0
         globals()["_platform"] = "desktop"
         globals()["_rpc_state"] = {
-            "enabled":     False,
-            "type":        "playing",
-            "name":        "selfbot",
-            "details":     "",
-            "state":       "",
-            "url":         "",
-            "large_image": "",
-            "large_text":  "",
-            "small_image": "",
-            "small_text":  "",
+            "enabled": False, "type": "playing", "name": "selfbot",
+            "details": "", "state": "", "url": "",
+            "large_image": "", "large_text": "", "small_image": "", "small_text": "",
         }
         globals()["_modules"] = {
-            "afk": False,
-            "spotify_sync": False,
-            "lyrics": False,
-            "autoresponse": False,
-            "stealthy": False,
-            "gift_sniper": True,
+            "afk": False, "spotify_sync": False, "lyrics": False,
+            "autoresponse": False, "stealthy": False, "gift_sniper": True,
         }
         globals()["_ar_responses"] = {}
         globals()["_quests"] = []
@@ -2159,7 +2117,6 @@ async def _dispatch_message(_client, message):
     global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
     global _managed_tasks, _multireact_enabled
 
-    # ── RPC COG DISPATCH (main client only) ──
     if RPC_COG is not None and _client is _MAIN_CLIENT:
         if message.content and message.content.startswith(PREFIX):
             _raw = message.content[len(PREFIX):].strip()
@@ -2295,9 +2252,7 @@ async def _dispatch_message(_client, message):
 
     db_stats_inc(cmd)
 
-    # ─────────────────────────────────────────────
     # HELP
-    # ─────────────────────────────────────────────
     if cmd in ("help", "h"):
         try: await message.delete()
         except Exception: pass
@@ -2309,9 +2264,7 @@ async def _dispatch_message(_client, message):
             await message.channel.send(build_help_section(sub, page)); return
         await message.channel.send(build_help_root(1))
 
-    # ─────────────────────────────────────────────
     # SETTINGS
-    # ─────────────────────────────────────────────
     elif cmd == "prefix":
         if len(args) < 2: return await message.edit(content=ui_info(f"current prefix: {PREFIX}"))
         PREFIX = args[1]; cfg = load_config(); cfg["prefix"] = PREFIX; save_config(cfg)
@@ -2412,9 +2365,7 @@ async def _dispatch_message(_client, message):
         rows = [f"  {GREY}•{RESET} {c}" for c in sorted(_cmd_disabled)]
         await message.edit(content=_paginate("disabled commands", "", rows) if rows else ui_info("none"))
 
-    # ─────────────────────────────────────────────
     # GUARDS
-    # ─────────────────────────────────────────────
     elif cmd == "blacklist":
         try: await message.delete()
         except Exception: pass
@@ -2510,9 +2461,7 @@ async def _dispatch_message(_client, message):
             await message.edit(content=ui_ok("guards reset"))
         else: await message.edit(content=build_help_section("guards"))
 
-    # ─────────────────────────────────────────────
     # RESILIENCE
-    # ─────────────────────────────────────────────
     elif cmd == "autoreconnect":
         _auto_reconnect = (args[1].lower() in ("on","enable")) if len(args) > 1 else not _auto_reconnect
         await message.edit(content=ui_ok(f"autoreconnect → {'on' if _auto_reconnect else 'off'}"))
@@ -2579,9 +2528,7 @@ async def _dispatch_message(_client, message):
             ]))
         else: await message.edit(content=build_help_section("resilience"))
 
-    # ─────────────────────────────────────────────
     # TASKS
-    # ─────────────────────────────────────────────
     elif cmd == "task":
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "list":
@@ -2606,9 +2553,7 @@ async def _dispatch_message(_client, message):
             await message.edit(content=ui_ok("cleared"))
         else: await message.edit(content=build_help_section("tasks"))
 
-    # ─────────────────────────────────────────────
     # TRIGGERS
-    # ─────────────────────────────────────────────
     elif cmd == "trigger":
         try: await message.delete()
         except Exception: pass
@@ -2688,9 +2633,7 @@ async def _dispatch_message(_client, message):
             await message.edit(content=ui_ok("cleared"))
         else: await message.edit(content=build_help_section("triggers"))
 
-    # ─────────────────────────────────────────────
     # GENERAL
-    # ─────────────────────────────────────────────
     elif cmd == "ping":
         await message.edit(content=ui_ok(f"pong — `{round(client.latency*1000)}ms`"))
     elif cmd == "info":
@@ -2729,7 +2672,8 @@ async def _dispatch_message(_client, message):
             return
         t.cancel()
         try: await t
-        except Exception: pass        _spam_tasks.pop(cid, None)
+        except Exception: pass
+        _spam_tasks.pop(cid, None)
         await message.edit(content=ui_ok("spam stopped"))
     elif cmd == "purge":
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
