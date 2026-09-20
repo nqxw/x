@@ -1,8 +1,28 @@
 [phases.setup]
-nixPkgs = ["python313", "ffmpeg"]
+aptPkgs = [
+  "libxcb1",
+  "libxcb-dri3-0",
+  "libx11-xcb1",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxrandr2",
+  "libgbm1",
+  "libasound2",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libcups2",
+  "libdrm2",
+  "libgtk-3-0",
+  "libnss3",
+  "libxss1",
+  "libxtst6"
+]
 
 [phases.install]
-cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+cmds = [
+  "pip install discord.py-self aiohttp hcaptcha-challenger",
+  "playwright install chromium --with-deps"
+]
 
 [start]
 cmd = "python selfbot.py"

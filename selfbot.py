@@ -16,6 +16,7 @@ import string
 import sqlite3
 import traceback
 import signal
+import importlib
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from collections import defaultdict
@@ -806,6 +807,23 @@ async def translate_text(text, target_lang):
     except Exception as e:
         return f"error: {e}"
 
+# ── neko roleplay gif fetcher (was missing — fixes cstate.neko_gif NameError) ──
+NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
+                "poke", "wink", "smug", "boop", "nom", "wave", "highfive",
+                "bite", "blush", "dance", "happy", "cringe"}
+
+async def neko_gif(action):
+    endpoint = action if action in NEKO_ACTIONS else "hug"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://nekos.life/api/v2/img/{endpoint}",
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    return (await r.json()).get("url")
+    except Exception:
+        pass
+    return None
+
 async def set_hypesquad(house_id: int):
     h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     try:
@@ -982,8 +1000,47 @@ def task_cancel(name):
     return False
 
 # ─────────────────────────────────────────────
-# COG BOOT
+# COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
+
+# Format: (module path, class name)
+COG_MODULES = [
+    ("cogs.quests", "QuestsCog"),
+    ("cogs.host", "HostCog"),
+    ("cogs.voice", "VoiceCog"),
+    ("cogs.mass", "MassCog"),
+    ("cogs.nuke", "NukeCog"),
+    ("cogs.scrape", "ScrapeCog"),
+    ("cogs.webhooks", "WebhooksCog"),
+    ("cogs.automod", "AutomodCog"),
+    ("cogs.monitor", "MonitorCog"),
+    ("cogs.backup", "BackupCog"),
+    ("cogs.perms", "PermsCog"),
+    ("cogs.scheduler", "SchedulerCog"),
+    ("cogs.db", "DbCog"),
+    ("cogs.lastfm", "LastfmCog"),
+    ("cogs.social", "SocialCog"),
+    ("cogs.status", "StatusCog"),
+    ("cogs.agc", "AgcCog"),
+    ("cogs.gc", "GroupChatCog"),
+    ("cogs.triggers", "TriggersCog"),
+    ("cogs.tasks", "TasksCog"),
+    ("cogs.guards", "GuardsCog"),
+    ("cogs.resilience", "ResilienceCog"),
+    ("cogs.settings", "SettingsCog"),
+    ("cogs.general", "GeneralCog"),
+    ("cogs.fun", "FunCog"),
+    ("cogs.tools", "ToolsCog"),
+    ("cogs.utility", "UtilityCog"),
+    ("cogs.tracking", "TrackingCog"),
+    ("cogs.downloads", "DownloadsCog"),
+    ("cogs.auto", "AutoCog"),
+    ("cogs.profile", "ProfileCog"),
+    ("cogs.developer", "DeveloperCog"),
+    ("cogs.server", "ServerCog"),
+    ("cogs.information", "InformationCog"),
+    ("cogs.interactions", "InteractionsCog"),
+]
 
 _COG_REGISTRY = {}
 _COG_INSTANCES = []
@@ -995,7 +1052,6 @@ async def _boot_cogs():
         return
     _COGS_BOOTED = True
     try:
-        import cogs
         from cogs import state as cstate
 
         # feed globals the cogs need
@@ -1080,11 +1136,36 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
-        _COG_REGISTRY, _COG_INSTANCES = cogs.build_registry()
-        cogs.register_events(client, _COG_INSTANCES)
-        print(f"[cogs] loaded {len(_COG_INSTANCES)} cogs, {len(_COG_REGISTRY)} commands")
+        # fault-tolerant per-module import — one bad cog doesn't kill the rest
+        for mod_name, cls_name in COG_MODULES:
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception as e:
+                print(f"[cogs] SKIP {mod_name} — import failed: {type(e).__name__}: {e}")
+                continue
+            cls = getattr(mod, cls_name, None)
+            if cls is None:
+                print(f"[cogs] SKIP {mod_name} — class {cls_name} not found")
+                continue
+            try:
+                inst = cls()
+            except Exception as e:
+                print(f"[cogs] SKIP {mod_name}.{cls_name} — init failed: {e}")
+                continue
+            _COG_INSTANCES.append(inst)
+            for c in getattr(inst, "COMMANDS", set()):
+                _COG_REGISTRY[c] = (inst, c)
+            if hasattr(inst, "register"):
+                try:
+                    inst.register(client)
+                except Exception as e:
+                    print(f"[cogs] {cls_name} event register failed: {e}")
+
+        print(f"[cogs] loaded {len(_COG_INSTANCES)} cogs, {len(_COG_REGISTRY)} commands registered")
+        if not _COG_REGISTRY:
+            print("[cogs] WARNING: no commands registered — check cogs/ folder is present and modules import cleanly")
     except Exception as e:
-        print(f"[cogs] load failed: {e}")
+        print(f"[cogs] fatal boot error: {e}")
         traceback.print_exc()
         _COG_REGISTRY = {}
         _COG_INSTANCES = []
@@ -1380,8 +1461,12 @@ async def _dispatch_message(_client, message):
         try:
             await cog.handle(message, cmd, args)
         except Exception as e:
-            print(f"[cog:{cmd}] {e}")
+            print(f"[cog:{cmd}] handler error: {e}")
             traceback.print_exc()
+            try:
+                await message.channel.send(ui_err(f"`{cmd}` errored — check console"))
+            except Exception:
+                pass
         return
 
     # ── INLINE FALLTHROUGH (help only) ──
@@ -1397,6 +1482,11 @@ async def _dispatch_message(_client, message):
             await message.channel.send(build_help_section(sub, page))
             return
         await message.channel.send(build_help_root(1))
+        return
+
+    # unknown command — log only, do nothing (selfbot convention: silent)
+    # uncomment next line if you want feedback on unknown commands:
+    # print(f"[dispatch] unknown cmd: {cmd}")
 
 
 @client.event
@@ -1453,17 +1543,6 @@ async def on_member_update(before, after):
             if ch:
                 try: await ch.send(ui_box("nick", [f"{after} nick: {before.nick} → {after.nick}"]))
                 except Exception: pass
-
-# ─────────────────────────────────────────────
-# HOST — legacy spawn still inline (used by host cog on demand)
-# ─────────────────────────────────────────────
-
-async def _run_hosted_client(hc, tok):
-    try:
-        await hc.start(tok)
-    except Exception as e:
-        print(f"[hosted:{getattr(hc,'_bot_index','?')}] CONNECT ERROR: {type(e).__name__}: {e}")
-        traceback.print_exc()
 
 # ─────────────────────────────────────────────
 # SIGNAL HANDLING + RUN
