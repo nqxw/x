@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp
-# sy's selfbot — v2.2.3
+# sy's selfbot — v2.2.4
 
 import discord
 from discord.ext import commands as _cmds_ext
@@ -31,8 +31,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ─────────────────────────────────────────────
 # OPTIONAL INTEGRATIONS
-# Missing modules don't kill the boot. Feature flags
-# let the rest of the bot degrade cleanly.
 # ─────────────────────────────────────────────
 
 HAS_IPC = False
@@ -157,7 +155,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.3"
+VERSION = "2.2.4"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -659,6 +657,7 @@ def build_help_section(cat, page=1):
 # ─────────────────────────────────────────────
 
 client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
+_MAIN_CLIENT = client   # explicit reference for places that must use the primary gateway
 
 # RPC cog shim — a commands.Bot that hosts the RPC cog.
 rpc_host = _cmds_ext.Bot(command_prefix=PREFIX, self_bot=True, help_command=None)
@@ -839,7 +838,7 @@ async def _run_hosted_client(hc, tok):
         traceback.print_exc()
 
 async def _spawn_hosted_clients():
-    """Log each hosted token into the gateway so they appear online."""
+    """Log each hosted token into the gateway and wire it to the shared dispatcher."""
     global _hosted_spawned
     if _hosted_spawned:
         return
@@ -858,16 +857,20 @@ async def _spawn_hosted_clients():
     for i, tok in enumerate(tokens):
         print(f"[hosted:{i+1}] attempting login...")
         try:
-            hc = discord.Client(chunk_guilds_at_startup=False, request_guilds=False)
+            hc = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
             hc._bot_index = i + 1
 
             @hc.event
-            async def on_ready(_hc=hc):
+            async def _hc_on_ready(_hc=hc):
                 print(f"[hosted:{_hc._bot_index}] \u2713 {_hc.user} online")
 
             @hc.event
-            async def on_message(_m, _hc=hc):
-                pass
+            async def _hc_on_message(_m, _hc=hc):
+                try:
+                    await _dispatch_message(_hc, _m)
+                except Exception as e:
+                    print(f"[hosted:{_hc._bot_index}] dispatch error: {e}")
+                    traceback.print_exc()
 
             _hosted_clients.append(hc)
             asyncio.create_task(_run_hosted_client(hc, tok))
@@ -1579,6 +1582,13 @@ async def _monitor_log(guild, title, body):
     except Exception: pass
 
 def _perm_check(cmd, message):
+    # Hosted clients own their own commands — never block them on whitelist.
+    for hc in _hosted_clients:
+        try:
+            if hc.user and hc.user.id == message.author.id:
+                return True
+        except Exception:
+            pass
     if cmd in _cmd_disabled: return False
     if message.author.id in _user_blacklist: return False
     if _user_whitelist and message.author.id not in _user_whitelist: return False
@@ -1835,8 +1845,11 @@ async def on_disconnect():
 async def on_resumed():
     _session_events.append({"ts": time.time(), "event": "resumed"})
 
-@client.event
-async def on_message(message):
+async def _dispatch_message(_client, message):
+    # Local alias — every unqualified `client.*` inside this function refers
+    # to the caller. Lets hosted clients reuse the same command table.
+    client = _client
+
     # ── ALL GLOBALS HOISTED TO THE TOP ──
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
@@ -1859,7 +1872,7 @@ async def on_message(message):
     # ── RPC COG FORWARDING ──
     if RPC_COG is not None:
         try:
-            rpc_host._connection.user = client.user
+            rpc_host._connection.user = _MAIN_CLIENT.user
             await rpc_host.process_commands(message)
         except Exception as e:
             print(f"[rpc dispatch] {e}")
@@ -1959,6 +1972,8 @@ async def on_message(message):
 
     if message.author.id != client.user.id: return
 
+    if not message.content:
+        return
     effective_prefix = PREFIX
     if message.guild and str(message.guild.id) in _server_prefixes:
         effective_prefix = _server_prefixes[str(message.guild.id)]
@@ -2512,7 +2527,7 @@ async def on_message(message):
         if plat not in PLATFORM_MAP: return await message.edit(content=ui_err(f"unknown platform: {plat}"))
         _current_platform = plat
         await message.edit(content=ui_ok(f"platform → {plat}"))
-        try: await client.ws.close(code=4000)
+        try: await _MAIN_CLIENT.ws.close(code=4000)
         except Exception: pass
     elif cmd == "hypesquad":
         if len(args) < 2: return await message.edit(content=ui_err("usage: hypesquad bravery/brilliance/balance/off"))
@@ -4362,6 +4377,11 @@ async def on_message(message):
 
     else:
         pass
+
+
+@client.event
+async def on_message(message):
+    await _dispatch_message(client, message)
 
 # ─────────────────────────────────────────────
 # REACTION / VOICE TRIGGER EVENTS
