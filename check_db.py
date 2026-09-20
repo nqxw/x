@@ -6,7 +6,7 @@ print(health_check())
 
 db = get_client()
 if not db:
-    print("\n❌ get_client() returned None — Supabase not connected.")
+    print("\n  get_client() returned None — Supabase not connected.")
     print("   Check that SUPABASE_KEY is filled in inside db_helper.py.")
     raise SystemExit(1)
 
