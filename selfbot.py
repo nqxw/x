@@ -250,10 +250,52 @@ HELP_DATA = {
         ("vcdeafen <user_id>","server deafen user"),("vcundeafen <user_id>","server undeafen user"),
         ("vckick <user_id>","kick user from vc"),("vcmove <user> <ch_id>","move user to channel"),
         ("vcmoveall <ch1> <ch2>","move all users ch1 → ch2"),
+        ("vcreconnect on/off/status","auto-rejoin vc on disconnect"),
         ("selfmute","toggle your own server mute"),
         ("selfdeaf","toggle your own server deafen"),
         ("selfstream","toggle your stream (go live)"),
         ("selfcamera","toggle your camera/video"),
+    ],
+    "rpc": [
+        ("rpc <1-6> <field> <value>","set a rich presence slot"),
+        ("rpc <slot> name <text>","activity name"),
+        ("rpc <slot> details <text>","details line"),
+        ("rpc <slot> state <text>","state line"),
+        ("rpc <slot> type <type>","playing/streaming/listening/watching/competing/purplestream"),
+        ("rpc <slot> platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta"),
+        ("rpc <slot> large_image <url>","large image"),
+        ("rpc <slot> small_image <url>","small image"),
+        ("rpc <slot> timestamp <val>","3600 | 1:00:00 | clear"),
+        ("rpc <slot> btn1 <label> <url>","first button"),
+        ("rpc <slot> btn2 <label> <url>","second button"),
+        ("rpc <slot> clear","wipe that slot"),
+        ("rpc status","show all 6 slots"),
+        ("rpc clearall","wipe every slot"),
+        ("rpc1 <field> <value>","slot 1 shorthand"),
+        ("rpc2 <field> <value>","slot 2 shorthand"),
+        ("rpc3 <field> <value>","slot 3 shorthand"),
+        ("rpc4 <field> <value>","slot 4 shorthand"),
+        ("rpc5 <field> <value>","slot 5 shorthand"),
+        ("rpc6 <field> <value>","slot 6 shorthand"),
+        ("spotify <song - artist> [slot]","quick spotify presence"),
+        ("youtube <video - channel> [slot]","quick youtube presence"),
+        ("xbox <game - details> [slot]","quick xbox presence"),
+        ("ps <game - details> [slot]","quick playstation presence"),
+        ("ps4 <game - details> [slot]","quick ps4 presence"),
+        ("crunchy <anime - ep> [slot]","quick crunchyroll presence"),
+        ("vrchat <state - world> [slot]","quick vrchat presence"),
+        ("meta <state - world> [slot] [image]","quick meta quest presence"),
+        ("playing <text>","simple playing activity"),
+        ("listening <text>","simple listening activity"),
+        ("watching <text>","simple watching activity"),
+        ("competing <text>","simple competing activity"),
+        ("rpc_status","list every slot"),
+        ("clear_multi_rpc","wipe all six slots"),
+        ("aoff","clear current activity"),
+        ("rstatus <a, b, c>","rotate custom status text"),
+        ("remoji <a, b, c>","rotate custom status emoji"),
+        ("stopstatus","stop status rotation"),
+        ("stopemoji","stop emoji rotation"),
     ],
     "fun": [
         ("gayrate [user_id]","gay percentage"),("feed <user_id>","feed a user"),
@@ -590,6 +632,7 @@ def build_help_root(page=1):
     desc = {
         "general":"utilities, platform & status","quests":"quest completer & orb badge",
         "sniper":"nitro sniper & logger","ar":"auto-responder","voice":"voice channel controls",
+        "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
         "admin":"owner / admin management",
         "lastfm":"last.fm integration","settings":"prefix, aliases, cooldowns, profiles",
@@ -807,7 +850,7 @@ async def translate_text(text, target_lang):
     except Exception as e:
         return f"error: {e}"
 
-# ── neko roleplay gif fetcher (was missing — fixes cstate.neko_gif NameError) ──
+# ── neko roleplay gif fetcher ──
 NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
                 "poke", "wink", "smug", "boop", "nom", "wave", "highfive",
                 "bite", "blush", "dance", "happy", "cringe"}
@@ -1003,7 +1046,8 @@ def task_cancel(name):
 # COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
 
-# Format: (module path, class name)
+# Order matters for command collision — later entries overwrite earlier ones.
+# Put adapter cogs that need to WIN a name at the bottom.
 COG_MODULES = [
     ("cogs.quests", "QuestsCog"),
     ("cogs.host", "HostCog"),
@@ -1040,6 +1084,10 @@ COG_MODULES = [
     ("cogs.server", "ServerCog"),
     ("cogs.information", "InformationCog"),
     ("cogs.interactions", "InteractionsCog"),
+    # ── RPC adapter last so its commands win collisions on
+    #    spotify / youtube / xbox / ps / ps4 / crunchy / playing / listening /
+    #    watching / competing / stopactivity / rpc_status / clear_multi_rpc ──
+    ("cogs.rpc_adapter", "RpcAdapterCog"),
 ]
 
 _COG_REGISTRY = {}
@@ -1483,10 +1531,6 @@ async def _dispatch_message(_client, message):
             return
         await message.channel.send(build_help_root(1))
         return
-
-    # unknown command — log only, do nothing (selfbot convention: silent)
-    # uncomment next line if you want feedback on unknown commands:
-    # print(f"[dispatch] unknown cmd: {cmd}")
 
 
 @client.event
