@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# sy's selfbot — v2.2.7 (cog-delegated)
+# lunar — v2.2.7 (cog-delegated)
 
 import discord
 import asyncio
@@ -150,7 +150,7 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[selfbot] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[lunar] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
@@ -345,7 +345,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show selfbot version"),("reload","reload config from disk"),
+        ("version","show lunar version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -425,8 +425,8 @@ HELP_DATA = {
     "developer": [
         ("host say <idx> <msg>","force hosted account to say"),
         ("host broadcast <msg>","broadcast from all accounts"),
-        ("logs [n]","tail selfbot console"),("eval <code>","evaluate python code"),
-        ("restart","restart the selfbot process"),("reconnect","force gateway reconnect"),
+        ("logs [n]","tail lunar console"),("eval <code>","evaluate python code"),
+        ("restart","restart the lunar process"),("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),("plugin unload <name>","unload a plugin"),
         ("plugin list","list loaded plugins"),
@@ -650,11 +650,11 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  sy | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  lunar | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -1604,7 +1604,7 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
     client.run(TOKEN)
 except discord.LoginFailure as e:
