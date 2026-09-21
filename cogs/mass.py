@@ -2,20 +2,12 @@
 import asyncio
 import os
 import aiohttp
+import discord
 from uuid import uuid4
 from . import state as S
 
 
-async def _mass_dm(guild, msg):
-    done = 0
-    client = S.CLIENT
-    for m in list(guild.members):
-        if m.bot or m.id == client.user.id: continue
-        try: await m.send(msg); done += 1
-        except Exception: pass
-        await asyncio.sleep(1.2)
-    return done
-
+# ── module-level helpers kept from the previous version ──
 
 async def _mass_friend_ids(ids):
     done = 0
@@ -109,26 +101,92 @@ async def _mass_leave(guild_id, tokens):
 
 
 class MassCog:
-    COMMANDS = {"massdm", "massdmfile", "massfriend", "massjoin", "massleave",
+    COMMANDS = {"massdm", "stopdm", "dmstats",
+                "massdmfile", "massfriend", "massjoin", "massleave",
                 "massrole", "massunrole", "massban", "masskick", "massch", "massvc",
                 "masscat", "massrolecreate", "massreact", "massdelete"}
+
+    def __init__(self):
+        # ── DM-all-open-channels state ──
+        self.dm_running = False
+        self.dm_stats = {"sent": 0, "failed": 0, "skipped": 0}
+        self._orphan_tasks = set()
+
+    # ── task tracking (fixes asyncio.create_task GC footgun) ──
+
+    def _spawn(self, coro):
+        t = asyncio.create_task(coro)
+        self._orphan_tasks.add(t)
+        t.add_done_callback(self._orphan_tasks.discard)
+        return t
+
+    async def cog_unload(self):
+        self.dm_running = False
+        for t in list(self._orphan_tasks):
+            if not t.done():
+                t.cancel()
+
+    # ── formatting helpers ──
+
+    def _format_response(self, content):
+        """Wrap text in an ansi block. Content is expected to already be
+        a bordered block (─── separators), so pass through as-is."""
+        if isinstance(content, str):
+            lines = content.split('\n')
+        else:
+            lines = content
+        return S._ansi_block(lines)
+
+    async def _send_and_delete(self, message, content, delete_after=2):
+        """Send a message and schedule its deletion. Takes a discord.Message
+        instead of a commands.Context so it fits the plain-class cog style."""
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            reply = await message.channel.send(content)
+        except Exception:
+            return None
+
+        async def _del():
+            await asyncio.sleep(delete_after)
+            try:
+                await reply.delete()
+            except Exception:
+                pass
+
+        self._spawn(_del())
+        return reply
+
+    async def _delete_after_delay(self, message, delay=2):
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    # ── command dispatch ──
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
         try: await message.delete()
         except Exception: pass
 
-        if cmd == "massdm":
-            if not message.guild:
-                return await message.channel.send(S.ui_err("server only"), delete_after=5)
-            if len(args) < 2:
-                return await message.channel.send(S.ui_err("usage: massdm <msg>"), delete_after=5)
-            txt = " ".join(args[1:])
-            await message.channel.send(S.ui_info("mass dm started"))
-            done = await _mass_dm(message.guild, txt)
-            await message.channel.send(S.ui_ok(f"sent to {done} members"))
+        # ── DM-all-open-channels commands ──
 
-        elif cmd == "massdmfile":
+        if cmd == "massdm":
+            return await self._cmd_massdm(message, args)
+
+        if cmd == "stopdm":
+            return await self._cmd_stopdm(message, args)
+
+        if cmd == "dmstats":
+            return await self._cmd_dmstats(message, args)
+
+        # ── original mass-dm-file and friends ──
+
+        if cmd == "massdmfile":
             if len(args) < 3 or not os.path.exists(args[1]):
                 return await message.channel.send(S.ui_err("usage: massdmfile <path> <msg>"), delete_after=5)
             txt = " ".join(args[2:])
@@ -244,3 +302,172 @@ class MassCog:
                     d += 1; await asyncio.sleep(0.3)
                     if d >= n: break
             await message.channel.send(S.ui_ok(f"deleted {d}"), delete_after=5)
+
+    # ── $massdm — DM every open DM channel ──
+
+    async def _cmd_massdm(self, message, args):
+        try:
+            if len(args) < 2:
+                await self._send_and_delete(message, S.ui_err("usage: massdm <message>"))
+                return
+
+            if self.dm_running:
+                await self._send_and_delete(message, S.ui_warn("a mass DM is already running"))
+                return
+
+            msg_text = " ".join(args[1:])
+            self.dm_running = True
+            self.dm_stats = {"sent": 0, "failed": 0, "skipped": 0}
+
+            # collect open DM channels
+            dm_channels = [c for c in S.CLIENT.private_channels
+                           if isinstance(c, discord.DMChannel)]
+
+            if not dm_channels:
+                self.dm_running = False
+                await self._send_and_delete(message, S.ui_err("no DM channels found"))
+                return
+
+            start_msg = (
+                f"Mass DM Started\n"
+                f"━━━━━━━━━━━\n\n"
+                f"• Total DMs: {len(dm_channels)}\n"
+                f"• Message: {msg_text[:50]}{'...' if len(msg_text) > 50 else ''}\n"
+                f"• Status: Running..."
+            )
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            status_msg = await message.channel.send(self._format_response(start_msg))
+
+            for i, channel in enumerate(dm_channels):
+                if not self.dm_running:
+                    break
+
+                # skip channels with no messages
+                try:
+                    has_any = False
+                    async for _m in channel.history(limit=1):
+                        has_any = True
+                        break
+                    if not has_any:
+                        self.dm_stats["skipped"] += 1
+                        continue
+                except Exception:
+                    self.dm_stats["skipped"] += 1
+                    continue
+
+                try:
+                    await channel.send(msg_text)
+                    self.dm_stats["sent"] += 1
+                except discord.Forbidden:
+                    self.dm_stats["failed"] += 1
+                except discord.HTTPException as e:
+                    if getattr(e, "status", None) == 429:
+                        retry_after = 5
+                        try:
+                            ra_hdr = e.response.headers.get("Retry-After")
+                            if ra_hdr:
+                                retry_after = float(ra_hdr)
+                        except Exception:
+                            pass
+                        warn = (
+                            f"Rate Limited\n"
+                            f"━━━━━━━━━━━\n\n"
+                            f"Waiting {retry_after}s before continuing..."
+                        )
+                        try:
+                            warning_response = await message.channel.send(
+                                self._format_response(warn))
+                            self._spawn(self._delete_after_delay(warning_response, 2))
+                        except Exception:
+                            pass
+                        await asyncio.sleep(retry_after)
+                        try:
+                            await channel.send(msg_text)
+                            self.dm_stats["sent"] += 1
+                        except Exception:
+                            self.dm_stats["failed"] += 1
+                    else:
+                        self.dm_stats["failed"] += 1
+                except Exception:
+                    self.dm_stats["failed"] += 1
+
+                # progress update every 5
+                if (i + 1) % 5 == 0:
+                    progress = (
+                        f"Mass DM Progress\n"
+                        f"━━━━━━━━━━━\n\n"
+                        f"• Progress: {i+1}/{len(dm_channels)}\n"
+                        f"• Sent: {self.dm_stats['sent']}\n"
+                        f"• Failed: {self.dm_stats['failed']}\n"
+                        f"• Skipped: {self.dm_stats['skipped']}"
+                    )
+                    try:
+                        await status_msg.edit(content=self._format_response(progress))
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(3)
+
+            self.dm_running = False
+
+            final = (
+                f"Mass DM Complete\n"
+                f"━━━━━━━━━━━\n\n"
+                f"• Total DMs: {len(dm_channels)}\n"
+                f"• Sent: {self.dm_stats['sent']}\n"
+                f"• Failed: {self.dm_stats['failed']}\n"
+                f"• Skipped: {self.dm_stats['skipped']}"
+            )
+            try:
+                await status_msg.edit(content=self._format_response(final))
+                self._spawn(self._delete_after_delay(status_msg, 2))
+            except Exception:
+                pass
+
+        except Exception as e:
+            self.dm_running = False
+            try:
+                await self._send_and_delete(message, S.ui_err(f"error in mass DM: {e}"))
+            except Exception:
+                pass
+
+    # ── $stopdm ──
+
+    async def _cmd_stopdm(self, message, args):
+        try:
+            if self.dm_running:
+                self.dm_running = False
+                stop = (
+                    f"Mass DM Stopped\n"
+                    f"━━━━━━━━━━━\n\n"
+                    f"• Sent: {self.dm_stats['sent']}\n"
+                    f"• Failed: {self.dm_stats['failed']}\n"
+                    f"• Skipped: {self.dm_stats['skipped']}"
+                )
+                await self._send_and_delete(message, self._format_response(stop))
+            else:
+                await self._send_and_delete(message, S.ui_err("no mass DM is currently running"))
+        except Exception as e:
+            await self._send_and_delete(message, S.ui_err(str(e)))
+
+    # ── $dmstats ──
+
+    async def _cmd_dmstats(self, message, args):
+        try:
+            dm_count = len([c for c in S.CLIENT.private_channels
+                            if isinstance(c, discord.DMChannel)])
+            stats = (
+                f"DM Statistics\n"
+                f"━━━━━━━━━━━\n\n"
+                f"• Total DM Channels: {dm_count}\n"
+                f"• DM Status: {'Running' if self.dm_running else 'Idle'}\n"
+                f"• Messages Sent: {self.dm_stats['sent']}\n"
+                f"• Messages Failed: {self.dm_stats['failed']}\n"
+                f"• DMs Skipped: {self.dm_stats['skipped']}"
+            )
+            await self._send_and_delete(message, self._format_response(stats))
+        except Exception as e:
+            await self._send_and_delete(message, S.ui_err(str(e)))
