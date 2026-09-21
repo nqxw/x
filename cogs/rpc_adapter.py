@@ -13,16 +13,10 @@ class RpcAdapterCog:
                 "stopstatus", "stopemoji"}
 
     def __init__(self):
-        self._inner = None  # RPCCog instance, created in register()
+        self._inner = None
 
     def register(self, client):
-        """Instantiate the upstream RPCCog with a Bot-shaped shim around client.
-
-        RPCCog is written against discord.ext.commands.Bot, which exposes a
-        `.loop` attribute for scheduling background tasks. discord.Client in
-        discord.py 2.x has no `.loop`. We wrap the client in a thin proxy that
-        provides `.loop` and delegates everything else through __getattr__.
-        """
+        """Instantiate the upstream RPCCog with a Bot-shaped shim around client."""
         try:
             from cogs.rpc import RPCCog
         except Exception as e:
@@ -41,12 +35,7 @@ class RpcAdapterCog:
                 except Exception:
                     loop = None
 
-            outer_client = client
-
             class _BotShim:
-                """Minimal Bot-shaped wrapper. Delegates all attribute access
-                to the underlying client, but exposes `loop` for RPCCog's
-                background task creation in __init__."""
                 def __init__(self, c, lp):
                     self._c = c
                     self.loop = lp
@@ -83,7 +72,6 @@ class RpcAdapterCog:
     async def _dispatch(self, message, cmd, args):
         inner = self._inner
 
-        # minimal ctx shim so inner methods that use ctx.send / ctx.message work
         class _Ctx:
             def __init__(self, m):
                 self.message = m
@@ -97,27 +85,39 @@ class RpcAdapterCog:
         ctx = _Ctx(message)
 
         # ── group-style commands (rpc1..rpc6) ──
-        if cmd.startswith("rpc") and cmd[3:].isdigit():
-            slot = int(cmd[3:]) - 1
+        if cmd.startswith("rpc") and len(cmd) == 4 and cmd[3].isdigit():
+            slot = int(cmd[3]) - 1
             if slot < 0 or slot > 5:
                 return await message.channel.send(S.ui_err("slot must be 1–6"))
             sub = args[1].lower() if len(args) > 1 else ""
             rest = args[2:] if len(args) > 2 else []
             return await self._rpc_slot_sub(ctx, slot, sub, rest)
 
-        # ── quick presence commands ──
+        # ── quick presence ──
         if cmd == "playing":
             txt = " ".join(args[1:]) if len(args) > 1 else None
-            return await inner.playing_cmd(ctx, message=txt) if hasattr(inner, "playing_cmd") else None
+            fn = getattr(inner, "playing_cmd", None)
+            if fn is None:
+                return await message.channel.send(S.ui_err("playing handler missing in rpc cog"))
+            return await fn(ctx, message=txt)
         if cmd in ("listening", "listen"):
             txt = " ".join(args[1:]) if len(args) > 1 else None
-            return await inner.listening_cmd(ctx, message=txt)
+            fn = getattr(inner, "listening_cmd", None)
+            if fn is None:
+                return await message.channel.send(S.ui_err("listening handler missing in rpc cog"))
+            return await fn(ctx, message=txt)
         if cmd in ("watching", "watch"):
             txt = " ".join(args[1:]) if len(args) > 1 else None
-            return await inner.watching_cmd(ctx, message=txt)
+            fn = getattr(inner, "watching_cmd", None)
+            if fn is None:
+                return await message.channel.send(S.ui_err("watching handler missing in rpc cog"))
+            return await fn(ctx, message=txt)
         if cmd == "competing":
             txt = " ".join(args[1:]) if len(args) > 1 else None
-            return await inner.competing_cmd(ctx, message=txt)
+            fn = getattr(inner, "competing_cmd", None)
+            if fn is None:
+                return await message.channel.send(S.ui_err("competing handler missing in rpc cog"))
+            return await fn(ctx, message=txt)
         if cmd == "stopactivity":
             return await inner.stopactivity_cmd(ctx)
         if cmd == "aoff":
@@ -128,16 +128,7 @@ class RpcAdapterCog:
             return await inner.rpc_status(ctx)
 
         if cmd in ("spotify", "youtube", "xbox", "ps", "ps4", "crunchy", "vrchat", "meta"):
-            method = {
-                "spotify": getattr(inner, "cmd_spotify", None),
-                "youtube": getattr(inner, "cmd_youtube", None),
-                "xbox":    getattr(inner, "cmd_xbox", None),
-                "ps":      getattr(inner, "cmd_ps", None),
-                "ps4":     getattr(inner, "cmd_ps4", None),
-                "crunchy": getattr(inner, "cmd_crunchy", None),
-                "vrchat":  getattr(inner, "cmd_vrchat", None),
-                "meta":    getattr(inner, "cmd_meta", None),
-            }.get(cmd)
+            method = getattr(inner, f"cmd_{cmd}", None)
             if method is None:
                 return await message.channel.send(S.ui_err(f"{cmd} handler missing in rpc cog"))
             rest = " ".join(args[1:]) if len(args) > 1 else None
@@ -145,16 +136,20 @@ class RpcAdapterCog:
 
         if cmd == "rstatus":
             txt = " ".join(args[1:]) if len(args) > 1 else None
-            return await inner.rotate_status(ctx, statuses=txt) if txt else None
+            if not txt:
+                return await message.channel.send(S.ui_err("usage: rstatus <a, b, c>"))
+            return await inner.rotate_status(ctx, statuses=txt)
         if cmd == "remoji":
             txt = " ".join(args[1:]) if len(args) > 1 else None
-            return await inner.rotate_emoji(ctx, emojis=txt) if txt else None
+            if not txt:
+                return await message.channel.send(S.ui_err("usage: remoji <a, b, c>"))
+            return await inner.rotate_emoji(ctx, emojis=txt)
         if cmd == "stopstatus":
             return await inner.stop_rotate_status(ctx)
         if cmd == "stopemoji":
             return await inner.stop_rotate_emoji(ctx)
 
-        # ── `$rpc` top-level shim: `$rpc <slot> <field> <value>` ──
+        # ── `$rpc <slot> <field> <value>` ──
         if cmd == "rpc":
             if len(args) < 2:
                 return await message.channel.send(S.ui_info(
@@ -169,38 +164,39 @@ class RpcAdapterCog:
                 if slot < 0 or slot > 5:
                     return await message.channel.send(S.ui_err("slot must be 1–6"))
                 field = args[2].lower() if len(args) > 2 else ""
-                value = " ".join(args[3:]) if len(args) > 3 else ""
-                return await self._rpc_slot_sub(ctx, slot, field, value.split() if value else [])
+                rest = args[3:] if len(args) > 3 else []
+                return await self._rpc_slot_sub(ctx, slot, field, rest)
             return await message.channel.send(S.ui_err("unknown rpc subcommand"))
+
+    # sub → (method suffix, param name | None for no-arg | "buttons" for label+url)
+    _SUB_MAP = {
+        "name":        ("name", "name"),
+        "details":     ("details", "details"),
+        "state":       ("state", "state"),
+        "type":        ("type", "activity_type"),
+        "platform":    ("platform", "preset"),
+        "large_image": ("large_image", "url"),
+        "small_image": ("small_image", "url"),
+        "timestamp":   ("timestamp", "value"),
+        "btn1":        ("btn1", "buttons"),
+        "btn2":        ("btn2", "buttons"),
+        "spotify":     ("spotify", "args"),
+        "youtube":     ("youtube", "args"),
+        "xbox":        ("xbox", "args"),
+        "ps":          ("ps", "args"),
+        "ps4":         ("ps4", "args"),
+        "crunchy":     ("crunchy", "args"),
+        "clear":       ("clear", None),
+    }
 
     async def _rpc_slot_sub(self, ctx, slot: int, sub: str, rest: list):
         """Route $rpcN <sub> <args...> into the upstream RPCCog methods."""
         inner = self._inner
         msg = " ".join(rest)
-
-        # maps user-facing sub → (method suffix, arg style)
-        method_map = {
-            "name":        "name",
-            "details":     "details",
-            "state":       "state",
-            "type":        "type",
-            "platform":    "platform",
-            "large_image": "large_image",
-            "small_image": "small_image",
-            "timestamp":   "timestamp",
-            "btn1":        "btn1",
-            "btn2":        "btn2",
-            "spotify":     "spotify",
-            "youtube":     "youtube",
-            "xbox":        "xbox",
-            "ps":          "ps",
-            "ps4":         "ps4",
-            "crunchy":     "crunchy",
-            "clear":       "clear",
-        }
-        suffix = method_map.get(sub)
-        if suffix is None:
+        entry = self._SUB_MAP.get(sub)
+        if entry is None:
             return await ctx.send(S.ui_err(f"unknown rpc field: {sub}"))
+        suffix, param = entry
 
         full = f"rpc{slot + 1}_{suffix}"
         fn = getattr(inner, full, None)
@@ -208,17 +204,17 @@ class RpcAdapterCog:
             return await ctx.send(S.ui_err(f"{full} not found in rpc cog"))
 
         try:
-            if sub in ("btn1", "btn2"):
+            if param is None:
+                # clear — no args
+                return await fn(ctx)
+            if param == "buttons":
+                # btn1/btn2 — takes (ctx, label, url) positionally
                 if len(rest) < 2:
                     return await ctx.send(S.ui_err(f"usage: {sub} <label> <url>"))
                 url = rest[-1]
                 label = " ".join(rest[:-1])
                 return await fn(ctx, label, url)
-            if sub == "clear":
-                return await fn(ctx)
-            if sub in ("spotify", "youtube", "xbox", "ps", "ps4", "crunchy"):
-                return await fn(ctx, msg or None)
-            # name / details / state / type / platform / images / timestamp
-            return await fn(ctx, msg)
+            # everything else is keyword-bound
+            return await fn(ctx, **{param: msg})
         except TypeError as e:
             return await ctx.send(S.ui_err(f"arg mismatch for {full}: {e}"))
