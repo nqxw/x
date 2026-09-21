@@ -4,7 +4,7 @@ import re
 
 class AsciiHelper:
     """Helper class to format ANSI messages for Discord"""
-    
+
     @staticmethod
     def _clean_empty_lines(content: str) -> str:
         """Remove lines that only contain '> ' and nothing else"""
@@ -15,7 +15,7 @@ class AsciiHelper:
                 continue
             cleaned_lines.append(line)
         return '\n'.join(cleaned_lines)
-    
+
     @staticmethod
     def format(message, username=None):
         """Format a message with ANSI colors inside a codeblock"""
@@ -25,7 +25,7 @@ class AsciiHelper:
             result += f"> {line}\n"
         result += "> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def multiline(lines, username=None, raw=False, cmd_count=None, page_info=None):
         """Format multiple lines of text with ANSI colors"""
@@ -38,7 +38,7 @@ class AsciiHelper:
                     result += f"> {line}\n"
             result += "> ```"
             return AsciiHelper._clean_empty_lines(result)
-        
+
         ansi_lines = []
         for line in lines:
             if line.strip() == "":
@@ -50,32 +50,32 @@ class AsciiHelper:
             result += f"> {line}\n"
         result += "> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def info(message):
-        result = f"> ```ansi\n> \x1b[2;37m[Authd?] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[lunar] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def success(message):
-        result = f"> ```ansi\n> \x1b[2;37m[Authd] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[lunar] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def error(message):
-        result = f"> ```ansi\n> \x1b[2;37m[Authd - error] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[lunar - error] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def warning(message):
-        result = f"> ```ansi\n> \x1b[2;37m[Authd :-:] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[lunar :-:] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def custom(message, color_code="2;37m"):
         result = f"> ```ansi\n> \x1b[{color_code}{message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
-    
+
     @staticmethod
     def table(data, headers=None):
         if not data:
