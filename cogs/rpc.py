@@ -10,9 +10,6 @@ import hashlib
 from pathlib import Path
 from discord.ext import commands
 
-# pull the live client from cogs.state if we weren't handed one explicitly.
-# this is what fixes `RPCCog.__init__() missing 1 required positional argument: 'bot'`
-# when selfbot.py's _boot_cogs does `cls()` on every cog.
 try:
     from cogs import state as cstate
 except Exception:
@@ -22,7 +19,6 @@ try:
     from utils.ascii_helper import AsciiHelper
     ascii = AsciiHelper()
 except Exception as e:
-    # fallback shim if utils/ascii_helper.py isn't present
     class _AsciiFallback:
         def success(self, msg): return f"✓ {msg}"
         def error(self, msg): return f"✗ {msg}"
@@ -70,7 +66,6 @@ PLATFORM_PRESET_MAP = {
 INLINE_KEYS = ["name", "details", "state", "type", "timestamp", "platform",
                "large_image_text", "large_image", "small_image", "btn1", "btn2"]
 
-# fields Discord requires on every activity payload — restored after load
 REQUIRED_ACTIVITY_FIELDS = {
     "type": 0,
     "name": "Default",
@@ -79,7 +74,6 @@ REQUIRED_ACTIVITY_FIELDS = {
     "instance": True,
 }
 
-# fields that make a Spotify presence actually render as Spotify
 SPOTIFY_FIELDS_TO_KEEP = {
     "session_id", "sync_id", "party", "secrets", "metadata", "flags",
     "application_id", "assets", "type", "name", "details", "state",
@@ -88,9 +82,21 @@ SPOTIFY_FIELDS_TO_KEEP = {
 
 
 class RPCCog(commands.Cog, name="Rich Presence"):
+
+    # ── dispatcher registration ──
+    # the selfbot's custom dispatcher routes via _COG_REGISTRY, which is built
+    # from this set. every name below is what the user types after the prefix.
+    COMMANDS = {
+        "rpc1", "rpc2", "rpc3", "rpc4", "rpc5", "rpc6",
+        "roblox", "spotify", "youtube", "xbox", "ps", "ps4",
+        "crunchy", "vrchat", "meta",
+        "playing", "listening", "watching", "competing",
+        "stopactivity", "setpresencestatus", "aoff",
+        "clear_multi_rpc", "rpc_status",
+        "rstatus", "remoji", "stopstatus", "stopemoji",
+    }
+
     def __init__(self, bot=None):
-        # tolerant init: accept a client arg or pull it from cogs.state.
-        # this is the exact fix for `RPCCog.__init__() missing 1 required positional argument: 'bot'`
         if bot is None and cstate is not None:
             bot = getattr(cstate, "CLIENT", None) or getattr(cstate, "MAIN_CLIENT", None)
         if bot is None:
@@ -108,19 +114,370 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self.current_status = ""
         self.current_emoji = ""
         self._interceptor_active = False
-        self._interceptor_ws = None          # ws instance we patched
-        self._original_ws_send = None        # ref to the unpatched send
+        self._interceptor_ws = None
+        self._original_ws_send = None
         self._clearing = False
         self._bg_tasks = []
         self._deferred_started = False
         try:
             self.bot.loop.create_task(self._deferred_start())
         except Exception:
-            # fallback for environments without bot.loop
             asyncio.ensure_future(self._deferred_start())
 
+    # ── dispatcher entry point ──
+
+    async def handle(self, message, cmd, args):
+        """Called by selfbot.py::_dispatch_message when cmd is in COMMANDS.
+        args is the full token list, args[0] == cmd."""
+        try:
+            rest = args[1:] if len(args) > 1 else []
+
+            if cmd in ("rpc1", "rpc2", "rpc3", "rpc4", "rpc5", "rpc6"):
+                slot = int(cmd[3]) - 1
+                await self._handle_slot(message, slot, rest)
+                return
+
+            if cmd in ("roblox", "spotify", "youtube", "xbox", "ps", "ps4",
+                       "crunchy", "vrchat", "meta"):
+                await self._handle_quick(message, cmd, rest)
+                return
+
+            if cmd == "playing":
+                await message.channel.send(ascii.error("Use `.rpc1 type playing` + `.rpc1 name <text>` instead"))
+                return
+            if cmd == "listening":
+                await message.channel.send(ascii.error("Use `.rpc1 type listening` + `.rpc1 name <text>` instead"))
+                return
+            if cmd == "watching":
+                await message.channel.send(ascii.error("Use `.rpc1 type watching` + `.rpc1 name <text>` instead"))
+                return
+            if cmd == "competing":
+                await message.channel.send(ascii.error("Use `.rpc1 type competing` + `.rpc1 name <text>` instead"))
+                return
+            if cmd == "stopactivity":
+                self.rpc_slots = [None] * 6
+                await self.apply_activities()
+                await message.channel.send(ascii.info("Activity cleared"))
+                return
+            if cmd == "aoff":
+                await message.channel.send(ascii.info("Use `.clear_multi_rpc` to wipe all slots"))
+                return
+            if cmd == "setpresencestatus":
+                await message.channel.send(ascii.error("Use the status cog's setpresencestatus"))
+                return
+            if cmd == "clear_multi_rpc":
+                self._clearing = True
+                try:
+                    self.rpc_slots = [None] * 6
+                    if self.bot.ws:
+                        await self.bot.ws.send(json.dumps({
+                            "op": 3, "d": {"since": 0, "activities": [],
+                                            "status": "online", "afk": False}}))
+                    self._save_rpc_slots()
+                finally:
+                    self._clearing = False
+                await message.channel.send(ascii.info("Cleared all RPC slots"))
+                return
+            if cmd == "rpc_status":
+                type_names = {0: "Playing", 1: "Streaming", 2: "Listening",
+                              3: "Watching", 5: "Competing"}
+                lines = []
+                for i, act in enumerate(self.rpc_slots):
+                    if act is None:
+                        lines.append(f"RPC{i+1} — empty")
+                    else:
+                        t = act.get("type", 0)
+                        label = type_names.get(t, "Unknown")
+                        lines.append(
+                            f"RPC{i+1} [{label}] {act.get('name', '—')} | "
+                            f"{act.get('details', '—')} | {act.get('state', '—')}")
+                await message.channel.send(ascii.multiline(lines))
+                return
+            if cmd == "rstatus":
+                if not rest:
+                    await message.channel.send(ascii.error("Usage: .rstatus a,b,c")); return
+                status_list = [s.strip() for s in " ".join(rest).split(",") if s.strip()]
+                if not status_list:
+                    await message.channel.send(ascii.error("Separate statuses by commas")); return
+                if self._status_rotation_task and not self._status_rotation_task.done():
+                    self._status_rotation_task.cancel()
+                self.status_rotation_active = True
+
+                async def _loop():
+                    idx = 0
+                    try:
+                        while self.status_rotation_active:
+                            self.current_status = status_list[idx]
+                            await self._patch_custom_status()
+                            await asyncio.sleep(8)
+                            idx = (idx + 1) % len(status_list)
+                    finally:
+                        self.current_status = ""
+                        try: await self._patch_custom_status()
+                        except Exception: pass
+
+                await message.channel.send(ascii.info(f"Status rotation: {len(status_list)} statuses"))
+                self._status_rotation_task = asyncio.create_task(_loop())
+                return
+            if cmd == "remoji":
+                if not rest:
+                    await message.channel.send(ascii.error("Usage: .remoji 🅰️,🅱️")); return
+                emoji_list = [e.strip() for e in " ".join(rest).split(",") if e.strip()]
+                if not emoji_list:
+                    await message.channel.send(ascii.error("Separate emojis by commas")); return
+                if self._emoji_rotation_task and not self._emoji_rotation_task.done():
+                    self._emoji_rotation_task.cancel()
+                self.emoji_rotation_active = True
+
+                async def _loop2():
+                    idx = 0
+                    try:
+                        while self.emoji_rotation_active:
+                            self.current_emoji = emoji_list[idx]
+                            await self._patch_custom_status()
+                            await asyncio.sleep(8)
+                            idx = (idx + 1) % len(emoji_list)
+                    finally:
+                        self.current_emoji = ""
+                        try: await self._patch_custom_status()
+                        except Exception: pass
+
+                await message.channel.send(ascii.info(f"Emoji rotation: {len(emoji_list)} emojis"))
+                self._emoji_rotation_task = asyncio.create_task(_loop2())
+                return
+            if cmd == "stopstatus":
+                self.status_rotation_active = False
+                await message.channel.send(ascii.info("Status rotation stopped"))
+                return
+            if cmd == "stopemoji":
+                self.emoji_rotation_active = False
+                await message.channel.send(ascii.info("Emoji rotation stopped"))
+                return
+        except Exception as e:
+            import traceback
+            print(f"[rpc] handle error on {cmd}: {e}")
+            traceback.print_exc()
+            try:
+                await message.channel.send(ascii.error(f"`{cmd}` errored — check console"))
+            except Exception:
+                pass
+
+    # ── slot subcommand dispatch ──
+
+    async def _handle_slot(self, message, slot, rest):
+        ch = message.channel
+        label = f"RPC{slot+1}"
+
+        if not rest:
+            # inline form: .rpc1 name X | details Y | ...
+            # but with no args there's nothing to parse
+            await ch.send(ascii.error(f"Usage: .rpc{slot+1} name <text> | details <text> | ..."))
+            return
+
+        sub = rest[0].lower()
+        payload = rest[1:]
+        rest_str = " ".join(payload)
+
+        # inline-parse fallback when sub isn't a known subcommand
+        known_subs = {"name", "details", "state", "type", "platform", "timestamp",
+                      "large_image", "small_image", "large_image_text", "btn1", "btn2",
+                      "spotify", "youtube", "xbox", "ps", "ps4", "crunchy", "crunchyroll",
+                      "roblox", "vrchat", "clear"}
+        if sub not in known_subs:
+            parsed = self._parse_inline(" ".join(rest))
+            if parsed:
+                await self._apply_inline(slot, parsed)
+                await self.apply_activities()
+                await ch.send(ascii.success(f"{label} updated"))
+            else:
+                await ch.send(ascii.error(f"Unknown subcommand: {sub}"))
+            return
+
+        if sub == "name":
+            self._ensure_slot(slot); self.rpc_slots[slot]["name"] = rest_str
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} name: {rest_str}"))
+        elif sub == "details":
+            self._ensure_slot(slot); self.rpc_slots[slot]["details"] = rest_str
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} details: {rest_str}"))
+        elif sub == "state":
+            self._ensure_slot(slot); self.rpc_slots[slot]["state"] = rest_str
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} state: {rest_str}"))
+        elif sub == "type":
+            t = rest_str.lower()
+            if t not in TYPE_MAP:
+                await ch.send(ascii.error("Invalid type")); return
+            self._ensure_slot(slot); self.rpc_slots[slot]["type"] = TYPE_MAP[t]
+            if t == "purplestream":
+                self.rpc_slots[slot]["url"] = PURPLESTREAM_URL
+            elif "url" in self.rpc_slots[slot] and t not in ("streaming", "purplestream"):
+                del self.rpc_slots[slot]["url"]
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} type: {t}"))
+        elif sub == "platform":
+            if self._apply_platform_preset(slot, rest_str.lower()):
+                await self.apply_activities(); await ch.send(ascii.success(f"{label} platform: {rest_str}"))
+            else:
+                await ch.send(ascii.error("Unknown platform"))
+        elif sub == "timestamp":
+            self._ensure_slot(slot)
+            if rest_str.lower() == "clear":
+                self.rpc_slots[slot].pop("timestamps", None)
+                await ch.send(ascii.info(f"{label} timestamp cleared"))
+            else:
+                try:
+                    self._set_timestamp(slot, rest_str)
+                    await self.apply_activities()
+                    await ch.send(ascii.success(f"{label} timestamp: {rest_str}"))
+                except Exception:
+                    await ch.send(ascii.error("Use format: 3600 or 1:00:00"))
+        elif sub == "large_image":
+            if not rest_str:
+                await ch.send(ascii.error(f"Usage: .rpc{slot+1} large_image <url>")); return
+            key = await self.upload_asset(rest_str)
+            if key:
+                self._ensure_slot(slot)
+                self.rpc_slots[slot].setdefault("assets", {})["large_image"] = key
+                await self.apply_activities(); await ch.send(ascii.success(f"{label} large image set"))
+            else:
+                await ch.send(ascii.error("upload failed"))
+        elif sub == "small_image":
+            if not rest_str:
+                await ch.send(ascii.error(f"Usage: .rpc{slot+1} small_image <url>")); return
+            key = await self.upload_asset(rest_str)
+            if key:
+                self._ensure_slot(slot)
+                self.rpc_slots[slot].setdefault("assets", {})["small_image"] = key
+                await self.apply_activities(); await ch.send(ascii.success(f"{label} small image set"))
+            else:
+                await ch.send(ascii.error("upload failed"))
+        elif sub == "large_image_text":
+            self._ensure_slot(slot)
+            self.rpc_slots[slot].setdefault("assets", {})["large_text"] = rest_str
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} large text set"))
+        elif sub == "btn1":
+            if len(payload) < 2:
+                await ch.send(ascii.error(f"Usage: .rpc{slot+1} btn1 <label> <url>")); return
+            self._ensure_slot(slot)
+            btns = self.rpc_slots[slot].setdefault("buttons", [])
+            entry = {"label": " ".join(payload[:-1]), "url": payload[-1]}
+            if not btns: btns.append(entry)
+            else: btns[0] = entry
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} btn1: {entry['label']}"))
+        elif sub == "btn2":
+            if len(payload) < 2:
+                await ch.send(ascii.error(f"Usage: .rpc{slot+1} btn2 <label> <url>")); return
+            self._ensure_slot(slot)
+            btns = self.rpc_slots[slot].setdefault("buttons", [])
+            while len(btns) < 2: btns.append(None)
+            btns[1] = {"label": " ".join(payload[:-1]), "url": payload[-1]}
+            self.rpc_slots[slot]["buttons"] = [b for b in btns if b]
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} btn2: {btns[1]['label']}"))
+        elif sub == "spotify":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["Default", "Unknown"]
+            if len(parts) < 2: parts.append("Unknown")
+            activity = await self.build_spotify(parts)
+            if not activity:
+                await ch.send(ascii.error("Format: Song - Artist")); return
+            self.rpc_slots[slot] = activity
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} Spotify: {parts[0]}"))
+        elif sub == "youtube":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["Default Video", "Default Channel"]
+            if len(parts) < 2: parts.append("Default Channel")
+            activity = await self.build_youtube(parts)
+            if not activity:
+                await ch.send(ascii.error("Format: Video - Channel")); return
+            self.rpc_slots[slot] = activity
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} YouTube: {parts[0]}"))
+        elif sub == "xbox":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["Xbox"]
+            self.rpc_slots[slot] = await self.build_xbox(parts)
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} Xbox: {parts[0]}"))
+        elif sub == "ps":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["PlayStation"]
+            self.rpc_slots[slot] = await self.build_playstation(parts)
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} PS: {parts[0]}"))
+        elif sub == "ps4":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["PS4"]
+            self.rpc_slots[slot] = await self.build_playstation(parts, ps4=True)
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} PS4: {parts[0]}"))
+        elif sub in ("crunchy", "crunchyroll"):
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["Crunchyroll"]
+            self.rpc_slots[slot] = await self.build_crunchyroll(parts)
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} Crunchyroll: {parts[0]}"))
+        elif sub == "roblox":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["Roblox"]
+            self.rpc_slots[slot] = await self.build_roblox(parts)
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} Roblox: {parts[0]}"))
+        elif sub == "vrchat":
+            parts = [p.strip() for p in rest_str.split("-")] if rest_str else ["Exploring VRChat", "VRChat"]
+            self.rpc_slots[slot] = await self.build_vrchat(parts)
+            await self.apply_activities(); await ch.send(ascii.success(f"{label} VRChat: {parts[0]}"))
+        elif sub == "clear":
+            self.rpc_slots[slot] = None
+            await self.apply_activities(); await ch.send(ascii.info(f"{label} cleared"))
+
+    # ── quick commands ──
+
+    async def _handle_quick(self, message, cmd, rest):
+        ch = message.channel
+        words = list(rest)
+        slot = 0
+        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
+            slot = int(words[-1]) - 1
+            words = words[:-1]
+        payload = " ".join(words)
+        parts = [p.strip() for p in payload.split("-")] if payload else []
+
+        if cmd == "roblox":
+            if not parts: parts = ["Roblox"]
+            self.rpc_slots[slot] = await self.build_roblox(parts)
+        elif cmd == "spotify":
+            if len(parts) < 2: parts.append("Unknown")
+            a = await self.build_spotify(parts)
+            if not a:
+                await ch.send(ascii.error("Format: Song - Artist")); return
+            self.rpc_slots[slot] = a
+        elif cmd == "youtube":
+            if len(parts) < 2: parts.append("Default Channel")
+            a = await self.build_youtube(parts)
+            if not a:
+                await ch.send(ascii.error("Format: Video - Channel")); return
+            self.rpc_slots[slot] = a
+        elif cmd == "xbox":
+            if not parts: parts = ["Xbox"]
+            self.rpc_slots[slot] = await self.build_xbox(parts)
+        elif cmd == "ps":
+            if not parts: parts = ["PlayStation"]
+            self.rpc_slots[slot] = await self.build_playstation(parts)
+        elif cmd == "ps4":
+            if not parts: parts = ["PS4"]
+            self.rpc_slots[slot] = await self.build_playstation(parts, ps4=True)
+        elif cmd == "crunchy":
+            if not parts: parts = ["Crunchyroll"]
+            self.rpc_slots[slot] = await self.build_crunchyroll(parts)
+        elif cmd == "vrchat":
+            if not parts: parts = ["Exploring VRChat", "VRChat"]
+            self.rpc_slots[slot] = await self.build_vrchat(parts)
+        elif cmd == "meta":
+            image_url = None
+            for i, w in enumerate(words):
+                if w.startswith(("http://", "https://")):
+                    image_url = w
+                    words = words[:i] + words[i+1:]
+                    break
+            if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
+                slot = int(words[-1]) - 1
+                words = words[:-1]
+            payload2 = " ".join(words)
+            p2 = [p.strip() for p in payload2.split("-")] if payload2 else ["Exploring VRChat", "VRChat"]
+            self.rpc_slots[slot] = await self.build_vrchat(p2, image_url)
+
+        await self.apply_activities()
+        shown = parts[0] if parts else "ok"
+        await ch.send(ascii.success(f"{cmd} → slot {slot+1}: {shown}"))
+
+    # ── lifecycle ──
+
     async def _deferred_start(self):
-        """Wait for ready, then wire up background loops and the interceptor."""
         if self._deferred_started:
             return
         self._deferred_started = True
@@ -141,12 +498,10 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 print("[RPC] Restored RPC slots on startup")
             except Exception as e:
                 print(f"[RPC] restore push failed: {e}")
-        # background refreshers
         self._bg_tasks.append(asyncio.create_task(self.auto_refresh_presence()))
         self._bg_tasks.append(asyncio.create_task(self.auto_refresh_cdn_assets()))
 
     async def cog_unload(self):
-        """Clean up: stop interceptor, cancel background tasks, stop rotations."""
         await self._stop_presence_interceptor()
         self.status_rotation_active = False
         self.emoji_rotation_active = False
@@ -161,12 +516,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
     # ── presence interceptor ──
 
     async def _start_presence_interceptor(self):
-        """Attach or re-attach the op:3 patch to the CURRENT ws.
-
-        A reconnect replaces self.bot.ws with a new object, so we can't trust
-        the _interceptor_active flag alone — we also have to verify the ws
-        identity we patched is still the live one.
-        """
         if self._interceptor_active and self.bot.ws is self._interceptor_ws:
             return
 
@@ -178,8 +527,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             print("[RPC] Could not attach interceptor - no websocket")
             return
 
-        # if we previously patched a different ws, drop that stale flag.
-        # the old ws object is gone anyway; nothing to restore.
         self._interceptor_ws = self.bot.ws
         self._original_ws_send = self.bot.ws.send
         original = self._original_ws_send
@@ -211,7 +558,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         print("[RPC] Presence interceptor active")
 
     async def _stop_presence_interceptor(self):
-        """Best-effort restore of the original ws.send if the ws is still alive."""
         if not self._interceptor_active:
             return
         try:
@@ -226,10 +572,8 @@ class RPCCog(commands.Cog, name="Rich Presence"):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        """Fires on every ready; re-attach if the ws changed or we lost the patch."""
         try:
             if self.bot.ws is not self._interceptor_ws:
-                # new ws — old patch is dead, force re-attach
                 self._interceptor_active = False
             await self._start_presence_interceptor()
             if any(a is not None for a in self.rpc_slots):
@@ -240,7 +584,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
     # ── persistence ──
 
     def _get_user_file(self, filename):
-        """Per-user file path. Uses the given filename under data/."""
         if not self.bot.user:
             return Path(f"data/_unready_{filename}")
         uid = str(self.bot.user.id)
@@ -273,7 +616,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 data = json.load(f)
             for i, slot in enumerate(data[:6]):
                 if slot:
-                    # restore required fields
                     for k, v in REQUIRED_ACTIVITY_FIELDS.items():
                         slot.setdefault(k, v)
                     slot.setdefault("assets", {})
@@ -507,7 +849,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             return None
         if image_url in self._asset_cache:
             return self._asset_cache[image_url]
-        # already a Discord CDN URL
         discord_cdn_pattern = (r"https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)"
                                 r"/attachments/(\d+)/(\d+)/(.+)")
         match = re.search(discord_cdn_pattern, image_url)
@@ -517,7 +858,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             self._asset_cache[image_url] = key
             self._asset_urls[key] = image_url
             return key
-        # need to upload
         if not self.bot.user:
             print("[RPC] upload_asset: bot.user not ready")
             return None
@@ -658,7 +998,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         }
 
     async def build_roblox(self, parts: list):
-        """Roblox presence — game name, optional details/state, elapsed timer."""
         game = (parts[0] if parts else "Roblox")[:128]
         now = int(time.time() * 1000)
         activity = {
@@ -677,1171 +1016,7 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             activity["assets"]["small_text"] = parts[2][:128]
         return activity
 
-    # ── RPC slot groups (1..6) ──
-
-    @commands.group(name="rpc1", invoke_without_command=True)
-    async def rpc1(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .rpc1 name <text> | ...")); return
-        parsed = self._parse_inline(args)
-        if parsed:
-            await self._apply_inline(0, parsed)
-            await self.apply_activities()
-            await ctx.send(ascii.success("RPC1 updated"))
-
-    @rpc1.command(name="name")
-    async def rpc1_name(self, ctx, *, name: str):
-        self._ensure_slot(0); self.rpc_slots[0]["name"] = name
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 name: {name}"))
-
-    @rpc1.command(name="details")
-    async def rpc1_details(self, ctx, *, details: str):
-        self._ensure_slot(0); self.rpc_slots[0]["details"] = details
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 details: {details}"))
-
-    @rpc1.command(name="state")
-    async def rpc1_state(self, ctx, *, state: str):
-        self._ensure_slot(0); self.rpc_slots[0]["state"] = state
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 state: {state}"))
-
-    @rpc1.command(name="type")
-    async def rpc1_type(self, ctx, activity_type: str):
-        t = activity_type.lower()
-        if t not in TYPE_MAP:
-            await ctx.send(ascii.error("Invalid type")); return
-        self._ensure_slot(0); self.rpc_slots[0]["type"] = TYPE_MAP[t]
-        if t == "purplestream":
-            self.rpc_slots[0]["url"] = PURPLESTREAM_URL
-        elif "url" in self.rpc_slots[0] and t not in ("streaming", "purplestream"):
-            del self.rpc_slots[0]["url"]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 type: {activity_type}"))
-
-    @rpc1.command(name="platform")
-    async def rpc1_platform(self, ctx, preset: str):
-        if self._apply_platform_preset(0, preset.lower()):
-            await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 platform: {preset}"))
-        else:
-            await ctx.send(ascii.error("Unknown platform"))
-
-    @rpc1.command(name="large_image")
-    async def rpc1_large_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(0)
-            self.rpc_slots[0].setdefault("assets", {})["large_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC1 large image set"))
-
-    @rpc1.command(name="small_image")
-    async def rpc1_small_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(0)
-            self.rpc_slots[0].setdefault("assets", {})["small_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC1 small image set"))
-
-    @rpc1.command(name="timestamp")
-    async def rpc1_timestamp(self, ctx, value: str):
-        self._ensure_slot(0)
-        if value.lower() == "clear":
-            self.rpc_slots[0].pop("timestamps", None)
-            await ctx.send(ascii.info("RPC1 timestamp cleared"))
-        else:
-            try:
-                self._set_timestamp(0, value)
-                await self.apply_activities()
-                await ctx.send(ascii.success(f"RPC1 timestamp: {value}"))
-            except Exception:
-                await ctx.send(ascii.error("Use format: 3600 or 1:00:00"))
-
-    @rpc1.command(name="btn1")
-    async def rpc1_btn1(self, ctx, label: str, url: str):
-        self._ensure_slot(0)
-        btns = self.rpc_slots[0].setdefault("buttons", [])
-        entry = {"label": label, "url": url}
-        if not btns: btns.append(entry)
-        else: btns[0] = entry
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 btn1: {label}"))
-
-    @rpc1.command(name="btn2")
-    async def rpc1_btn2(self, ctx, label: str, url: str):
-        self._ensure_slot(0)
-        btns = self.rpc_slots[0].setdefault("buttons", [])
-        while len(btns) < 2: btns.append(None)
-        btns[1] = {"label": label, "url": url}
-        self.rpc_slots[0]["buttons"] = [b for b in btns if b]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 btn2: {label}"))
-
-    @rpc1.command(name="spotify")
-    async def rpc1_spotify(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default", "Unknown"]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[0] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 Spotify: {parts[0]}"))
-
-    @rpc1.command(name="youtube")
-    async def rpc1_youtube(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default Video", "Default Channel"]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[0] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 YouTube: {parts[0]}"))
-
-    @rpc1.command(name="xbox")
-    async def rpc1_xbox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[0] = await self.build_xbox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 Xbox: {parts[0]}"))
-
-    @rpc1.command(name="ps")
-    async def rpc1_ps(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[0] = await self.build_playstation(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 PS: {parts[0]}"))
-
-    @rpc1.command(name="ps4")
-    async def rpc1_ps4(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[0] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 PS4: {parts[0]}"))
-
-    @rpc1.command(name="crunchy")
-    async def rpc1_crunchy(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[0] = await self.build_crunchyroll(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 Crunchyroll: {parts[0]}"))
-
-    @rpc1.command(name="roblox")
-    async def rpc1_roblox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[0] = await self.build_roblox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 Roblox: {parts[0]}"))
-
-    @rpc1.command(name="clear")
-    async def rpc1_clear(self, ctx):
-        self.rpc_slots[0] = None
-        await self.apply_activities(); await ctx.send(ascii.info("RPC1 cleared"))
-
-    # RPC2
-    @commands.group(name="rpc2", invoke_without_command=True)
-    async def rpc2(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .rpc2 name <text> | ...")); return
-        parsed = self._parse_inline(args)
-        if parsed:
-            await self._apply_inline(1, parsed)
-            await self.apply_activities()
-            await ctx.send(ascii.success("RPC2 updated"))
-
-    @rpc2.command(name="name")
-    async def rpc2_name(self, ctx, *, name: str):
-        self._ensure_slot(1); self.rpc_slots[1]["name"] = name
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 name: {name}"))
-
-    @rpc2.command(name="details")
-    async def rpc2_details(self, ctx, *, details: str):
-        self._ensure_slot(1); self.rpc_slots[1]["details"] = details
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 details: {details}"))
-
-    @rpc2.command(name="state")
-    async def rpc2_state(self, ctx, *, state: str):
-        self._ensure_slot(1); self.rpc_slots[1]["state"] = state
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 state: {state}"))
-
-    @rpc2.command(name="type")
-    async def rpc2_type(self, ctx, activity_type: str):
-        t = activity_type.lower()
-        if t not in TYPE_MAP:
-            await ctx.send(ascii.error("Invalid type")); return
-        self._ensure_slot(1); self.rpc_slots[1]["type"] = TYPE_MAP[t]
-        if t == "purplestream":
-            self.rpc_slots[1]["url"] = PURPLESTREAM_URL
-        elif "url" in self.rpc_slots[1] and t not in ("streaming", "purplestream"):
-            del self.rpc_slots[1]["url"]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 type: {activity_type}"))
-
-    @rpc2.command(name="platform")
-    async def rpc2_platform(self, ctx, preset: str):
-        if self._apply_platform_preset(1, preset.lower()):
-            await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 platform: {preset}"))
-        else:
-            await ctx.send(ascii.error("Unknown platform"))
-
-    @rpc2.command(name="large_image")
-    async def rpc2_large_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(1)
-            self.rpc_slots[1].setdefault("assets", {})["large_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC2 large image set"))
-
-    @rpc2.command(name="small_image")
-    async def rpc2_small_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(1)
-            self.rpc_slots[1].setdefault("assets", {})["small_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC2 small image set"))
-
-    @rpc2.command(name="timestamp")
-    async def rpc2_timestamp(self, ctx, value: str):
-        self._ensure_slot(1)
-        if value.lower() == "clear":
-            self.rpc_slots[1].pop("timestamps", None)
-            await ctx.send(ascii.info("RPC2 timestamp cleared"))
-        else:
-            try:
-                self._set_timestamp(1, value)
-                await self.apply_activities()
-                await ctx.send(ascii.success(f"RPC2 timestamp: {value}"))
-            except Exception:
-                await ctx.send(ascii.error("Use format: 3600 or 1:00:00"))
-
-    @rpc2.command(name="btn1")
-    async def rpc2_btn1(self, ctx, label: str, url: str):
-        self._ensure_slot(1)
-        btns = self.rpc_slots[1].setdefault("buttons", [])
-        entry = {"label": label, "url": url}
-        if not btns: btns.append(entry)
-        else: btns[0] = entry
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 btn1: {label}"))
-
-    @rpc2.command(name="btn2")
-    async def rpc2_btn2(self, ctx, label: str, url: str):
-        self._ensure_slot(1)
-        btns = self.rpc_slots[1].setdefault("buttons", [])
-        while len(btns) < 2: btns.append(None)
-        btns[1] = {"label": label, "url": url}
-        self.rpc_slots[1]["buttons"] = [b for b in btns if b]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 btn2: {label}"))
-
-    @rpc2.command(name="spotify")
-    async def rpc2_spotify(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default", "Unknown"]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[1] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 Spotify: {parts[0]}"))
-
-    @rpc2.command(name="youtube")
-    async def rpc2_youtube(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default Video", "Default Channel"]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[1] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 YouTube: {parts[0]}"))
-
-    @rpc2.command(name="xbox")
-    async def rpc2_xbox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[1] = await self.build_xbox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 Xbox: {parts[0]}"))
-
-    @rpc2.command(name="ps")
-    async def rpc2_ps(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[1] = await self.build_playstation(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 PS: {parts[0]}"))
-
-    @rpc2.command(name="ps4")
-    async def rpc2_ps4(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[1] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 PS4: {parts[0]}"))
-
-    @rpc2.command(name="crunchy")
-    async def rpc2_crunchy(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[1] = await self.build_crunchyroll(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 Crunchyroll: {parts[0]}"))
-
-    @rpc2.command(name="roblox")
-    async def rpc2_roblox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[1] = await self.build_roblox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 Roblox: {parts[0]}"))
-
-    @rpc2.command(name="clear")
-    async def rpc2_clear(self, ctx):
-        self.rpc_slots[1] = None
-        await self.apply_activities(); await ctx.send(ascii.info("RPC2 cleared"))
-
-    # RPC3
-    @commands.group(name="rpc3", invoke_without_command=True)
-    async def rpc3(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .rpc3 name <text> | ...")); return
-        parsed = self._parse_inline(args)
-        if parsed:
-            await self._apply_inline(2, parsed)
-            await self.apply_activities()
-            await ctx.send(ascii.success("RPC3 updated"))
-
-    @rpc3.command(name="name")
-    async def rpc3_name(self, ctx, *, name: str):
-        self._ensure_slot(2); self.rpc_slots[2]["name"] = name
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 name: {name}"))
-
-    @rpc3.command(name="details")
-    async def rpc3_details(self, ctx, *, details: str):
-        self._ensure_slot(2); self.rpc_slots[2]["details"] = details
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 details: {details}"))
-
-    @rpc3.command(name="state")
-    async def rpc3_state(self, ctx, *, state: str):
-        self._ensure_slot(2); self.rpc_slots[2]["state"] = state
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 state: {state}"))
-
-    @rpc3.command(name="type")
-    async def rpc3_type(self, ctx, activity_type: str):
-        t = activity_type.lower()
-        if t not in TYPE_MAP:
-            await ctx.send(ascii.error("Invalid type")); return
-        self._ensure_slot(2); self.rpc_slots[2]["type"] = TYPE_MAP[t]
-        if t == "purplestream":
-            self.rpc_slots[2]["url"] = PURPLESTREAM_URL
-        elif "url" in self.rpc_slots[2] and t not in ("streaming", "purplestream"):
-            del self.rpc_slots[2]["url"]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 type: {activity_type}"))
-
-    @rpc3.command(name="platform")
-    async def rpc3_platform(self, ctx, preset: str):
-        if self._apply_platform_preset(2, preset.lower()):
-            await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 platform: {preset}"))
-        else:
-            await ctx.send(ascii.error("Unknown platform"))
-
-    @rpc3.command(name="large_image")
-    async def rpc3_large_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(2)
-            self.rpc_slots[2].setdefault("assets", {})["large_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC3 large image set"))
-
-    @rpc3.command(name="small_image")
-    async def rpc3_small_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(2)
-            self.rpc_slots[2].setdefault("assets", {})["small_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC3 small image set"))
-
-    @rpc3.command(name="timestamp")
-    async def rpc3_timestamp(self, ctx, value: str):
-        self._ensure_slot(2)
-        if value.lower() == "clear":
-            self.rpc_slots[2].pop("timestamps", None)
-            await ctx.send(ascii.info("RPC3 timestamp cleared"))
-        else:
-            try:
-                self._set_timestamp(2, value)
-                await self.apply_activities()
-                await ctx.send(ascii.success(f"RPC3 timestamp: {value}"))
-            except Exception:
-                await ctx.send(ascii.error("Use format: 3600 or 1:00:00"))
-
-    @rpc3.command(name="btn1")
-    async def rpc3_btn1(self, ctx, label: str, url: str):
-        self._ensure_slot(2)
-        btns = self.rpc_slots[2].setdefault("buttons", [])
-        entry = {"label": label, "url": url}
-        if not btns: btns.append(entry)
-        else: btns[0] = entry
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 btn1: {label}"))
-
-    @rpc3.command(name="btn2")
-    async def rpc3_btn2(self, ctx, label: str, url: str):
-        self._ensure_slot(2)
-        btns = self.rpc_slots[2].setdefault("buttons", [])
-        while len(btns) < 2: btns.append(None)
-        btns[1] = {"label": label, "url": url}
-        self.rpc_slots[2]["buttons"] = [b for b in btns if b]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 btn2: {label}"))
-
-    @rpc3.command(name="spotify")
-    async def rpc3_spotify(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default", "Unknown"]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[2] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 Spotify: {parts[0]}"))
-
-    @rpc3.command(name="youtube")
-    async def rpc3_youtube(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default Video", "Default Channel"]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[2] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 YouTube: {parts[0]}"))
-
-    @rpc3.command(name="xbox")
-    async def rpc3_xbox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[2] = await self.build_xbox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 Xbox: {parts[0]}"))
-
-    @rpc3.command(name="ps")
-    async def rpc3_ps(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[2] = await self.build_playstation(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 PS: {parts[0]}"))
-
-    @rpc3.command(name="ps4")
-    async def rpc3_ps4(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[2] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 PS4: {parts[0]}"))
-
-    @rpc3.command(name="crunchy")
-    async def rpc3_crunchy(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[2] = await self.build_crunchyroll(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 Crunchyroll: {parts[0]}"))
-
-    @rpc3.command(name="roblox")
-    async def rpc3_roblox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[2] = await self.build_roblox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 Roblox: {parts[0]}"))
-
-    @rpc3.command(name="clear")
-    async def rpc3_clear(self, ctx):
-        self.rpc_slots[2] = None
-        await self.apply_activities(); await ctx.send(ascii.info("RPC3 cleared"))
-
-    # RPC4
-    @commands.group(name="rpc4", invoke_without_command=True)
-    async def rpc4(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .rpc4 name <text> | ...")); return
-        parsed = self._parse_inline(args)
-        if parsed:
-            await self._apply_inline(3, parsed)
-            await self.apply_activities()
-            await ctx.send(ascii.success("RPC4 updated"))
-
-    @rpc4.command(name="name")
-    async def rpc4_name(self, ctx, *, name: str):
-        self._ensure_slot(3); self.rpc_slots[3]["name"] = name
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 name: {name}"))
-
-    @rpc4.command(name="details")
-    async def rpc4_details(self, ctx, *, details: str):
-        self._ensure_slot(3); self.rpc_slots[3]["details"] = details
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 details: {details}"))
-
-    @rpc4.command(name="state")
-    async def rpc4_state(self, ctx, *, state: str):
-        self._ensure_slot(3); self.rpc_slots[3]["state"] = state
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 state: {state}"))
-
-    @rpc4.command(name="type")
-    async def rpc4_type(self, ctx, activity_type: str):
-        t = activity_type.lower()
-        if t not in TYPE_MAP:
-            await ctx.send(ascii.error("Invalid type")); return
-        self._ensure_slot(3); self.rpc_slots[3]["type"] = TYPE_MAP[t]
-        if t == "purplestream":
-            self.rpc_slots[3]["url"] = PURPLESTREAM_URL
-        elif "url" in self.rpc_slots[3] and t not in ("streaming", "purplestream"):
-            del self.rpc_slots[3]["url"]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 type: {activity_type}"))
-
-    @rpc4.command(name="platform")
-    async def rpc4_platform(self, ctx, preset: str):
-        if self._apply_platform_preset(3, preset.lower()):
-            await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 platform: {preset}"))
-        else:
-            await ctx.send(ascii.error("Unknown platform"))
-
-    @rpc4.command(name="large_image")
-    async def rpc4_large_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(3)
-            self.rpc_slots[3].setdefault("assets", {})["large_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC4 large image set"))
-
-    @rpc4.command(name="small_image")
-    async def rpc4_small_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(3)
-            self.rpc_slots[3].setdefault("assets", {})["small_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC4 small image set"))
-
-    @rpc4.command(name="timestamp")
-    async def rpc4_timestamp(self, ctx, value: str):
-        self._ensure_slot(3)
-        if value.lower() == "clear":
-            self.rpc_slots[3].pop("timestamps", None)
-            await ctx.send(ascii.info("RPC4 timestamp cleared"))
-        else:
-            try:
-                self._set_timestamp(3, value)
-                await self.apply_activities()
-                await ctx.send(ascii.success(f"RPC4 timestamp: {value}"))
-            except Exception:
-                await ctx.send(ascii.error("Use format: 3600 or 1:00:00"))
-
-    @rpc4.command(name="btn1")
-    async def rpc4_btn1(self, ctx, label: str, url: str):
-        self._ensure_slot(3)
-        btns = self.rpc_slots[3].setdefault("buttons", [])
-        entry = {"label": label, "url": url}
-        if not btns: btns.append(entry)
-        else: btns[0] = entry
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 btn1: {label}"))
-
-    @rpc4.command(name="btn2")
-    async def rpc4_btn2(self, ctx, label: str, url: str):
-        self._ensure_slot(3)
-        btns = self.rpc_slots[3].setdefault("buttons", [])
-        while len(btns) < 2: btns.append(None)
-        btns[1] = {"label": label, "url": url}
-        self.rpc_slots[3]["buttons"] = [b for b in btns if b]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 btn2: {label}"))
-
-    @rpc4.command(name="spotify")
-    async def rpc4_spotify(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default", "Unknown"]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[3] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 Spotify: {parts[0]}"))
-
-    @rpc4.command(name="youtube")
-    async def rpc4_youtube(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default Video", "Default Channel"]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[3] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 YouTube: {parts[0]}"))
-
-    @rpc4.command(name="xbox")
-    async def rpc4_xbox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[3] = await self.build_xbox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 Xbox: {parts[0]}"))
-
-    @rpc4.command(name="ps")
-    async def rpc4_ps(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[3] = await self.build_playstation(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 PS: {parts[0]}"))
-
-    @rpc4.command(name="ps4")
-    async def rpc4_ps4(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[3] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 PS4: {parts[0]}"))
-
-    @rpc4.command(name="crunchy")
-    async def rpc4_crunchy(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[3] = await self.build_crunchyroll(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 Crunchyroll: {parts[0]}"))
-
-    @rpc4.command(name="roblox")
-    async def rpc4_roblox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[3] = await self.build_roblox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 Roblox: {parts[0]}"))
-
-    @rpc4.command(name="clear")
-    async def rpc4_clear(self, ctx):
-        self.rpc_slots[3] = None
-        await self.apply_activities(); await ctx.send(ascii.info("RPC4 cleared"))
-
-    # RPC5
-    @commands.group(name="rpc5", invoke_without_command=True)
-    async def rpc5(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .rpc5 name <text> | ...")); return
-        parsed = self._parse_inline(args)
-        if parsed:
-            await self._apply_inline(4, parsed)
-            await self.apply_activities()
-            await ctx.send(ascii.success("RPC5 updated"))
-
-    @rpc5.command(name="name")
-    async def rpc5_name(self, ctx, *, name: str):
-        self._ensure_slot(4); self.rpc_slots[4]["name"] = name
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 name: {name}"))
-
-    @rpc5.command(name="details")
-    async def rpc5_details(self, ctx, *, details: str):
-        self._ensure_slot(4); self.rpc_slots[4]["details"] = details
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 details: {details}"))
-
-    @rpc5.command(name="state")
-    async def rpc5_state(self, ctx, *, state: str):
-        self._ensure_slot(4); self.rpc_slots[4]["state"] = state
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 state: {state}"))
-
-    @rpc5.command(name="type")
-    async def rpc5_type(self, ctx, activity_type: str):
-        t = activity_type.lower()
-        if t not in TYPE_MAP:
-            await ctx.send(ascii.error("Invalid type")); return
-        self._ensure_slot(4); self.rpc_slots[4]["type"] = TYPE_MAP[t]
-        if t == "purplestream":
-            self.rpc_slots[4]["url"] = PURPLESTREAM_URL
-        elif "url" in self.rpc_slots[4] and t not in ("streaming", "purplestream"):
-            del self.rpc_slots[4]["url"]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 type: {activity_type}"))
-
-    @rpc5.command(name="platform")
-    async def rpc5_platform(self, ctx, preset: str):
-        if self._apply_platform_preset(4, preset.lower()):
-            await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 platform: {preset}"))
-        else:
-            await ctx.send(ascii.error("Unknown platform"))
-
-    @rpc5.command(name="large_image")
-    async def rpc5_large_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(4)
-            self.rpc_slots[4].setdefault("assets", {})["large_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC5 large image set"))
-
-    @rpc5.command(name="small_image")
-    async def rpc5_small_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(4)
-            self.rpc_slots[4].setdefault("assets", {})["small_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC5 small image set"))
-
-    @rpc5.command(name="timestamp")
-    async def rpc5_timestamp(self, ctx, value: str):
-        self._ensure_slot(4)
-        if value.lower() == "clear":
-            self.rpc_slots[4].pop("timestamps", None)
-            await ctx.send(ascii.info("RPC5 timestamp cleared"))
-        else:
-            try:
-                self._set_timestamp(4, value)
-                await self.apply_activities()
-                await ctx.send(ascii.success(f"RPC5 timestamp: {value}"))
-            except Exception:
-                await ctx.send(ascii.error("Use format: 3600 or 1:00:00"))
-
-    @rpc5.command(name="btn1")
-    async def rpc5_btn1(self, ctx, label: str, url: str):
-        self._ensure_slot(4)
-        btns = self.rpc_slots[4].setdefault("buttons", [])
-        entry = {"label": label, "url": url}
-        if not btns: btns.append(entry)
-        else: btns[0] = entry
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 btn1: {label}"))
-
-    @rpc5.command(name="btn2")
-    async def rpc5_btn2(self, ctx, label: str, url: str):
-        self._ensure_slot(4)
-        btns = self.rpc_slots[4].setdefault("buttons", [])
-        while len(btns) < 2: btns.append(None)
-        btns[1] = {"label": label, "url": url}
-        self.rpc_slots[4]["buttons"] = [b for b in btns if b]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 btn2: {label}"))
-
-    @rpc5.command(name="spotify")
-    async def rpc5_spotify(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default", "Unknown"]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[4] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 Spotify: {parts[0]}"))
-
-    @rpc5.command(name="youtube")
-    async def rpc5_youtube(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default Video", "Default Channel"]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[4] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 YouTube: {parts[0]}"))
-
-    @rpc5.command(name="xbox")
-    async def rpc5_xbox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[4] = await self.build_xbox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 Xbox: {parts[0]}"))
-
-    @rpc5.command(name="ps")
-    async def rpc5_ps(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[4] = await self.build_playstation(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 PS: {parts[0]}"))
-
-    @rpc5.command(name="ps4")
-    async def rpc5_ps4(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[4] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 PS4: {parts[0]}"))
-
-    @rpc5.command(name="crunchy")
-    async def rpc5_crunchy(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[4] = await self.build_crunchyroll(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 Crunchyroll: {parts[0]}"))
-
-    @rpc5.command(name="roblox")
-    async def rpc5_roblox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[4] = await self.build_roblox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 Roblox: {parts[0]}"))
-
-    @rpc5.command(name="clear")
-    async def rpc5_clear(self, ctx):
-        self.rpc_slots[4] = None
-        await self.apply_activities(); await ctx.send(ascii.info("RPC5 cleared"))
-
-    # RPC6
-    @commands.group(name="rpc6", invoke_without_command=True)
-    async def rpc6(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .rpc6 name <text> | ...")); return
-        parsed = self._parse_inline(args)
-        if parsed:
-            await self._apply_inline(5, parsed)
-            await self.apply_activities()
-            await ctx.send(ascii.success("RPC6 updated"))
-
-    @rpc6.command(name="name")
-    async def rpc6_name(self, ctx, *, name: str):
-        self._ensure_slot(5); self.rpc_slots[5]["name"] = name
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 name: {name}"))
-
-    @rpc6.command(name="details")
-    async def rpc6_details(self, ctx, *, details: str):
-        self._ensure_slot(5); self.rpc_slots[5]["details"] = details
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 details: {details}"))
-
-    @rpc6.command(name="state")
-    async def rpc6_state(self, ctx, *, state: str):
-        self._ensure_slot(5); self.rpc_slots[5]["state"] = state
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 state: {state}"))
-
-    @rpc6.command(name="type")
-    async def rpc6_type(self, ctx, activity_type: str):
-        t = activity_type.lower()
-        if t not in TYPE_MAP:
-            await ctx.send(ascii.error("Invalid type")); return
-        self._ensure_slot(5); self.rpc_slots[5]["type"] = TYPE_MAP[t]
-        if t == "purplestream":
-            self.rpc_slots[5]["url"] = PURPLESTREAM_URL
-        elif "url" in self.rpc_slots[5] and t not in ("streaming", "purplestream"):
-            del self.rpc_slots[5]["url"]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 type: {activity_type}"))
-
-    @rpc6.command(name="platform")
-    async def rpc6_platform(self, ctx, preset: str):
-        if self._apply_platform_preset(5, preset.lower()):
-            await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 platform: {preset}"))
-        else:
-            await ctx.send(ascii.error("Unknown platform"))
-
-    @rpc6.command(name="large_image")
-    async def rpc6_large_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(5)
-            self.rpc_slots[5].setdefault("assets", {})["large_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC6 large image set"))
-
-    @rpc6.command(name="small_image")
-    async def rpc6_small_image(self, ctx, url: str):
-        key = await self.upload_asset(url)
-        if key:
-            self._ensure_slot(5)
-            self.rpc_slots[5].setdefault("assets", {})["small_image"] = key
-            await self.apply_activities(); await ctx.send(ascii.success("RPC6 small image set"))
-
-    @rpc6.command(name="timestamp")
-    async def rpc6_timestamp(self, ctx, value: str):
-        self._ensure_slot(5)
-        if value.lower() == "clear":
-            self.rpc_slots[5].pop("timestamps", None)
-            await ctx.send(ascii.info("RPC6 timestamp cleared"))
-        else:
-            try:
-                self._set_timestamp(5, value)
-                await self.apply_activities()
-                await ctx.send(ascii.success(f"RPC6 timestamp: {value}"))
-            except Exception:
-                await ctx.send(ascii.error("Use format: 3600 or 1:00:00"))
-
-    @rpc6.command(name="btn1")
-    async def rpc6_btn1(self, ctx, label: str, url: str):
-        self._ensure_slot(5)
-        btns = self.rpc_slots[5].setdefault("buttons", [])
-        entry = {"label": label, "url": url}
-        if not btns: btns.append(entry)
-        else: btns[0] = entry
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 btn1: {label}"))
-
-    @rpc6.command(name="btn2")
-    async def rpc6_btn2(self, ctx, label: str, url: str):
-        self._ensure_slot(5)
-        btns = self.rpc_slots[5].setdefault("buttons", [])
-        while len(btns) < 2: btns.append(None)
-        btns[1] = {"label": label, "url": url}
-        self.rpc_slots[5]["buttons"] = [b for b in btns if b]
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 btn2: {label}"))
-
-    @rpc6.command(name="spotify")
-    async def rpc6_spotify(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default", "Unknown"]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[5] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 Spotify: {parts[0]}"))
-
-    @rpc6.command(name="youtube")
-    async def rpc6_youtube(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Default Video", "Default Channel"]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[5] = activity
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 YouTube: {parts[0]}"))
-
-    @rpc6.command(name="xbox")
-    async def rpc6_xbox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[5] = await self.build_xbox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 Xbox: {parts[0]}"))
-
-    @rpc6.command(name="ps")
-    async def rpc6_ps(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[5] = await self.build_playstation(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 PS: {parts[0]}"))
-
-    @rpc6.command(name="ps4")
-    async def rpc6_ps4(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[5] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 PS4: {parts[0]}"))
-
-    @rpc6.command(name="crunchy")
-    async def rpc6_crunchy(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[5] = await self.build_crunchyroll(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 Crunchyroll: {parts[0]}"))
-
-    @rpc6.command(name="roblox")
-    async def rpc6_roblox(self, ctx, *, args: str = None):
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[5] = await self.build_roblox(parts)
-        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 Roblox: {parts[0]}"))
-
-    @rpc6.command(name="clear")
-    async def rpc6_clear(self, ctx):
-        self.rpc_slots[5] = None
-        await self.apply_activities(); await ctx.send(ascii.info("RPC6 cleared"))
-
-    # ── quick presence ──
-
-    @commands.command(name="playing")
-    async def playing_cmd(self, ctx, *, message=None):
-        try: await ctx.message.delete()
-        except Exception: pass
-        if not message:
-            await ctx.send(ascii.error("Usage: .playing <text>")); return
-        await self.bot.change_presence(activity=discord.Game(name=message))
-        await ctx.send(ascii.success(f"Playing: {message}"))
-
-    @commands.command(aliases=["listen"])
-    async def listening_cmd(self, ctx, *, message=None):
-        try: await ctx.message.delete()
-        except Exception: pass
-        if not message:
-            await ctx.send(ascii.error("Usage: .listening <text>")); return
-        await self.bot.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.listening, name=message))
-        await ctx.send(ascii.success(f"Listening: {message}"))
-
-    @commands.command(aliases=["watch"])
-    async def watching_cmd(self, ctx, *, message=None):
-        try: await ctx.message.delete()
-        except Exception: pass
-        if not message:
-            await ctx.send(ascii.error("Usage: .watching <text>")); return
-        await self.bot.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.watching, name=message))
-        await ctx.send(ascii.success(f"Watching: {message}"))
-
-    @commands.command(name="competing")
-    async def competing_cmd(self, ctx, *, message=None):
-        try: await ctx.message.delete()
-        except Exception: pass
-        if not message:
-            await ctx.send(ascii.error("Usage: .competing <text>")); return
-        await self.bot.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.competing, name=message))
-        await ctx.send(ascii.success(f"Competing: {message}"))
-
-    @commands.command(name="stopactivity")
-    async def stopactivity_cmd(self, ctx):
-        try: await ctx.message.delete()
-        except Exception: pass
-        await self.bot.change_presence(activity=None, status=discord.Status.online)
-        await ctx.send(ascii.info("Activity cleared"))
-
-    @commands.command(name="setpresencestatus")
-    async def setpresencestatus_cmd(self, ctx, status_type: str):
-        """Rename of `setstatus` to avoid colliding with the status cog."""
-        try: await ctx.message.delete()
-        except Exception: pass
-        status_map = {"online": discord.Status.online, "dnd": discord.Status.dnd,
-                      "idle": discord.Status.idle, "invisible": discord.Status.invisible}
-        if status_type.lower() in status_map:
-            await self.bot.change_presence(status=status_map[status_type.lower()])
-            await ctx.send(ascii.success(f"Status: {status_type}"))
-        else:
-            await ctx.send(ascii.error("Use: online, dnd, idle, invisible"))
-
-    @commands.command(name="aoff")
-    async def aoff_cmd(self, ctx):
-        try: await ctx.message.delete()
-        except Exception: pass
-        await self.bot.change_presence(activity=None)
-
-    @commands.command(name="clear_multi_rpc")
-    async def clear_multi_rpc(self, ctx):
-        self._clearing = True
-        try:
-            self.rpc_slots = [None] * 6
-            if self.bot.ws:
-                await self.bot.ws.send(json.dumps({
-                    "op": 3, "d": {"since": 0, "activities": [],
-                                    "status": "online", "afk": False}}))
-            self._save_rpc_slots()
-        finally:
-            self._clearing = False
-        await ctx.send(ascii.info("Cleared all RPC slots"))
-
-    @commands.command(name="rpc_status")
-    async def rpc_status(self, ctx):
-        type_names = {0: "Playing", 1: "Streaming", 2: "Listening", 3: "Watching", 5: "Competing"}
-        lines = []
-        for i, act in enumerate(self.rpc_slots):
-            if act is None:
-                lines.append(f"\x1b[2;37mRPC{i+1} — empty\x1b[0m")
-            else:
-                t = act.get("type", 0)
-                label = type_names.get(t, "Unknown")
-                lines.append(
-                    f"\x1b[2;37mRPC{i+1} [{label}] {act.get('name', '—')} | "
-                    f"{act.get('details', '—')} | {act.get('state', '—')}\x1b[0m")
-        try:
-            await ctx.send(ascii.multiline(lines, raw=True))
-        except TypeError:
-            await ctx.send(ascii.multiline(lines))
-
-    @commands.command(name="spotify")
-    async def cmd_spotify(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .spotify Song - Artist [slot 1-6]")); return
-        words = args.strip().split(); slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1; args = " ".join(words[:-1])
-        parts = [p.strip() for p in args.split("-")]
-        if len(parts) < 2: parts.append("Unknown")
-        activity = await self.build_spotify(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Song - Artist")); return
-        self.rpc_slots[slot] = activity
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"Spotify → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="youtube")
-    async def cmd_youtube(self, ctx, *, args: str = None):
-        if not args:
-            await ctx.send(ascii.error("Usage: .youtube Video - Channel [slot 1-6]")); return
-        words = args.strip().split(); slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1; args = " ".join(words[:-1])
-        parts = [p.strip() for p in args.split("-")]
-        if len(parts) < 2: parts.append("Default Channel")
-        activity = await self.build_youtube(parts)
-        if not activity:
-            await ctx.send(ascii.error("Format: Video - Channel")); return
-        self.rpc_slots[slot] = activity
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"YouTube → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="xbox")
-    async def cmd_xbox(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []; slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Xbox"]
-        self.rpc_slots[slot] = await self.build_xbox(parts)
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"Xbox → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="ps")
-    async def cmd_ps(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []; slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["PlayStation"]
-        self.rpc_slots[slot] = await self.build_playstation(parts)
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"PS → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="ps4")
-    async def cmd_ps4(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []; slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["PS4"]
-        self.rpc_slots[slot] = await self.build_playstation(parts, ps4=True)
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"PS4 → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="crunchy")
-    async def cmd_crunchy(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []; slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
-        self.rpc_slots[slot] = await self.build_crunchyroll(parts)
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"Crunchyroll → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="roblox")
-    async def cmd_roblox(self, ctx, *, args: str = None):
-        words = args.strip().split() if args else []; slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
-        self.rpc_slots[slot] = await self.build_roblox(parts)
-        await self.apply_activities()
-        await ctx.send(ascii.success(f"Roblox → slot {slot+1}: {parts[0]}"))
-
-    @commands.command(name="vrchat")
-    async def cmd_vrchat(self, ctx, *, args: str = None):
-        try: await ctx.message.delete()
-        except Exception: pass
-        words = args.strip().split() if args else []; slot = 0
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1
-            args = " ".join(words[:-1]) if len(words) > 1 else None
-        parts = [p.strip() for p in args.split("-")] if args else ["Exploring VRChat", "VRChat"]
-        self.rpc_slots[slot] = await self.build_vrchat(parts)
-        await self.apply_activities()
-        state = parts[0] if parts else "Exploring VRChat"
-        await ctx.send(ascii.success(f"VRChat → slot {slot+1}: {state}"))
-
-    @commands.command(name="meta")
-    async def cmd_meta(self, ctx, *, args: str = None):
-        try: await ctx.message.delete()
-        except Exception: pass
-        if not args:
-            await ctx.send(ascii.error("Usage: .meta State - World [slot] [image_url]")); return
-        words = args.strip().split(); slot = 0; image_url = None
-        for i, word in enumerate(words):
-            if word.startswith(("http://", "https://")):
-                image_url = word; words = words[:i]; break
-        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
-            slot = int(words[-1]) - 1; words = words[:-1]
-        args_str = " ".join(words) if words else None
-        parts = ([p.strip() for p in args_str.split("-")] if args_str
-                 else ["Exploring VRChat", "VRChat"])
-        self.rpc_slots[slot] = await self.build_vrchat(parts, image_url)
-        await self.apply_activities()
-        state = parts[0] if parts else "Exploring VRChat"
-        await ctx.send(ascii.success(f"Meta Quest → slot {slot+1}: {state}"))
-
-    # ── status rotation ──
-
-    @commands.command(name='rstatus')
-    async def rotate_status(self, ctx, *, statuses: str):
-        try: await ctx.message.delete()
-        except Exception: pass
-        status_list = [s.strip() for s in statuses.split(',') if s.strip()]
-        if not status_list:
-            await ctx.send(ascii.error("Separate statuses by commas")); return
-        # cancel any prior rotation
-        if self._status_rotation_task and not self._status_rotation_task.done():
-            self._status_rotation_task.cancel()
-        self.status_rotation_active = True
-
-        async def _loop():
-            idx = 0
-            try:
-                while self.status_rotation_active:
-                    self.current_status = status_list[idx]
-                    await self._patch_custom_status()
-                    await asyncio.sleep(8)
-                    idx = (idx + 1) % len(status_list)
-            finally:
-                self.current_status = ""
-                try: await self._patch_custom_status()
-                except Exception: pass
-
-        await ctx.send(ascii.info(f"Status rotation: {len(status_list)} statuses"))
-        self._status_rotation_task = asyncio.create_task(_loop())
-
-    @commands.command(name='remoji')
-    async def rotate_emoji(self, ctx, *, emojis: str):
-        try: await ctx.message.delete()
-        except Exception: pass
-        emoji_list = [e.strip() for e in emojis.split(',') if e.strip()]
-        if not emoji_list:
-            await ctx.send(ascii.error("Separate emojis by commas")); return
-        if self._emoji_rotation_task and not self._emoji_rotation_task.done():
-            self._emoji_rotation_task.cancel()
-        self.emoji_rotation_active = True
-
-        async def _loop():
-            idx = 0
-            try:
-                while self.emoji_rotation_active:
-                    self.current_emoji = emoji_list[idx]
-                    await self._patch_custom_status()
-                    await asyncio.sleep(8)
-                    idx = (idx + 1) % len(emoji_list)
-            finally:
-                self.current_emoji = ""
-                try: await self._patch_custom_status()
-                except Exception: pass
-
-        await ctx.send(ascii.info(f"Emoji rotation: {len(emoji_list)} emojis"))
-        self._emoji_rotation_task = asyncio.create_task(_loop())
+    # ── status rotation helper ──
 
     async def _patch_custom_status(self):
         json_data = {'custom_status': {'text': self.current_status,
@@ -1852,20 +1027,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 headers={'Authorization': self.bot.http.token,
                          'Content-Type': 'application/json'},
                 json=json_data)
-
-    @commands.command(name='stopstatus')
-    async def stop_rotate_status(self, ctx):
-        try: await ctx.message.delete()
-        except Exception: pass
-        self.status_rotation_active = False
-        await ctx.send(ascii.info("Status rotation stopped"))
-
-    @commands.command(name='stopemoji')
-    async def stop_rotate_emoji(self, ctx):
-        try: await ctx.message.delete()
-        except Exception: pass
-        self.emoji_rotation_active = False
-        await ctx.send(ascii.info("Emoji rotation stopped"))
 
 
 async def setup(bot):
