@@ -7,6 +7,7 @@ from . import (
     guards, resilience, settings,
     general, fun, tools, utility, tracking, downloads,
     auto, profile, developer, server, information, interactions,
+    spoofer, rpc,
 )
 
 ALL_COGS = [
@@ -45,16 +46,39 @@ ALL_COGS = [
     server.ServerCog,
     information.InformationCog,
     interactions.InteractionsCog,
+    # ── adapters last so they win command-name collisions ──
+    spoofer.SpooferCog,
+    rpc.RPCCog,
 ]
 
-def build_registry():
+def build_registry(client=None):
+    """Build the command registry. `client` is optional — cogs that need it
+    pull from cogs.state.CLIENT via their own __init__ fallback. Passing it
+    here is the explicit path and takes priority when a cog accepts a bot."""
     registry = {}
     instances = []
     for cls in ALL_COGS:
-        inst = cls()
+        inst = None
+        # try with client first (RPC-style cogs take an optional bot arg)
+        if client is not None:
+            try:
+                inst = cls(client)
+            except TypeError:
+                inst = None
+            except Exception as e:
+                print(f"[cogs] {cls.__name__} init failed with client: {e}")
+                inst = None
+        # fall back to no-arg init (every other cog)
+        if inst is None:
+            try:
+                inst = cls()
+            except Exception as e:
+                print(f"[cogs] {cls.__name__} init failed: {e}")
+                continue
         instances.append(inst)
         for cmd in getattr(inst, "COMMANDS", set()):
             registry[cmd] = (inst, cmd)
+    print(f"[cogs] registry: {len(instances)} cogs, {len(registry)} commands")
     return registry, instances
 
 def register_events(client, instances):
