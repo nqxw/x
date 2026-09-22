@@ -37,7 +37,8 @@ PLATFORM_ICON_KEYS = {
     "spotify": "spotify", "youtube": "youtube", "xbox": "xbox",
     "ps": "playstation", "playstation": "playstation", "ps4": "playstation",
     "ps5": "playstation", "crunchy": "crunchyroll", "crunchyroll": "crunchyroll",
-    "twitch": "twitch", "vrchat": "vrchat", "meta_quest": "vrchat", "quest": "vrchat"
+    "twitch": "twitch", "vrchat": "vrchat", "meta_quest": "vrchat", "quest": "vrchat",
+    "roblox": "roblox"
 }
 
 PLATFORM_PRESET_MAP = {
@@ -54,7 +55,8 @@ PLATFORM_PRESET_MAP = {
     "meta_quest": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "quest": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "meta": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
-    "oculus": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"}
+    "oculus": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
+    "roblox": {"application_id": 363445589247131668, "platform": None, "asset": "roblox"}
 }
 
 INLINE_KEYS = ["name", "details", "state", "type", "timestamp", "platform",
@@ -614,6 +616,26 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             "instance": True
         }
 
+    async def build_roblox(self, parts: list):
+        """Roblox presence — game name, optional details/state, elapsed timer."""
+        game = (parts[0] if parts else "Roblox")[:128]
+        now = int(time.time() * 1000)
+        activity = {
+            "type": 0,
+            "name": "Roblox",
+            "application_id": "363445589247131668",
+            "details": game,
+            "timestamps": {"start": now},
+            "assets": {"large_image": "roblox", "large_text": game[:128]},
+            "instance": True,
+        }
+        if len(parts) > 1 and parts[1]:
+            activity["state"] = parts[1][:128]
+        if len(parts) > 2 and parts[2]:
+            activity["assets"]["small_image"] = "roblox_small"
+            activity["assets"]["small_text"] = parts[2][:128]
+        return activity
+
     # ── RPC slot groups (1..6) ──
 
     @commands.group(name="rpc1", invoke_without_command=True)
@@ -751,6 +773,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
         self.rpc_slots[0] = await self.build_crunchyroll(parts)
         await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 Crunchyroll: {parts[0]}"))
+
+    @rpc1.command(name="roblox")
+    async def rpc1_roblox(self, ctx, *, args: str = None):
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[0] = await self.build_roblox(parts)
+        await self.apply_activities(); await ctx.send(ascii.success(f"RPC1 Roblox: {parts[0]}"))
 
     @rpc1.command(name="clear")
     async def rpc1_clear(self, ctx):
@@ -894,6 +922,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self.rpc_slots[1] = await self.build_crunchyroll(parts)
         await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 Crunchyroll: {parts[0]}"))
 
+    @rpc2.command(name="roblox")
+    async def rpc2_roblox(self, ctx, *, args: str = None):
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[1] = await self.build_roblox(parts)
+        await self.apply_activities(); await ctx.send(ascii.success(f"RPC2 Roblox: {parts[0]}"))
+
     @rpc2.command(name="clear")
     async def rpc2_clear(self, ctx):
         self.rpc_slots[1] = None
@@ -1035,6 +1069,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
         self.rpc_slots[2] = await self.build_crunchyroll(parts)
         await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 Crunchyroll: {parts[0]}"))
+
+    @rpc3.command(name="roblox")
+    async def rpc3_roblox(self, ctx, *, args: str = None):
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[2] = await self.build_roblox(parts)
+        await self.apply_activities(); await ctx.send(ascii.success(f"RPC3 Roblox: {parts[0]}"))
 
     @rpc3.command(name="clear")
     async def rpc3_clear(self, ctx):
@@ -1178,6 +1218,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self.rpc_slots[3] = await self.build_crunchyroll(parts)
         await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 Crunchyroll: {parts[0]}"))
 
+    @rpc4.command(name="roblox")
+    async def rpc4_roblox(self, ctx, *, args: str = None):
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[3] = await self.build_roblox(parts)
+        await self.apply_activities(); await ctx.send(ascii.success(f"RPC4 Roblox: {parts[0]}"))
+
     @rpc4.command(name="clear")
     async def rpc4_clear(self, ctx):
         self.rpc_slots[3] = None
@@ -1320,6 +1366,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self.rpc_slots[4] = await self.build_crunchyroll(parts)
         await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 Crunchyroll: {parts[0]}"))
 
+    @rpc5.command(name="roblox")
+    async def rpc5_roblox(self, ctx, *, args: str = None):
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[4] = await self.build_roblox(parts)
+        await self.apply_activities(); await ctx.send(ascii.success(f"RPC5 Roblox: {parts[0]}"))
+
     @rpc5.command(name="clear")
     async def rpc5_clear(self, ctx):
         self.rpc_slots[4] = None
@@ -1461,6 +1513,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         parts = [p.strip() for p in args.split("-")] if args else ["Crunchyroll"]
         self.rpc_slots[5] = await self.build_crunchyroll(parts)
         await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 Crunchyroll: {parts[0]}"))
+
+    @rpc6.command(name="roblox")
+    async def rpc6_roblox(self, ctx, *, args: str = None):
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[5] = await self.build_roblox(parts)
+        await self.apply_activities(); await ctx.send(ascii.success(f"RPC6 Roblox: {parts[0]}"))
 
     @rpc6.command(name="clear")
     async def rpc6_clear(self, ctx):
@@ -1641,6 +1699,17 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self.rpc_slots[slot] = await self.build_crunchyroll(parts)
         await self.apply_activities()
         await ctx.send(ascii.success(f"Crunchyroll → slot {slot+1}: {parts[0]}"))
+
+    @commands.command(name="roblox")
+    async def cmd_roblox(self, ctx, *, args: str = None):
+        words = args.strip().split() if args else []; slot = 0
+        if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
+            slot = int(words[-1]) - 1
+            args = " ".join(words[:-1]) if len(words) > 1 else None
+        parts = [p.strip() for p in args.split("-")] if args else ["Roblox"]
+        self.rpc_slots[slot] = await self.build_roblox(parts)
+        await self.apply_activities()
+        await ctx.send(ascii.success(f"Roblox → slot {slot+1}: {parts[0]}"))
 
     @commands.command(name="vrchat")
     async def cmd_vrchat(self, ctx, *, args: str = None):
