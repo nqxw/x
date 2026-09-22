@@ -1,5 +1,7 @@
-# cogs/spoofer.py | platform / device spoofing — patches the confirmed discord.py-self
-# gateway write surface: ws.send_as_json, ws._sendstr, ws.identify, ws.socket.send_str.
+# cogs/spoofer.py | platform / device spoofing.
+# patches aiohttp.ClientWebSocketResponse.send_str at the CLASS level — the
+# lowest-level write path every gateway frame goes through. survives every
+# reconnect, every cog rebuild, every library refactor above it.
 import asyncio
 import json
 import re
@@ -33,6 +35,17 @@ PLATFORM_PRESETS = {
 
 
 _OP2_RE = re.compile(r'"op"\s*:\s*2\b')
+_PATCHED_CLASSES = {}        # cls -> {"send_str": original, "send_json": original, ...}
+_LIVE_COG = [None]           # holds the current SpooferCog instance
+_PRESET_HOLDER = [None]      # holds the currently active preset dict (survives cog rebuilds)
+
+
+def _is_identify_frame(data):
+    if not isinstance(data, str):
+        return False
+    if not _OP2_RE.search(data):
+        return False
+    return '"properties"' in data
 
 
 def _is_identify_payload(payload):
@@ -45,27 +58,92 @@ def _is_identify_payload(payload):
         return False
 
 
-def _is_identify_frame(data):
-    if not isinstance(data, str):
-        return False
-    if not _OP2_RE.search(data):
-        return False
-    return '"properties"' in data
-
-
-def _rewrite(props_or_payload, preset, cog):
-    """Rewrite the properties block inside an identify payload dict."""
-    if "properties" in props_or_payload:
-        props = props_or_payload["properties"]
-    else:
-        props = props_or_payload
+def _rewrite_in_frame(data):
+    """Given a JSON string that is an IDENTIFY frame, rewrite its properties.
+    Return the new string. Return None if it isn't one."""
+    if not _is_identify_frame(data):
+        return None
+    preset = _PRESET_HOLDER[0]
+    if preset is None:
+        return None
+    try:
+        payload = json.loads(data)
+    except Exception:
+        return None
+    if not _is_identify_payload(payload):
+        return None
+    props = payload["d"]["properties"]
     props["$os"] = preset["os"]
     props["$browser"] = preset["browser"]
     props["$device"] = preset["device"]
-    cog._last_props = dict(props)
-    cog._identify_count += 1
-    print(f"[spoofer] rewrote IDENTIFY #{cog._identify_count} → {preset['label']}")
-    return props_or_payload
+    # record for status
+    cog = _LIVE_COG[0]
+    if cog is not None:
+        cog._last_props = dict(props)
+        cog._identify_count += 1
+    print(f"[spoofer] rewrote IDENTIFY → {preset['label']}")
+    return json.dumps(payload)
+
+
+def _patch_aiohttp_class():
+    """Patch aiohttp.ClientWebSocketResponse.send_str (and send_json) at the
+    class level. every gateway write goes through one of these."""
+    try:
+        import aiohttp
+    except Exception as e:
+        print(f"[spoofer] aiohttp import failed: {e}")
+        return False
+
+    cls = aiohttp.ClientWebSocketResponse
+    if cls in _PATCHED_CLASSES:
+        return True
+
+    originals = {}
+
+    # send_str — the raw string path (most likely what IDENTIFY uses)
+    if callable(getattr(cls, "send_str", None)):
+        original = cls.send_str
+        originals["send_str"] = original
+
+        async def patched_send_str(self, data, *args, **kwargs):
+            try:
+                rewritten = _rewrite_in_frame(data)
+                if rewritten is not None:
+                    data = rewritten
+            except Exception as e:
+                print(f"[spoofer] send_str rewrite error: {e}")
+            return await original(self, data, *args, **kwargs)
+
+        cls.send_str = patched_send_str
+        print("[spoofer] patched aiohttp.ClientWebSocketResponse.send_str")
+
+    # send_json — dict path (the library may build payload as dict then json-dump it here)
+    if callable(getattr(cls, "send_json", None)):
+        original = cls.send_json
+        originals["send_json"] = original
+
+        async def patched_send_json(self, data, *args, **kwargs):
+            try:
+                preset = _PRESET_HOLDER[0]
+                if preset is not None and _is_identify_payload(data):
+                    props = data["d"]["properties"]
+                    props["$os"] = preset["os"]
+                    props["$browser"] = preset["browser"]
+                    props["$device"] = preset["device"]
+                    cog = _LIVE_COG[0]
+                    if cog is not None:
+                        cog._last_props = dict(props)
+                        cog._identify_count += 1
+                    print(f"[spoofer] rewrote IDENTIFY (json) → {preset['label']}")
+            except Exception as e:
+                print(f"[spoofer] send_json rewrite error: {e}")
+            return await original(self, data, *args, **kwargs)
+
+        cls.send_json = patched_send_json
+        print("[spoofer] patched aiohttp.ClientWebSocketResponse.send_json")
+
+    _PATCHED_CLASSES[cls] = originals
+    return True
 
 
 class SpooferCog:
@@ -74,196 +152,36 @@ class SpooferCog:
 
     def __init__(self):
         self.bot = None
-        self._interceptor_ws = None
-        self._patch_targets = []       # (obj, attr_name, original_callable, kind)
-        self._interceptor_active = False
         self._patched_preset = None
         self._last_props = None
         self._identify_count = 0
         self._reconnect_count = 0
-        self._watch_task = None
+        # register self as the live cog
+        _LIVE_COG[0] = self
+        # install the class patch — happens once per process
+        _patch_aiohttp_class()
 
     # ── diagnostics ──
 
     def _build_diag(self):
-        client = S.CLIENT
         lines = []
-        if client is None:
-            return ["client is None"]
-        lines.append(f"client: {type(client).__name__}")
-        ws = getattr(client, "ws", None)
-        lines.append(f"ws: {type(ws).__name__ if ws else 'None'}")
-        if ws is not None:
-            interesting = [a for a in dir(ws) if any(k in a.lower() for k in
-                           ("send", "keep", "socket", "ident", "gateway"))]
-            lines.append(f"ws sendable: {interesting}")
-            lines.append(f"ws.socket: {type(getattr(ws, 'socket', None)).__name__}")
-        lines.append(f"patched targets: "
-                     f"{[f'{type(o).__name__}.{n}' for o, n, _, _ in self._patch_targets]}")
-        return lines
-
-    # ── patching ──
-
-    def _find_targets(self):
-        """Return list of (obj, attr, kind) where kind is 'dict' or 'str'."""
-        client = S.CLIENT
-        targets = []
-        if client is None:
-            return targets
-
-        ws = getattr(client, "ws", None)
-        if ws is None:
-            return targets
-
-        # primary dict serializer — most likely path
-        if callable(getattr(ws, "send_as_json", None)):
-            targets.append((ws, "send_as_json", "dict"))
-
-        # raw string send — fallback path
-        if callable(getattr(ws, "_sendstr", None)):
-            targets.append((ws, "_sendstr", "str"))
-
-        # identify builder — build-time hook
-        if callable(getattr(ws, "identify", None)):
-            targets.append((ws, "identify", "identify"))
-
-        # lower-level socket fallback
-        sock = getattr(ws, "socket", None)
-        if sock is not None and callable(getattr(sock, "send_str", None)):
-            targets.append((sock, "send_str", "str"))
-
-        return targets
-
-    async def _ensure_interceptor(self):
-        client = S.CLIENT
-        if client is None:
-            return False
-
-        if self._interceptor_active and getattr(client, "ws", None) is self._interceptor_ws:
-            return True
-
-        for _ in range(30):
-            if getattr(client, "ws", None) is not None:
-                break
-            await asyncio.sleep(0.5)
-        if not getattr(client, "ws", None):
-            return False
-
-        # tear down old patches before reattaching
-        self._unpatch_all()
-
-        self._interceptor_ws = client.ws
-        cog = self
-
-        targets = self._find_targets()
-        if not targets:
-            print("[spoofer] no patch targets found")
-            return False
-
-        names = [f"{type(o).__name__}.{a}" for o, a, _ in targets]
-        print(f"[spoofer] patching {len(targets)} target(s): {names}")
-
-        for obj, attr, kind in targets:
-            try:
-                original = getattr(obj, attr)
-            except Exception:
-                continue
-
-            def make_wrapper(orig, wrap_kind):
-                if wrap_kind == "dict":
-                    async def wrapper(*args, **kwargs):
-                        preset = cog._patched_preset
-                        if preset and args and _is_identify_payload(args[0]):
-                            try:
-                                _rewrite(args[0], preset, cog)
-                            except Exception as e:
-                                print(f"[spoofer] dict rewrite failed: {e}")
-                        return await orig(*args, **kwargs)
-                    return wrapper
-                elif wrap_kind == "str":
-                    async def wrapper(*args, **kwargs):
-                        preset = cog._patched_preset
-                        if preset and args and _is_identify_frame(args[0]):
-                            try:
-                                payload = json.loads(args[0])
-                                if _is_identify_payload(payload):
-                                    _rewrite(payload, preset, cog)
-                                    args = (json.dumps(payload),) + args[1:]
-                            except Exception as e:
-                                print(f"[spoofer] str rewrite failed: {e}")
-                        return await orig(*args, **kwargs)
-                    return wrapper
-                else:  # identify — builder method, patch after call
-                    def wrapper(*args, **kwargs):
-                        # identify builds a dict payload; call, then mutate, then
-                        # the caller serializes. some builds return a dict, some
-                        # return the ws. handle both.
-                        result = orig(*args, **kwargs)
-                        preset = cog._patched_preset
-                        if preset and isinstance(result, dict):
-                            try:
-                                _rewrite(result, preset, cog)
-                            except Exception as e:
-                                print(f"[spoofer] identify rewrite failed: {e}")
-                        return result
-                    return wrapper
-
-            wrapped = make_wrapper(original, kind)
-            try:
-                setattr(obj, attr, wrapped)
-                self._patch_targets.append((obj, attr, original, kind))
-                print(f"[spoofer] patched {type(obj).__name__}.{attr} ({kind})")
-            except Exception as e:
-                print(f"[spoofer] could not patch {type(obj).__name__}.{attr}: {e}")
-
-        if not self._patch_targets:
-            print("[spoofer] nothing patchable")
-            return False
-
-        self._interceptor_active = True
-        print("[spoofer] IDENTIFY interceptor active")
-        self._start_watcher()
-        return True
-
-    def _unpatch_all(self):
-        for obj, attr, original, _kind in self._patch_targets:
-            try:
-                setattr(obj, attr, original)
-            except Exception:
-                pass
-        self._patch_targets.clear()
-        self._interceptor_active = False
-
-    # ── watcher ──
-
-    def _start_watcher(self):
-        if self._watch_task and not self._watch_task.done():
-            return
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            return
-        self._watch_task = loop.create_task(self._ws_watcher())
-
-    async def _ws_watcher(self):
-        last_ws_id = None
-        while True:
-            try:
-                client = S.CLIENT
-                ws = getattr(client, "ws", None) if client else None
-                if ws is not None:
-                    cur_id = id(ws)
-                    if cur_id != last_ws_id:
-                        last_ws_id = cur_id
-                        self._interceptor_ws = None
-                        ok = await self._ensure_interceptor()
-                        if ok:
-                            print(f"[spoofer] reattached to new ws "
-                                  f"(preset: "
-                                  f"{self._patched_preset['label'] if self._patched_preset else '—'})")
-            except Exception as e:
-                print(f"[spoofer] watcher error: {e}")
-            await asyncio.sleep(2)
+            import aiohttp
+            cls = aiohttp.ClientWebSocketResponse
+            m = getattr(cls, "send_str", None)
+            lines.append(f"aiohttp.send_str: {'patched' if getattr(m, '__name__', '') == 'patched_send_str' else getattr(m, '__name__', 'missing')}")
+            m2 = getattr(cls, "send_json", None)
+            lines.append(f"aiohttp.send_json: {'patched' if getattr(m2, '__name__', '') == 'patched_send_json' else getattr(m2, '__name__', 'missing')}")
+        except Exception as e:
+            lines.append(f"aiohttp inspect failed: {e}")
+        lines.append(f"preset holder: {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
+        lines.append(f"identify count: {self._identify_count}")
+        lines.append(f"last props: {self._last_props}")
+        client = S.CLIENT
+        ws = getattr(client, "ws", None) if client else None
+        lines.append(f"ws: {type(ws).__name__ if ws else 'None'}")
+        lines.append(f"ws.socket: {type(getattr(ws, 'socket', None)).__name__ if ws else 'None'}")
+        return lines
 
     # ── command path ──
 
@@ -277,11 +195,8 @@ class SpooferCog:
         if not preset:
             await message.edit(content=S.ui_err(f"unknown platform: {preset_key}"))
             return False
-        if not await self._ensure_interceptor():
-            await message.edit(content=S.ui_err(
-                "could not attach interceptor — run $spooferdiag"))
-            return False
         self._patched_preset = preset
+        _PRESET_HOLDER[0] = preset   # survives cog rebuilds
         S._current_platform = preset_key
         return True
 
@@ -340,8 +255,6 @@ class SpooferCog:
             print("[spooferdiag] ====")
             await message.edit(content=S._ansi_block(lines))
             return
-
-        await self._ensure_interceptor()
 
         if cmd == "platform":
             if len(args) < 2:
@@ -402,15 +315,12 @@ class SpooferCog:
 
     async def _send_status(self, message):
         p = self._last_props or {}
-        ws = getattr(S.CLIENT, "ws", None)
-        ws_match = (ws is self._interceptor_ws) if ws is not None else False
-        targets = [f"{type(o).__name__}.{n}" for o, n, _, _ in self._patch_targets]
+        active = _PRESET_HOLDER[0]
         lines = [
             f"  tracked:      {getattr(S, '_current_platform', '?')}",
-            f"  interceptor:  {'active' if self._interceptor_active else 'inactive'}",
-            f"  ws match:     {'yes' if ws_match else 'no'}",
+            f"  preset held:  {active['label'] if active else '—'}",
+            f"  class patch:  {'installed' if _PATCHED_CLASSES else 'missing'}",
             f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
-            f"  targets:      {', '.join(targets) if targets else '—'}",
             f"  identify #:   {self._identify_count}",
             f"  reconnects:   {self._reconnect_count}",
             f"  $os:          {p.get('$os', '?')}",
