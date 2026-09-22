@@ -1,15 +1,14 @@
 # cogs/spoofer.py | platform / device spoofing — patches outgoing IDENTIFY (op:2)
-# frames on the wire instead of chasing whatever attribute the client stores
-# properties under. survives discord.py-self forks and internal refactors.
+# frames on the wire. forces a fresh IDENTIFY (not a RESUME) on reconnect so the
+# spoofed properties actually ship.
 import asyncio
 import json
+import re
 import time
 import discord
 from . import state as S
 
 
-# Discord's gateway IDENTIFY accepts these in properties.$os / $browser / $device.
-# the values below are what Discord's official clients send from each platform.
 PLATFORM_PRESETS = {
     "desktop":     {"os": "Windows",  "browser": "Discord Client", "device": "",            "label": "Windows Desktop"},
     "windows":     {"os": "Windows",  "browser": "Discord Client", "device": "",            "label": "Windows Desktop"},
@@ -33,6 +32,20 @@ PLATFORM_PRESETS = {
 }
 
 
+# tolerant check — matches {"op": 2, ...} and {"op":2, ...} both
+_OP2_RE = re.compile(r'"op"\s*:\s*2\b')
+
+
+def _frame_is_identify(data):
+    """Return True if `data` (a JSON string) is an IDENTIFY frame (op 2)."""
+    if not isinstance(data, str):
+        return False
+    if not _OP2_RE.search(data):
+        return False
+    # cheap sanity: must also contain a "properties" key
+    return '"properties"' in data
+
+
 class SpooferCog:
     COMMANDS = {"platform", "spoof", "spoofer", "vr", "console",
                 "spoofreset", "spoofstatus"}
@@ -42,8 +55,9 @@ class SpooferCog:
         self._interceptor_ws = None
         self._original_send = None
         self._interceptor_active = False
-        self._patched_preset = None     # the preset currently being sent
-        self._last_props = None         # last written properties (for status)
+        self._patched_preset = None
+        self._last_props = None
+        self._identify_count = 0          # how many IDENTIFYs we've rewritten
 
     # ── interceptor ──
 
@@ -69,8 +83,7 @@ class SpooferCog:
         cog = self
 
         async def patched_send(data, *args, **kwargs):
-            # intercept IDENTIFY frames (op:2) and rewrite properties.$os/$browser/$device
-            if isinstance(data, str) and '"op":2' in data:
+            if _frame_is_identify(data):
                 try:
                     payload = json.loads(data)
                     if payload.get("op") == 2 and isinstance(payload.get("d"), dict):
@@ -82,9 +95,12 @@ class SpooferCog:
                             props["$device"] = preset["device"]
                             payload["d"]["properties"] = props
                             cog._last_props = dict(props)
+                            cog._identify_count += 1
+                            print(f"[spoofer] rewrote IDENTIFY #{cog._identify_count} "
+                                  f"→ {preset['label']}")
                             data = json.dumps(payload)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[spoofer] identify rewrite failed: {e}")
             return await original(data, *args, **kwargs)
 
         try:
@@ -103,7 +119,6 @@ class SpooferCog:
         return preset["label"] if preset else plat
 
     async def _set_platform(self, preset_key, message):
-        """Set the preset that will be injected into the next IDENTIFY."""
         preset = PLATFORM_PRESETS.get(preset_key)
         if not preset:
             await message.edit(content=S.ui_err(f"unknown platform: {preset_key}"))
@@ -119,9 +134,22 @@ class SpooferCog:
         return True
 
     async def _reconnect(self):
-        """Drop the gateway so the next IDENTIFY uses the injected properties."""
+        """Force a FRESH IDENTIFY (not a RESUME).
+        Clearing session_id makes discord.py-self send op:2 next connect
+        instead of op:6. Without this, the reconnect resumes the old
+        session and the spoofer never fires."""
         client = S.CLIENT
         try:
+            conn = getattr(client, "_connection", None)
+            if conn is not None:
+                try:
+                    conn._session_id = None
+                except Exception:
+                    pass
+                try:
+                    conn.sequence = None
+                except Exception:
+                    pass
             ws = getattr(client, "ws", None)
             if ws:
                 await ws.close(code=4000)
@@ -136,7 +164,6 @@ class SpooferCog:
             await message.edit(content=S.ui_err("client not ready"))
             return
 
-        # attach the interceptor lazily on first command
         await self._ensure_interceptor()
 
         # ── platform ──
@@ -174,11 +201,13 @@ class SpooferCog:
             if sub == "status":
                 p = self._last_props or {}
                 lines = [
-                    f"  tracked:   {getattr(S, '_current_platform', '?')}",
+                    f"  tracked:     {getattr(S, '_current_platform', '?')}",
                     f"  interceptor: {'active' if self._interceptor_active else 'inactive'}",
-                    f"  $os:       {p.get('$os', '?')}",
-                    f"  $browser:  {p.get('$browser', '?')}",
-                    f"  $device:   {p.get('$device', '?')}",
+                    f"  patched:     {self._patched_preset['label'] if self._patched_preset else '—'}",
+                    f"  identify #:  {self._identify_count}",
+                    f"  $os:         {p.get('$os', '?')}",
+                    f"  $browser:    {p.get('$browser', '?')}",
+                    f"  $device:     {p.get('$device', '?')}",
                 ]
                 await message.edit(content=S._ansi_block(lines))
                 return
@@ -213,6 +242,7 @@ class SpooferCog:
                 f"  tracked:     {getattr(S, '_current_platform', '?')}",
                 f"  interceptor: {'active' if self._interceptor_active else 'inactive'}",
                 f"  patched:     {self._patched_preset['label'] if self._patched_preset else '—'}",
+                f"  identify #:  {self._identify_count}",
                 f"  $os:         {p.get('$os', '?')}",
                 f"  $browser:    {p.get('$browser', '?')}",
                 f"  $device:     {p.get('$device', '?')}",
