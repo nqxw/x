@@ -29,6 +29,7 @@ except Exception as e:
 
 
 DEFAULT_APP_ID = 1453358037506199743
+ROBLOX_APP_ID = 1552026905023356938
 PURPLESTREAM_URL = "https://www.twitch.tv/hadeontop"
 ICON_PLACEHOLDER = "https://cdn.pfps.gg/pfps/20715-237182-lonely-girl-animated.gif"
 
@@ -60,7 +61,7 @@ PLATFORM_PRESET_MAP = {
     "quest": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "meta": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "oculus": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
-    "roblox": {"application_id": 899273624442372096, "platform": None, "asset": "roblox"},
+    "roblox": {"application_id": ROBLOX_APP_ID, "platform": None, "asset": "roblox"},
 }
 
 INLINE_KEYS = ["name", "details", "state", "type", "timestamp", "platform",
@@ -83,9 +84,6 @@ SPOTIFY_FIELDS_TO_KEEP = {
 
 class RPCCog(commands.Cog, name="Rich Presence"):
 
-    # ── dispatcher registration ──
-    # the selfbot's custom dispatcher routes via _COG_REGISTRY, which is built
-    # from this set. every name below is what the user types after the prefix.
     COMMANDS = {
         "rpc1", "rpc2", "rpc3", "rpc4", "rpc5", "rpc6",
         "roblox", "spotify", "youtube", "xbox", "ps", "ps4",
@@ -127,8 +125,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
     # ── dispatcher entry point ──
 
     async def handle(self, message, cmd, args):
-        """Called by selfbot.py::_dispatch_message when cmd is in COMMANDS.
-        args is the full token list, args[0] == cmd."""
         try:
             rest = args[1:] if len(args) > 1 else []
 
@@ -269,8 +265,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         label = f"RPC{slot+1}"
 
         if not rest:
-            # inline form: .rpc1 name X | details Y | ...
-            # but with no args there's nothing to parse
             await ch.send(ascii.error(f"Usage: .rpc{slot+1} name <text> | details <text> | ..."))
             return
 
@@ -278,7 +272,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         payload = rest[1:]
         rest_str = " ".join(payload)
 
-        # inline-parse fallback when sub isn't a known subcommand
         known_subs = {"name", "details", "state", "type", "platform", "timestamp",
                       "large_image", "small_image", "large_image_text", "btn1", "btn2",
                       "spotify", "youtube", "xbox", "ps", "ps4", "crunchy", "crunchyroll",
@@ -849,6 +842,7 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             return None
         if image_url in self._asset_cache:
             return self._asset_cache[image_url]
+
         discord_cdn_pattern = (r"https?://(?:cdn\.discordapp\.com|media\.discordapp\.net)"
                                 r"/attachments/(\d+)/(\d+)/(.+)")
         match = re.search(discord_cdn_pattern, image_url)
@@ -858,23 +852,43 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             self._asset_cache[image_url] = key
             self._asset_urls[key] = image_url
             return key
+
         if not self.bot.user:
             print("[RPC] upload_asset: bot.user not ready")
             return None
+
         try:
+            fetch_headers = {
+                "Authorization": self.bot.http.token,
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "discord/1.0.9044 Chrome/120.0.6099.291 Safari/537.36"),
+                "Accept": "image/*,*/*;q=0.8",
+                "Referer": "https://discord.com/",
+            }
+            async with aiohttp.ClientSession(headers=fetch_headers) as session:
+                async with session.get(image_url) as r:
+                    if r.status != 200:
+                        print(f"[RPC] upload_asset fetch {r.status} for {image_url[:80]}")
+                        return None
+                    image_bytes = await r.read()
+
+            if not image_bytes:
+                print("[RPC] upload_asset: empty response body")
+                return None
+
+            raw_name = image_url.split('/')[-1].split('?')[0]
+            name = raw_name if ('.' in raw_name and len(raw_name) <= 50) else "asset.png"
+            if name.lower().endswith('.webp'):
+                name = name.rsplit('.', 1)[0] + ".png"
+
             self_dm = self.bot.user.dm_channel
             if self_dm is None:
                 self_dm = await self.bot.user.create_dm()
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url) as r:
-                    if r.status != 200:
-                        return None
-                    image_bytes = await r.read()
-            filename = image_url.split('/')[-1].split('?')[0]
-            if '.' not in filename or len(filename) > 50:
-                filename = "asset.png"
+
             message = await self_dm.send(
-                file=discord.File(io.BytesIO(image_bytes), filename=filename))
+                file=discord.File(io.BytesIO(image_bytes), filename=name))
+
             if message.attachments:
                 new_url = message.attachments[0].url
                 new_match = re.search(discord_cdn_pattern, new_url)
@@ -883,9 +897,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                     key = f"mp:attachments/{cid}/{aid}/{fname}"
                     self._asset_cache[image_url] = key
                     self._asset_urls[key] = image_url
+                    self._save_asset_urls()
                     return key
         except Exception as e:
-            print(f"[RPC] upload_asset failed: {e}")
+            import traceback
+            print(f"[RPC] upload_asset failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
         return None
 
     # ── presence builders ──
@@ -998,12 +1015,13 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         }
 
     async def build_roblox(self, parts: list):
+        """Roblox presence — game name, optional details/state, elapsed timer."""
         game = (parts[0] if parts else "Roblox")[:128]
         now = int(time.time() * 1000)
         activity = {
             "type": 0,
             "name": "Roblox",
-            "application_id": "899273624442372096",
+            "application_id": str(ROBLOX_APP_ID),
             "details": game,
             "timestamps": {"start": now},
             "assets": {"large_image": "roblox", "large_text": game[:128]},
