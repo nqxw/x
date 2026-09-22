@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# lunar — v2.2.7 (cog-delegated)
+# sy's selfbot — v2.2.8 (cog-delegated, roblox platform)
 
 import discord
 import asyncio
@@ -150,14 +150,14 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[lunar] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[selfbot] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.7"
+VERSION = "2.2.8"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -226,7 +226,7 @@ HELP_DATA = {
         ("snipe [n]","snipe last deleted message"),("snipe clear","wipe snipe cache"),
         ("editsnipe [n]","snipe last edited message"),("editsnipe clear","wipe edit-snipe cache"),
         ("copycat <id>","mirror next 10 msgs from user"),("status <text>","set custom status"),
-        ("status clear","clear status"),("platform <type>","spoof gateway platform"),
+        ("status clear","clear status"),("platform <type>","spoof gateway platform (desktop/web/mobile/ios/android/embedded)"),
         ("platform off","reset platform to desktop"),("hypesquad <house>","set hypesquad house"),
         ("hypesquad off","remove hypesquad badge"),
     ],
@@ -250,52 +250,10 @@ HELP_DATA = {
         ("vcdeafen <user_id>","server deafen user"),("vcundeafen <user_id>","server undeafen user"),
         ("vckick <user_id>","kick user from vc"),("vcmove <user> <ch_id>","move user to channel"),
         ("vcmoveall <ch1> <ch2>","move all users ch1 → ch2"),
-        ("vcreconnect on/off/status","auto-rejoin vc on disconnect"),
         ("selfmute","toggle your own server mute"),
         ("selfdeaf","toggle your own server deafen"),
         ("selfstream","toggle your stream (go live)"),
         ("selfcamera","toggle your camera/video"),
-    ],
-    "rpc": [
-        ("rpc <1-6> <field> <value>","set a rich presence slot"),
-        ("rpc <slot> name <text>","activity name"),
-        ("rpc <slot> details <text>","details line"),
-        ("rpc <slot> state <text>","state line"),
-        ("rpc <slot> type <type>","playing/streaming/listening/watching/competing/purplestream"),
-        ("rpc <slot> platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta"),
-        ("rpc <slot> large_image <url>","large image"),
-        ("rpc <slot> small_image <url>","small image"),
-        ("rpc <slot> timestamp <val>","3600 | 1:00:00 | clear"),
-        ("rpc <slot> btn1 <label> <url>","first button"),
-        ("rpc <slot> btn2 <label> <url>","second button"),
-        ("rpc <slot> clear","wipe that slot"),
-        ("rpc status","show all 6 slots"),
-        ("rpc clearall","wipe every slot"),
-        ("rpc1 <field> <value>","slot 1 shorthand"),
-        ("rpc2 <field> <value>","slot 2 shorthand"),
-        ("rpc3 <field> <value>","slot 3 shorthand"),
-        ("rpc4 <field> <value>","slot 4 shorthand"),
-        ("rpc5 <field> <value>","slot 5 shorthand"),
-        ("rpc6 <field> <value>","slot 6 shorthand"),
-        ("spotify <song - artist> [slot]","quick spotify presence"),
-        ("youtube <video - channel> [slot]","quick youtube presence"),
-        ("xbox <game - details> [slot]","quick xbox presence"),
-        ("ps <game - details> [slot]","quick playstation presence"),
-        ("ps4 <game - details> [slot]","quick ps4 presence"),
-        ("crunchy <anime - ep> [slot]","quick crunchyroll presence"),
-        ("vrchat <state - world> [slot]","quick vrchat presence"),
-        ("meta <state - world> [slot] [image]","quick meta quest presence"),
-        ("playing <text>","simple playing activity"),
-        ("listening <text>","simple listening activity"),
-        ("watching <text>","simple watching activity"),
-        ("competing <text>","simple competing activity"),
-        ("rpc_status","list every slot"),
-        ("clear_multi_rpc","wipe all six slots"),
-        ("aoff","clear current activity"),
-        ("rstatus <a, b, c>","rotate custom status text"),
-        ("remoji <a, b, c>","rotate custom status emoji"),
-        ("stopstatus","stop status rotation"),
-        ("stopemoji","stop emoji rotation"),
     ],
     "fun": [
         ("gayrate [user_id]","gay percentage"),("feed <user_id>","feed a user"),
@@ -345,7 +303,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show lunar version"),("reload","reload config from disk"),
+        ("version","show selfbot version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -425,8 +383,8 @@ HELP_DATA = {
     "developer": [
         ("host say <idx> <msg>","force hosted account to say"),
         ("host broadcast <msg>","broadcast from all accounts"),
-        ("logs [n]","tail lunar console"),("eval <code>","evaluate python code"),
-        ("restart","restart the lunar process"),("reconnect","force gateway reconnect"),
+        ("logs [n]","tail selfbot console"),("eval <code>","evaluate python code"),
+        ("restart","restart the selfbot process"),("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),("plugin unload <name>","unload a plugin"),
         ("plugin list","list loaded plugins"),
@@ -622,6 +580,26 @@ HELP_DATA = {
         ("interact list","list pending interactions"),
         ("interact clear","clear pending interactions"),
     ],
+    "rpc": [
+        ("rpc1..rpc6 <args>","set RPC slot inline (name/details/state/type/...)"),
+        ("rpcN name <text>","set slot name"),("rpcN details <text>","set slot details"),
+        ("rpcN state <text>","set slot state"),("rpcN type <playing|streaming|listening|watching|competing>","set activity type"),
+        ("rpcN platform <preset>","set platform preset (xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta/roblox/off)"),
+        ("rpcN roblox <game> [- details [- small_text]]","roblox presence with optional details"),
+        ("rpcN spotify <song - artist>","spotify presence"),("rpcN youtube <video - channel>","youtube presence"),
+        ("rpcN xbox <game>","xbox presence"),("rpcN ps <game>","playstation presence"),
+        ("rpcN ps4 <game>","ps4 presence"),("rpcN crunchy <anime - ep>","crunchyroll presence"),
+        ("rpcN timestamp <3600|1:00:00|clear>","set/clear elapsed timer"),
+        ("rpcN large_image <url>","set large asset"),("rpcN small_image <url>","set small asset"),
+        ("rpcN btn1 <label> <url>","set first button"),("rpcN btn2 <label> <url>","set second button"),
+        ("rpcN clear","clear that slot"),("roblox <game> [- details] [slot]","quick roblox presence"),
+        ("spotify <song - artist> [slot]","quick spotify presence"),
+        ("youtube <video - channel> [slot]","quick youtube presence"),
+        ("xbox <game> [slot]","quick xbox presence"),("ps <game> [slot]","quick playstation presence"),
+        ("ps4 <game> [slot]","quick ps4 presence"),("crunchy <anime - ep> [slot]","quick crunchyroll presence"),
+        ("vrchat <state - world> [slot]","quick vrchat presence"),("meta <state - world> [slot] [image_url]","quick meta quest presence"),
+        ("rpc_status","show all six slots"),("clear_multi_rpc","wipe every rpc slot"),
+    ],
 }
 
 def build_help_root(page=1):
@@ -632,7 +610,6 @@ def build_help_root(page=1):
     desc = {
         "general":"utilities, platform & status","quests":"quest completer & orb badge",
         "sniper":"nitro sniper & logger","ar":"auto-responder","voice":"voice channel controls",
-        "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
         "admin":"owner / admin management",
         "lastfm":"last.fm integration","settings":"prefix, aliases, cooldowns, profiles",
@@ -649,12 +626,13 @@ def build_help_root(page=1):
         "monitor":"event monitoring & alerts","backup":"server backup & restore",
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
+        "rpc":"rich presence slots, platforms & presets",
     }
-    lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  lunar | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  sy | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -768,6 +746,9 @@ _db_path = "database/selfbot.db"
 _db = None
 
 # ── platform / hypesquad ──
+# selfbot-side label map. gateway spoofing still goes through the rpc cog's
+# PLATFORM_PRESET_MAP for anything rich-presence related. this map exists so
+# help text, dashboards, and any inline reader can name the platforms.
 PLATFORM_MAP = {
     "desktop":  "Windows",
     "web":      "Web",
@@ -775,6 +756,23 @@ PLATFORM_MAP = {
     "ios":      "iOS",
     "android":  "Android",
     "embedded": "Embedded",
+    # platform presets mirrored from cogs/rpc.py so selfbot-side readers agree
+    "roblox":       "Roblox",
+    "xbox":         "Xbox",
+    "ps":           "PlayStation",
+    "ps4":          "PlayStation 4",
+    "ps5":          "PlayStation 5",
+    "playstation":  "PlayStation",
+    "crunchyroll":  "Crunchyroll",
+    "crunchy":      "Crunchyroll",
+    "youtube":      "YouTube",
+    "twitch":       "Twitch",
+    "vrchat":       "VRChat",
+    "meta_quest":   "Meta Quest",
+    "quest":        "Meta Quest",
+    "meta":         "Meta Quest",
+    "oculus":       "Meta Quest",
+    "spotify":      "Spotify",
 }
 _current_platform = "desktop"
 
@@ -850,7 +848,7 @@ async def translate_text(text, target_lang):
     except Exception as e:
         return f"error: {e}"
 
-# ── neko roleplay gif fetcher ──
+# ── neko roleplay gif fetcher (was missing — fixes cstate.neko_gif NameError) ──
 NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
                 "poke", "wink", "smug", "boop", "nom", "wave", "highfive",
                 "bite", "blush", "dance", "happy", "cringe"}
@@ -1046,9 +1044,9 @@ def task_cancel(name):
 # COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
 
-# Order matters for command collision — later entries overwrite earlier ones.
-# Put adapter cogs that need to WIN a name at the bottom.
+# Format: (module path, class name)
 COG_MODULES = [
+    ("cogs.rpc", "RPCCog"),
     ("cogs.quests", "QuestsCog"),
     ("cogs.host", "HostCog"),
     ("cogs.voice", "VoiceCog"),
@@ -1084,10 +1082,6 @@ COG_MODULES = [
     ("cogs.server", "ServerCog"),
     ("cogs.information", "InformationCog"),
     ("cogs.interactions", "InteractionsCog"),
-    # ── RPC adapter last so its commands win collisions on
-    #    spotify / youtube / xbox / ps / ps4 / crunchy / playing / listening /
-    #    watching / competing / stopactivity / rpc_status / clear_multi_rpc ──
-    ("cogs.rpc_adapter", "RpcAdapterCog"),
 ]
 
 _COG_REGISTRY = {}
@@ -1125,6 +1119,9 @@ async def _boot_cogs():
         cstate.decrypt_file = decrypt_file
         cstate._has_crypto = _HAS_CRYPTO
         cstate._HAS_CRYPTO = _HAS_CRYPTO
+        cstate.PLATFORM_MAP = PLATFORM_MAP
+        cstate.HOUSE_IDS = HOUSE_IDS
+        cstate.HOUSE_NAMES = HOUSE_NAMES
 
         # adopt existing containers into state (shared references)
         cstate.HOSTED_TOKENS = HOSTED_TOKENS
@@ -1532,6 +1529,10 @@ async def _dispatch_message(_client, message):
         await message.channel.send(build_help_root(1))
         return
 
+    # unknown command — log only, do nothing (selfbot convention: silent)
+    # uncomment next line if you want feedback on unknown commands:
+    # print(f"[dispatch] unknown cmd: {cmd}")
+
 
 @client.event
 async def on_message(message):
@@ -1604,7 +1605,7 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
     client.run(TOKEN)
 except discord.LoginFailure as e:
