@@ -10,6 +10,14 @@ import hashlib
 from pathlib import Path
 from discord.ext import commands
 
+# pull the live client from cogs.state if we weren't handed one explicitly.
+# this is what fixes `RPCCog.__init__() missing 1 required positional argument: 'bot'`
+# when selfbot.py's _boot_cogs does `cls()` on every cog.
+try:
+    from cogs import state as cstate
+except Exception:
+    cstate = None
+
 try:
     from utils.ascii_helper import AsciiHelper
     ascii = AsciiHelper()
@@ -56,7 +64,7 @@ PLATFORM_PRESET_MAP = {
     "quest": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "meta": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "oculus": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
-    "roblox": {"application_id": 363445589247131668, "platform": None, "asset": "roblox"}
+    "roblox": {"application_id": 363445589247131668, "platform": None, "asset": "roblox"},
 }
 
 INLINE_KEYS = ["name", "details", "state", "type", "timestamp", "platform",
@@ -80,7 +88,14 @@ SPOTIFY_FIELDS_TO_KEEP = {
 
 
 class RPCCog(commands.Cog, name="Rich Presence"):
-    def __init__(self, bot):
+    def __init__(self, bot=None):
+        # tolerant init: accept a client arg or pull it from cogs.state.
+        # this is the exact fix for `RPCCog.__init__() missing 1 required positional argument: 'bot'`
+        if bot is None and cstate is not None:
+            bot = getattr(cstate, "CLIENT", None) or getattr(cstate, "MAIN_CLIENT", None)
+        if bot is None:
+            raise RuntimeError("RPCCog: no client available — pass bot or set cstate.CLIENT before init")
+
         self.bot = bot
         self.rpc_slots = [None] * 6
         self._slot_platform_preset = [None] * 6
@@ -93,8 +108,11 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self.current_status = ""
         self.current_emoji = ""
         self._interceptor_active = False
+        self._interceptor_ws = None          # ws instance we patched
+        self._original_ws_send = None        # ref to the unpatched send
         self._clearing = False
         self._bg_tasks = []
+        self._deferred_started = False
         try:
             self.bot.loop.create_task(self._deferred_start())
         except Exception:
@@ -103,6 +121,9 @@ class RPCCog(commands.Cog, name="Rich Presence"):
 
     async def _deferred_start(self):
         """Wait for ready, then wire up background loops and the interceptor."""
+        if self._deferred_started:
+            return
+        self._deferred_started = True
         try:
             await self.bot.wait_until_ready()
         except Exception:
@@ -140,8 +161,15 @@ class RPCCog(commands.Cog, name="Rich Presence"):
     # ── presence interceptor ──
 
     async def _start_presence_interceptor(self):
-        if self._interceptor_active:
+        """Attach or re-attach the op:3 patch to the CURRENT ws.
+
+        A reconnect replaces self.bot.ws with a new object, so we can't trust
+        the _interceptor_active flag alone — we also have to verify the ws
+        identity we patched is still the live one.
+        """
+        if self._interceptor_active and self.bot.ws is self._interceptor_ws:
             return
+
         for _ in range(30):
             if self.bot.ws and hasattr(self.bot.ws, 'send'):
                 break
@@ -150,8 +178,11 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             print("[RPC] Could not attach interceptor - no websocket")
             return
 
-        # capture the ORIGINAL send of the CURRENT ws; do not cache across reconnects
-        original = self.bot.ws.send
+        # if we previously patched a different ws, drop that stale flag.
+        # the old ws object is gone anyway; nothing to restore.
+        self._interceptor_ws = self.bot.ws
+        self._original_ws_send = self.bot.ws.send
+        original = self._original_ws_send
         rpc_cog = self
 
         async def patched_send(data, *args, **kwargs):
@@ -170,37 +201,46 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                     pass
             return await original(data, *args, **kwargs)
 
-        self.bot.ws.send = patched_send
+        try:
+            self.bot.ws.send = patched_send
+        except Exception as e:
+            print(f"[RPC] failed to patch ws.send: {e}")
+            return
+
         self._interceptor_active = True
         print("[RPC] Presence interceptor active")
 
     async def _stop_presence_interceptor(self):
-        if self._interceptor_active and self.bot.ws:
-            try:
-                # we can't restore the exact original because we don't hold a ref;
-                # just clear the flag and let the wrapper be garbage collected.
-                # on next reconnect ws is replaced anyway.
-                pass
-            except Exception:
-                pass
-            self._interceptor_active = False
-            print("[RPC] Presence interceptor removed")
+        """Best-effort restore of the original ws.send if the ws is still alive."""
+        if not self._interceptor_active:
+            return
+        try:
+            if self.bot.ws is self._interceptor_ws and self._original_ws_send is not None:
+                self.bot.ws.send = self._original_ws_send
+        except Exception:
+            pass
+        self._interceptor_active = False
+        self._interceptor_ws = None
+        self._original_ws_send = None
+        print("[RPC] Presence interceptor removed")
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # fires on every ready; only re-attach if we lost the interceptor
-        if not self._interceptor_active:
-            try:
-                await self._start_presence_interceptor()
-                if any(a is not None for a in self.rpc_slots):
-                    await self._push()
-            except Exception as e:
-                print(f"[RPC] on_ready re-attach failed: {e}")
+        """Fires on every ready; re-attach if the ws changed or we lost the patch."""
+        try:
+            if self.bot.ws is not self._interceptor_ws:
+                # new ws — old patch is dead, force re-attach
+                self._interceptor_active = False
+            await self._start_presence_interceptor()
+            if any(a is not None for a in self.rpc_slots):
+                await self._push()
+        except Exception as e:
+            print(f"[RPC] on_ready re-attach failed: {e}")
 
     # ── persistence ──
 
     def _get_user_file(self, filename):
-        """Per-user file path. Uses the given filename under data/{uid}/."""
+        """Per-user file path. Uses the given filename under data/."""
         if not self.bot.user:
             return Path(f"data/_unready_{filename}")
         uid = str(self.bot.user.id)
@@ -323,6 +363,7 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         if not active:
             return
         if not self.bot.ws:
+            print("[RPC] push skipped — no websocket")
             return
         current_status = str(self.bot.status) if hasattr(self.bot, 'status') else "online"
         payload = {"op": 3, "d": {"since": 0, "activities": active,
