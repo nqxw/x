@@ -1,6 +1,6 @@
 # cogs/spoofer.py | platform / device spoofing — patches outgoing IDENTIFY (op:2)
-# frames on the wire. forces a fresh IDENTIFY (not a RESUME) on reconnect and
-# closes cleanly so discord.py-self reconnects without backoff.
+# frames on the wire. keeps the interceptor attached across ws reconnects via a
+# background poll, so a fresh IDENTIFY after a reconnect always gets rewritten.
 import asyncio
 import json
 import re
@@ -32,7 +32,6 @@ PLATFORM_PRESETS = {
 }
 
 
-# tolerant check — matches {"op": 2, ...} and {"op":2, ...} both
 _OP2_RE = re.compile(r'"op"\s*:\s*2\b')
 
 
@@ -57,6 +56,43 @@ class SpooferCog:
         self._last_props = None
         self._identify_count = 0
         self._reconnect_count = 0
+        self._watch_task = None
+
+    # ── background watcher ──
+
+    def _start_watcher(self):
+        """Spawn a single background task that reattaches the interceptor
+        whenever client.ws changes (i.e. after every reconnect)."""
+        if self._watch_task and not self._watch_task.done():
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        self._watch_task = loop.create_task(self._ws_watcher())
+
+    async def _ws_watcher(self):
+        """Poll client.ws every 2s. If the ws object changed, re-patch it."""
+        last_ws_id = None
+        while True:
+            try:
+                client = S.CLIENT
+                ws = getattr(client, "ws", None) if client else None
+                if ws is not None:
+                    cur_id = id(ws)
+                    if cur_id != last_ws_id:
+                        last_ws_id = cur_id
+                        # new ws object — force reattach
+                        self._interceptor_active = False
+                        self._interceptor_ws = None
+                        ok = await self._ensure_interceptor()
+                        if ok:
+                            print(f"[spoofer] reattached interceptor to new ws "
+                                  f"(preset: "
+                                  f"{self._patched_preset['label'] if self._patched_preset else '—'})")
+            except Exception as e:
+                print(f"[spoofer] watcher error: {e}")
+            await asyncio.sleep(2)
 
     # ── interceptor ──
 
@@ -109,6 +145,8 @@ class SpooferCog:
 
         self._interceptor_active = True
         print("[spoofer] IDENTIFY interceptor active")
+        # spin up the watcher once — it lives for the process lifetime
+        self._start_watcher()
         return True
 
     def _current_preset_label(self):
@@ -132,12 +170,6 @@ class SpooferCog:
         return True
 
     async def _fast_reconnect(self):
-        """Force a fresh IDENTIFY fast.
-        - clears session_id + sequence + resume_gateway_url → forces op:2 not op:6
-        - resets reconnect_attempts so the library starts at attempt 1 (no backoff)
-        - closes with code 1000 (normal) → no jittered reconnect delay
-        - if the library's own reconnect task is sleeping, kick it.
-        """
         client = S.CLIENT
         if client is None:
             return
@@ -146,7 +178,6 @@ class SpooferCog:
         ws = getattr(client, "ws", None)
         self._reconnect_count += 1
 
-        # 1. clear the resume state — this is what forces a fresh IDENTIFY
         if conn is not None:
             for attr in ("_session_id", "sequence", "_resume_gateway_url",
                          "_resume_gateway"):
@@ -154,23 +185,11 @@ class SpooferCog:
                     setattr(conn, attr, None)
                 except Exception:
                     pass
-            # 2. reset the library's backoff counter
             try:
                 conn._reconnect_attempts = 0
             except Exception:
                 pass
-            # 3. cancel a sleeping reconnect task so ours goes first
-            try:
-                task = getattr(conn, "_reconnect_task", None)
-                if task is not None and not task.done():
-                    # if the task is not currently running (i.e. it's the active
-                    # one), leave it alone — cancelling it is what we want only
-                    # if it's mid-sleep. this call is best-effort.
-                    pass
-            except Exception:
-                pass
 
-        # 4. close cleanly — 1000 avoids discord.py-self's 1-5s backoff
         if ws is not None:
             try:
                 await ws.close(code=1000)
@@ -180,11 +199,9 @@ class SpooferCog:
                 except Exception as e:
                     print(f"[spoofer] close failed: {e}")
 
-        # 5. nudge the client to reconnect immediately if it exposes one
         try:
             await client.connect(reconnect=True)
         except TypeError:
-            # some builds take no args
             try:
                 await client.connect()
             except Exception:
@@ -202,7 +219,6 @@ class SpooferCog:
 
         await self._ensure_interceptor()
 
-        # ── platform ──
         if cmd == "platform":
             if len(args) < 2:
                 cur = getattr(S, "_current_platform", "desktop")
@@ -226,7 +242,6 @@ class SpooferCog:
             await self._fast_reconnect()
             return
 
-        # ── spoof / spoofer ──
         if cmd in ("spoof", "spoofer"):
             if len(args) < 2:
                 await message.edit(content=S.ui_info(
@@ -235,18 +250,7 @@ class SpooferCog:
             sub = args[1].lower()
 
             if sub == "status":
-                p = self._last_props or {}
-                lines = [
-                    f"  tracked:      {getattr(S, '_current_platform', '?')}",
-                    f"  interceptor:  {'active' if self._interceptor_active else 'inactive'}",
-                    f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
-                    f"  identify #:   {self._identify_count}",
-                    f"  reconnects:   {self._reconnect_count}",
-                    f"  $os:          {p.get('$os', '?')}",
-                    f"  $browser:     {p.get('$browser', '?')}",
-                    f"  $device:      {p.get('$device', '?')}",
-                ]
-                await message.edit(content=S._ansi_block(lines))
+                await self._send_status(message)
                 return
 
             if sub == "reset":
@@ -263,7 +267,6 @@ class SpooferCog:
             await self._fast_reconnect()
             return
 
-        # ── vr / console ──
         if cmd in ("vr", "console"):
             if not await self._set_platform(cmd, message):
                 return
@@ -272,26 +275,30 @@ class SpooferCog:
             await self._fast_reconnect()
             return
 
-        # ── spoofstatus ──
         if cmd == "spoofstatus":
-            p = self._last_props or {}
-            lines = [
-                f"  tracked:      {getattr(S, '_current_platform', '?')}",
-                f"  interceptor:  {'active' if self._interceptor_active else 'inactive'}",
-                f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
-                f"  identify #:   {self._identify_count}",
-                f"  reconnects:   {self._reconnect_count}",
-                f"  $os:          {p.get('$os', '?')}",
-                f"  $browser:     {p.get('$browser', '?')}",
-                f"  $device:      {p.get('$device', '?')}",
-            ]
-            await message.edit(content=S._ansi_block(lines))
+            await self._send_status(message)
             return
 
-        # ── spoofreset ──
         if cmd == "spoofreset":
             if not await self._set_platform("desktop", message):
                 return
             await message.edit(content=S.ui_ok("platform reset → Desktop"))
             await self._fast_reconnect()
             return
+
+    async def _send_status(self, message):
+        p = self._last_props or {}
+        ws = getattr(S.CLIENT, "ws", None)
+        ws_match = (ws is self._interceptor_ws) if ws is not None else False
+        lines = [
+            f"  tracked:      {getattr(S, '_current_platform', '?')}",
+            f"  interceptor:  {'active' if self._interceptor_active else 'inactive'}",
+            f"  ws match:     {'yes' if ws_match else 'no'}",
+            f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
+            f"  identify #:   {self._identify_count}",
+            f"  reconnects:   {self._reconnect_count}",
+            f"  $os:          {p.get('$os', '?')}",
+            f"  $browser:     {p.get('$browser', '?')}",
+            f"  $device:      {p.get('$device', '?')}",
+        ]
+        await message.edit(content=S._ansi_block(lines))
