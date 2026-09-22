@@ -60,7 +60,7 @@ PLATFORM_PRESET_MAP = {
     "quest": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "meta": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "oculus": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
-    "roblox": {"application_id": 363445589247131668, "platform": None, "asset": "roblox"},
+    "roblox": {"application_id": 899273624442372096, "platform": None, "asset": "roblox"},
 }
 
 INLINE_KEYS = ["name", "details", "state", "type", "timestamp", "platform",
@@ -1003,7 +1003,7 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         activity = {
             "type": 0,
             "name": "Roblox",
-            "application_id": "363445589247131668",
+            "application_id": "899273624442372096",
             "details": game,
             "timestamps": {"start": now},
             "assets": {"large_image": "roblox", "large_text": game[:128]},
