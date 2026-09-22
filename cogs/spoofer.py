@@ -1,4 +1,6 @@
-# cogs/spoofer.py | platform / device spoofing — reconnect gateway with modified IDENTIFY properties
+# cogs/spoofer.py | platform / device spoofing — patches outgoing IDENTIFY (op:2)
+# frames on the wire instead of chasing whatever attribute the client stores
+# properties under. survives discord.py-self forks and internal refactors.
 import asyncio
 import json
 import time
@@ -31,57 +33,119 @@ PLATFORM_PRESETS = {
 }
 
 
-def _current_props(client):
-    """Best-effort read of the live IDENTIFY properties block."""
-    try:
-        conn = getattr(client, "_connection", None)
-        if conn is not None and getattr(conn, "_properties", None):
-            return conn._properties
-    except Exception:
-        pass
-    try:
-        ws = getattr(client, "ws", None)
-        if ws is not None and hasattr(ws, "_connection"):
-            return getattr(ws._connection, "_properties", None)
-    except Exception:
-        pass
-    return None
-
-
-def _apply_props(client, preset):
-    """Write os/browser/device into the IDENTIFY properties block.
-    discord.py-self reads properties at IDENTIFY time from client._connection._properties."""
-    props = _current_props(client)
-    if props is None:
-        return False
-    props["$os"] = preset["os"]
-    props["$browser"] = preset["browser"]
-    props["$device"] = preset["device"]
-    return True
-
-
-async def _reconnect(client):
-    """Drop the gateway so the next IDENTIFY uses the modified properties."""
-    try:
-        ws = getattr(client, "ws", None)
-        if ws:
-            await ws.close(code=4000)
-    except Exception as e:
-        print(f"[spoofer] reconnect failed: {e}")
-
-
 class SpooferCog:
     COMMANDS = {"platform", "spoof", "spoofer", "vr", "console",
                 "spoofreset", "spoofstatus"}
 
+    def __init__(self):
+        self.bot = None
+        self._interceptor_ws = None
+        self._original_send = None
+        self._interceptor_active = False
+        self._patched_preset = None     # the preset currently being sent
+        self._last_props = None         # last written properties (for status)
+
+    # ── interceptor ──
+
+    async def _ensure_interceptor(self):
+        """Attach or re-attach the op:2 IDENTIFY patch to the current ws."""
+        client = S.CLIENT
+        if client is None:
+            return False
+
+        if self._interceptor_active and getattr(client, "ws", None) is self._interceptor_ws:
+            return True
+
+        for _ in range(30):
+            if getattr(client, "ws", None) and hasattr(client.ws, 'send'):
+                break
+            await asyncio.sleep(0.5)
+        if not getattr(client, "ws", None):
+            return False
+
+        self._interceptor_ws = client.ws
+        self._original_send = client.ws.send
+        original = self._original_send
+        cog = self
+
+        async def patched_send(data, *args, **kwargs):
+            # intercept IDENTIFY frames (op:2) and rewrite properties.$os/$browser/$device
+            if isinstance(data, str) and '"op":2' in data:
+                try:
+                    payload = json.loads(data)
+                    if payload.get("op") == 2 and isinstance(payload.get("d"), dict):
+                        props = payload["d"].get("properties", {})
+                        preset = cog._patched_preset
+                        if preset:
+                            props["$os"] = preset["os"]
+                            props["$browser"] = preset["browser"]
+                            props["$device"] = preset["device"]
+                            payload["d"]["properties"] = props
+                            cog._last_props = dict(props)
+                            data = json.dumps(payload)
+                except Exception:
+                    pass
+            return await original(data, *args, **kwargs)
+
+        try:
+            client.ws.send = patched_send
+        except Exception as e:
+            print(f"[spoofer] failed to patch ws.send: {e}")
+            return False
+
+        self._interceptor_active = True
+        print("[spoofer] IDENTIFY interceptor active")
+        return True
+
+    def _current_preset_label(self):
+        plat = getattr(S, "_current_platform", "desktop")
+        preset = PLATFORM_PRESETS.get(plat)
+        return preset["label"] if preset else plat
+
+    async def _set_platform(self, preset_key, message):
+        """Set the preset that will be injected into the next IDENTIFY."""
+        preset = PLATFORM_PRESETS.get(preset_key)
+        if not preset:
+            await message.edit(content=S.ui_err(f"unknown platform: {preset_key}"))
+            return False
+
+        if not await self._ensure_interceptor():
+            await message.edit(content=S.ui_err(
+                "could not attach to gateway — try again in a moment"))
+            return False
+
+        self._patched_preset = preset
+        S._current_platform = preset_key
+        return True
+
+    async def _reconnect(self):
+        """Drop the gateway so the next IDENTIFY uses the injected properties."""
+        client = S.CLIENT
+        try:
+            ws = getattr(client, "ws", None)
+            if ws:
+                await ws.close(code=4000)
+        except Exception as e:
+            print(f"[spoofer] reconnect failed: {e}")
+
+    # ── dispatcher ──
+
     async def handle(self, message, cmd, args):
         client = S.CLIENT
+        if client is None:
+            await message.edit(content=S.ui_err("client not ready"))
+            return
 
-        # ── platform <type> | platform | platform off ──
+        # attach the interceptor lazily on first command
+        await self._ensure_interceptor()
+
+        # ── platform ──
         if cmd == "platform":
             if len(args) < 2:
-                cur = S._current_platform
-                lines = [f"  current: {cur}", "", "  available:"]
+                cur = getattr(S, "_current_platform", "desktop")
+                lines = [f"  current: {cur}", "",
+                         f"  live:    {self._current_preset_label()}", "",
+                         "  available:"]
                 for k in sorted(PLATFORM_PRESETS.keys()):
                     lines.append(f"    {k:<12} {PLATFORM_PRESETS[k]['label']}")
                 await message.edit(content=S._ansi_block(lines))
@@ -91,19 +155,12 @@ class SpooferCog:
             if plat == "off":
                 plat = "desktop"
 
-            preset = PLATFORM_PRESETS.get(plat)
-            if not preset:
-                await message.edit(content=S.ui_err(f"unknown platform: {plat}"))
+            if not await self._set_platform(plat, message):
                 return
 
-            if not _apply_props(client, preset):
-                await message.edit(content=S.ui_err(
-                    "could not reach IDENTIFY properties — reconnect manually"))
-                return
-
-            S._current_platform = plat
+            preset = PLATFORM_PRESETS[plat]
             await message.edit(content=S.ui_ok(f"platform → {preset['label']}"))
-            await _reconnect(client)
+            await self._reconnect()
             return
 
         # ── spoof / spoofer ──
@@ -115,66 +172,58 @@ class SpooferCog:
             sub = args[1].lower()
 
             if sub == "status":
-                props = _current_props(client) or {}
+                p = self._last_props or {}
                 lines = [
-                    f"  tracked:   {S._current_platform}",
-                    f"  $os:       {props.get('$os', '?')}",
-                    f"  $browser:  {props.get('$browser', '?')}",
-                    f"  $device:   {props.get('$device', '?')}",
+                    f"  tracked:   {getattr(S, '_current_platform', '?')}",
+                    f"  interceptor: {'active' if self._interceptor_active else 'inactive'}",
+                    f"  $os:       {p.get('$os', '?')}",
+                    f"  $browser:  {p.get('$browser', '?')}",
+                    f"  $device:   {p.get('$device', '?')}",
                 ]
                 await message.edit(content=S._ansi_block(lines))
                 return
 
             if sub == "reset":
-                preset = PLATFORM_PRESETS["desktop"]
-                _apply_props(client, preset)
-                S._current_platform = "desktop"
+                if not await self._set_platform("desktop", message):
+                    return
                 await message.edit(content=S.ui_ok("platform reset → Desktop"))
-                await _reconnect(client)
+                await self._reconnect()
                 return
 
-            preset = PLATFORM_PRESETS.get(sub)
-            if not preset:
-                await message.edit(content=S.ui_err(f"unknown platform: {sub}"))
+            if not await self._set_platform(sub, message):
                 return
-            if not _apply_props(client, preset):
-                await message.edit(content=S.ui_err("could not set properties"))
-                return
-            S._current_platform = sub
+            preset = PLATFORM_PRESETS[sub]
             await message.edit(content=S.ui_ok(f"spoofed → {preset['label']}"))
-            await _reconnect(client)
+            await self._reconnect()
             return
 
-        # ── vr / console shortcuts ──
+        # ── vr / console ──
         if cmd in ("vr", "console"):
-            preset = PLATFORM_PRESETS.get(cmd)
-            if not preset:
-                await message.edit(content=S.ui_err(f"no preset for {cmd}"))
+            if not await self._set_platform(cmd, message):
                 return
-            if not _apply_props(client, preset):
-                await message.edit(content=S.ui_err("could not set properties"))
-                return
-            S._current_platform = cmd
+            preset = PLATFORM_PRESETS[cmd]
             await message.edit(content=S.ui_ok(f"platform → {preset['label']}"))
-            await _reconnect(client)
+            await self._reconnect()
             return
 
-        # ── spoofstatus / spoofreset ──
+        # ── spoofstatus ──
         if cmd == "spoofstatus":
-            props = _current_props(client) or {}
+            p = self._last_props or {}
             lines = [
-                f"  tracked:   {S._current_platform}",
-                f"  $os:       {props.get('$os', '?')}",
-                f"  $browser:  {props.get('$browser', '?')}",
-                f"  $device:   {props.get('$device', '?')}",
+                f"  tracked:     {getattr(S, '_current_platform', '?')}",
+                f"  interceptor: {'active' if self._interceptor_active else 'inactive'}",
+                f"  patched:     {self._patched_preset['label'] if self._patched_preset else '—'}",
+                f"  $os:         {p.get('$os', '?')}",
+                f"  $browser:    {p.get('$browser', '?')}",
+                f"  $device:     {p.get('$device', '?')}",
             ]
             await message.edit(content=S._ansi_block(lines))
             return
 
+        # ── spoofreset ──
         if cmd == "spoofreset":
-            preset = PLATFORM_PRESETS["desktop"]
-            _apply_props(client, preset)
-            S._current_platform = "desktop"
+            if not await self._set_platform("desktop", message):
+                return
             await message.edit(content=S.ui_ok("platform reset → Desktop"))
-            await _reconnect(client)
+            await self._reconnect()
             return
