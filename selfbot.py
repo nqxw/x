@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# sy's selfbot — v2.2.9 (cog-delegated, alias arg-sync)
+# sy's selfbot — v2.3.0 (cog-delegated, spoofer category)
 
 import discord
 import asyncio
@@ -157,7 +157,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.9"
+VERSION = "2.3.0"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -226,9 +226,23 @@ HELP_DATA = {
         ("snipe [n]","snipe last deleted message"),("snipe clear","wipe snipe cache"),
         ("editsnipe [n]","snipe last edited message"),("editsnipe clear","wipe edit-snipe cache"),
         ("copycat <id>","mirror next 10 msgs from user"),("status <text>","set custom status"),
-        ("status clear","clear status"),("platform <type>","spoof gateway platform (desktop/web/mobile/ios/android/embedded)"),
-        ("platform off","reset platform to desktop"),("hypesquad <house>","set hypesquad house"),
-        ("hypesquad off","remove hypesquad badge"),
+        ("status clear","clear status"),
+        ("hypesquad <house>","set hypesquad house"),("hypesquad off","remove hypesquad badge"),
+    ],
+    "spoofer": [
+        ("platform","show current platform + list"),
+        ("platform <type>","spoof platform & reconnect gateway"),
+        ("platform off","reset to desktop"),
+        ("spoof <type>","alias for platform <type>"),
+        ("spoof status","show live IDENTIFY properties"),
+        ("spoof reset","reset to desktop"),
+        ("vr","spoof as VR headset"),
+        ("console","spoof as console"),
+        ("spoofstatus","show live IDENTIFY properties"),
+        ("spoofreset","reset to desktop"),
+        ("types","desktop / windows / macos / linux / web / browser"),
+        ("","phone / mobile / android / ios / iphone / ipad"),
+        ("","console / xbox / playstation / ps / vr / quest / embedded / off"),
     ],
     "quests": [
         ("quest","list active quests + progress"),("questrun <index>","solve specific quest"),
@@ -250,10 +264,53 @@ HELP_DATA = {
         ("vcdeafen <user_id>","server deafen user"),("vcundeafen <user_id>","server undeafen user"),
         ("vckick <user_id>","kick user from vc"),("vcmove <user> <ch_id>","move user to channel"),
         ("vcmoveall <ch1> <ch2>","move all users ch1 → ch2"),
+        ("vcreconnect on/off/status","auto-rejoin vc on disconnect"),
         ("selfmute","toggle your own server mute"),
         ("selfdeaf","toggle your own server deafen"),
         ("selfstream","toggle your stream (go live)"),
         ("selfcamera","toggle your camera/video"),
+    ],
+    "rpc": [
+        ("rpc <1-6> <field> <value>","set a rich presence slot"),
+        ("rpc <slot> name <text>","activity name"),
+        ("rpc <slot> details <text>","details line"),
+        ("rpc <slot> state <text>","state line"),
+        ("rpc <slot> type <type>","playing/streaming/listening/watching/competing/purplestream"),
+        ("rpc <slot> platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta/roblox"),
+        ("rpc <slot> large_image <url>","large image"),
+        ("rpc <slot> small_image <url>","small image"),
+        ("rpc <slot> timestamp <val>","3600 | 1:00:00 | clear"),
+        ("rpc <slot> btn1 <label> <url>","first button"),
+        ("rpc <slot> btn2 <label> <url>","second button"),
+        ("rpc <slot> clear","wipe that slot"),
+        ("rpc status","show all 6 slots"),
+        ("rpc clearall","wipe every slot"),
+        ("rpc1 <field> <value>","slot 1 shorthand"),
+        ("rpc2 <field> <value>","slot 2 shorthand"),
+        ("rpc3 <field> <value>","slot 3 shorthand"),
+        ("rpc4 <field> <value>","slot 4 shorthand"),
+        ("rpc5 <field> <value>","slot 5 shorthand"),
+        ("rpc6 <field> <value>","slot 6 shorthand"),
+        ("roblox <game> [- details] [slot]","quick roblox presence"),
+        ("spotify <song - artist> [slot]","quick spotify presence"),
+        ("youtube <video - channel> [slot]","quick youtube presence"),
+        ("xbox <game - details> [slot]","quick xbox presence"),
+        ("ps <game - details> [slot]","quick playstation presence"),
+        ("ps4 <game - details> [slot]","quick ps4 presence"),
+        ("crunchy <anime - ep> [slot]","quick crunchyroll presence"),
+        ("vrchat <state - world> [slot]","quick vrchat presence"),
+        ("meta <state - world> [slot] [image]","quick meta quest presence"),
+        ("playing <text>","simple playing activity"),
+        ("listening <text>","simple listening activity"),
+        ("watching <text>","simple watching activity"),
+        ("competing <text>","simple competing activity"),
+        ("rpc_status","list every slot"),
+        ("clear_multi_rpc","wipe all six slots"),
+        ("aoff","clear current activity"),
+        ("rstatus <a, b, c>","rotate custom status text"),
+        ("remoji <a, b, c>","rotate custom status emoji"),
+        ("stopstatus","stop status rotation"),
+        ("stopemoji","stop emoji rotation"),
     ],
     "fun": [
         ("gayrate [user_id]","gay percentage"),("feed <user_id>","feed a user"),
@@ -580,26 +637,6 @@ HELP_DATA = {
         ("interact list","list pending interactions"),
         ("interact clear","clear pending interactions"),
     ],
-    "rpc": [
-        ("rpc1..rpc6 <args>","set RPC slot inline (name/details/state/type/...)"),
-        ("rpcN name <text>","set slot name"),("rpcN details <text>","set slot details"),
-        ("rpcN state <text>","set slot state"),("rpcN type <playing|streaming|listening|watching|competing>","set activity type"),
-        ("rpcN platform <preset>","set platform preset (xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta/roblox/off)"),
-        ("rpcN roblox <game> [- details [- small_text]]","roblox presence with optional details"),
-        ("rpcN spotify <song - artist>","spotify presence"),("rpcN youtube <video - channel>","youtube presence"),
-        ("rpcN xbox <game>","xbox presence"),("rpcN ps <game>","playstation presence"),
-        ("rpcN ps4 <game>","ps4 presence"),("rpcN crunchy <anime - ep>","crunchyroll presence"),
-        ("rpcN timestamp <3600|1:00:00|clear>","set/clear elapsed timer"),
-        ("rpcN large_image <url>","set large asset"),("rpcN small_image <url>","set small asset"),
-        ("rpcN btn1 <label> <url>","set first button"),("rpcN btn2 <label> <url>","set second button"),
-        ("rpcN clear","clear that slot"),("roblox <game> [- details] [slot]","quick roblox presence"),
-        ("spotify <song - artist> [slot]","quick spotify presence"),
-        ("youtube <video - channel> [slot]","quick youtube presence"),
-        ("xbox <game> [slot]","quick xbox presence"),("ps <game> [slot]","quick playstation presence"),
-        ("ps4 <game> [slot]","quick ps4 presence"),("crunchy <anime - ep> [slot]","quick crunchyroll presence"),
-        ("vrchat <state - world> [slot]","quick vrchat presence"),("meta <state - world> [slot] [image_url]","quick meta quest presence"),
-        ("rpc_status","show all six slots"),("clear_multi_rpc","wipe every rpc slot"),
-    ],
 }
 
 def build_help_root(page=1):
@@ -608,8 +645,10 @@ def build_help_root(page=1):
     page = max(1, min(page, total))
     chunk = cats[(page-1)*10:(page-1)*10+10]
     desc = {
-        "general":"utilities, platform & status","quests":"quest completer & orb badge",
+        "general":"utilities, status & misc","spoofer":"platform / device spoofing",
+        "quests":"quest completer & orb badge",
         "sniper":"nitro sniper & logger","ar":"auto-responder","voice":"voice channel controls",
+        "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
         "admin":"owner / admin management",
         "lastfm":"last.fm integration","settings":"prefix, aliases, cooldowns, profiles",
@@ -626,7 +665,6 @@ def build_help_root(page=1):
         "monitor":"event monitoring & alerts","backup":"server backup & restore",
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
-        "rpc":"rich presence slots, platforms & presets",
     }
     lines = [f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
@@ -746,26 +784,36 @@ _db_path = "database/selfbot.db"
 _db = None
 
 # ── platform / hypesquad ──
+# selfbot-side label map. gateway spoofing is owned by cogs.spoofer; this map
+# exists so help text, dashboards, and inline readers can name every platform.
 PLATFORM_MAP = {
     "desktop":  "Windows",
+    "windows":  "Windows",
     "web":      "Web",
+    "browser":  "Web",
+    "phone":    "Android",
     "mobile":   "Android",
-    "ios":      "iOS",
     "android":  "Android",
+    "ios":      "iOS",
+    "iphone":   "iOS",
+    "ipad":     "iOS",
+    "macos":    "Mac OS X",
+    "linux":    "Linux",
+    "console":  "Console",
+    "xbox":     "Xbox",
+    "playstation": "PlayStation",
+    "ps":       "PlayStation",
+    "vr":       "VR Headset",
+    "quest":    "Meta Quest",
     "embedded": "Embedded",
+    # rpc presets mirrored here so selfbot-side readers agree with cogs.rpc
     "roblox":       "Roblox",
-    "xbox":         "Xbox",
-    "ps":           "PlayStation",
-    "ps4":          "PlayStation 4",
-    "ps5":          "PlayStation 5",
-    "playstation":  "PlayStation",
     "crunchyroll":  "Crunchyroll",
     "crunchy":      "Crunchyroll",
     "youtube":      "YouTube",
     "twitch":       "Twitch",
     "vrchat":       "VRChat",
     "meta_quest":   "Meta Quest",
-    "quest":        "Meta Quest",
     "meta":         "Meta Quest",
     "oculus":       "Meta Quest",
     "spotify":      "Spotify",
@@ -844,7 +892,7 @@ async def translate_text(text, target_lang):
     except Exception as e:
         return f"error: {e}"
 
-# ── neko roleplay gif fetcher (was missing — fixes cstate.neko_gif NameError) ──
+# ── neko roleplay gif fetcher ──
 NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
                 "poke", "wink", "smug", "boop", "nom", "wave", "highfive",
                 "bite", "blush", "dance", "happy", "cringe"}
@@ -1040,8 +1088,9 @@ def task_cancel(name):
 # COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
 
+# Order matters for command collision — later entries overwrite earlier ones.
+# Put adapter cogs that need to WIN a name at the bottom.
 COG_MODULES = [
-    ("cogs.rpc", "RPCCog"),
     ("cogs.quests", "QuestsCog"),
     ("cogs.host", "HostCog"),
     ("cogs.voice", "VoiceCog"),
@@ -1077,6 +1126,12 @@ COG_MODULES = [
     ("cogs.server", "ServerCog"),
     ("cogs.information", "InformationCog"),
     ("cogs.interactions", "InteractionsCog"),
+    # ── spoofer + rpc adapters LAST so their commands win collisions on
+    #    platform / spotify / youtube / xbox / ps / ps4 / crunchy / playing /
+    #    listening / watching / competing / stopactivity / rpc_status /
+    #    clear_multi_rpc ──
+    ("cogs.spoofer", "SpooferCog"),
+    ("cogs.rpc", "RPCCog"),
 ]
 
 _COG_REGISTRY = {}
@@ -1176,6 +1231,7 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
+        # fault-tolerant per-module import — one bad cog doesn't kill the rest
         for mod_name, cls_name in COG_MODULES:
             try:
                 mod = importlib.import_module(mod_name)
@@ -1228,6 +1284,7 @@ async def on_ready():
     idx = getattr(client, "_bot_index", "main")
     print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
 
+    # load hosted tokens list
     global HOSTED_TOKENS
     try:
         HOSTED_TOKENS = await async_hosted_tokens_get()
@@ -1248,9 +1305,11 @@ async def on_ready():
     triggers_load()
     tasks_load()
 
+    # boot cogs on main client
     if is_main and not _COGS_BOOTED:
         await _boot_cogs()
 
+    # IPC block (unchanged)
     if is_main and not globals().get("_ipc_initialized"):
         print("[ipc] initializing global state...")
         globals()["_ipc_initialized"] = True
@@ -1279,6 +1338,7 @@ async def on_ready():
         except Exception as e:
             print(f"[ipc] ✗ failed to start: {e}")
 
+    # background loops
     if not any("scheduler" in str(t) for t in asyncio.all_tasks()):
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
