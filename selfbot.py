@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# sy's selfbot — v2.2.8 (cog-delegated, roblox platform)
+# sy's selfbot — v2.2.9 (cog-delegated, alias arg-sync)
 
 import discord
 import asyncio
@@ -157,7 +157,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.8"
+VERSION = "2.2.9"
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -746,9 +746,6 @@ _db_path = "database/selfbot.db"
 _db = None
 
 # ── platform / hypesquad ──
-# selfbot-side label map. gateway spoofing still goes through the rpc cog's
-# PLATFORM_PRESET_MAP for anything rich-presence related. this map exists so
-# help text, dashboards, and any inline reader can name the platforms.
 PLATFORM_MAP = {
     "desktop":  "Windows",
     "web":      "Web",
@@ -756,7 +753,6 @@ PLATFORM_MAP = {
     "ios":      "iOS",
     "android":  "Android",
     "embedded": "Embedded",
-    # platform presets mirrored from cogs/rpc.py so selfbot-side readers agree
     "roblox":       "Roblox",
     "xbox":         "Xbox",
     "ps":           "PlayStation",
@@ -1044,7 +1040,6 @@ def task_cancel(name):
 # COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
 
-# Format: (module path, class name)
 COG_MODULES = [
     ("cogs.rpc", "RPCCog"),
     ("cogs.quests", "QuestsCog"),
@@ -1181,7 +1176,6 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
-        # fault-tolerant per-module import — one bad cog doesn't kill the rest
         for mod_name, cls_name in COG_MODULES:
             try:
                 mod = importlib.import_module(mod_name)
@@ -1193,7 +1187,10 @@ async def _boot_cogs():
                 print(f"[cogs] SKIP {mod_name} — class {cls_name} not found")
                 continue
             try:
-                inst = cls()
+                try:
+                    inst = cls(client)
+                except TypeError:
+                    inst = cls()
             except Exception as e:
                 print(f"[cogs] SKIP {mod_name}.{cls_name} — init failed: {e}")
                 continue
@@ -1231,7 +1228,6 @@ async def on_ready():
     idx = getattr(client, "_bot_index", "main")
     print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
 
-    # load hosted tokens list
     global HOSTED_TOKENS
     try:
         HOSTED_TOKENS = await async_hosted_tokens_get()
@@ -1252,11 +1248,9 @@ async def on_ready():
     triggers_load()
     tasks_load()
 
-    # boot cogs on main client
     if is_main and not _COGS_BOOTED:
         await _boot_cogs()
 
-    # IPC block (unchanged)
     if is_main and not globals().get("_ipc_initialized"):
         print("[ipc] initializing global state...")
         globals()["_ipc_initialized"] = True
@@ -1285,7 +1279,6 @@ async def on_ready():
         except Exception as e:
             print(f"[ipc] ✗ failed to start: {e}")
 
-    # background loops
     if not any("scheduler" in str(t) for t in asyncio.all_tasks()):
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
@@ -1485,8 +1478,13 @@ async def _dispatch_message(_client, message):
     raw = message.content[len(effective_prefix):]
     args = raw.split()
     cmd = args[0].lower() if args else ""
+
+    # ── ALIAS RESOLUTION (with arg sync) ──
+    # rewrite cmd AND keep args[0] in sync, otherwise the cog's subcommand
+    # dispatch sees the pre-alias name and matches nothing → silent return.
     if cmd in _aliases:
         cmd = _aliases[cmd]
+        args = [cmd] + args[1:]
 
     if cmd in _cooldowns:
         key = (message.author.id, cmd)
