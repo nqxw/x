@@ -28,9 +28,13 @@ SUPPORTED_TASKS = (
     "MISSION_COMPLETE", "COMPLETE_QUEST",
     "COMPLETE_ACTIVITY", "EXTERNAL_TASK",
     "LAUNCH_GAME", "LAUNCH_QUEST",
+    "ACHIEVEMENT_IN_ACTIVITY", "ACHIEVEMENT",
+    "COMPLETE_ACHIEVEMENT", "EARN_ACHIEVEMENT",
 )
 VIDEO_TASKS = ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE")
 HEARTBEAT_TASKS = ("PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2", "PLAY_ACTIVITY", "STREAM_ON_DESKTOP")
+ACHIEVEMENT_TASKS = ("ACHIEVEMENT_IN_ACTIVITY", "ACHIEVEMENT",
+                     "COMPLETE_ACHIEVEMENT", "EARN_ACHIEVEMENT")
 MISSION_TASKS = ("COLLECT_ITEM", "COLLECT", "MISSION_COMPLETE", "COMPLETE_QUEST",
                  "COMPLETE_ACTIVITY", "EXTERNAL_TASK", "LAUNCH_GAME", "LAUNCH_QUEST")
 
@@ -200,16 +204,24 @@ class QuestService:
         if not quest.is_enrolled(): await self.enroll(session, quest)
         if not quest.is_supported(): return "unsupported"
         task = quest.selected_task
+
+        # ── achievements ──
+        if task in ACHIEVEMENT_TASKS:
+            return await self._achievements(session, quest)
+
         if task in VIDEO_TASKS:
             return await self._video(session, quest)
+
         if task in HEARTBEAT_TASKS:
             payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
             if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
             if task == "PLAY_ACTIVITY":
                 payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
             return await self._heartbeat(session, quest, payloads)
-        if task in MISSION_TASKS or task not in (*VIDEO_TASKS, *HEARTBEAT_TASKS):
+
+        if task in MISSION_TASKS or task not in (*VIDEO_TASKS, *HEARTBEAT_TASKS, *ACHIEVEMENT_TASKS):
             return await self._mission(session, quest)
+
         payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
         if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
         return await self._heartbeat(session, quest, payloads)
@@ -231,6 +243,110 @@ class QuestService:
                 break
             await asyncio.sleep(interval)
         return "completed" if quest.is_completed() or quest.progress_value() >= quest.target else "recovering"
+
+    async def _achievements(self, session, quest):
+        """Achievement-type quest handler.
+        Flow:
+          1. heartbeat loop with activity payloads until we hit 60 attempts or
+             the quest completes
+          2. if not complete, force /quests/{id}/progress
+          3. if 403/404, try /activities/achievement/{quest_id}/progress
+          4. fall back to /external-task-progress
+          5. terminal heartbeat
+        """
+        task = quest.selected_task
+        target = quest.target or 1.0
+
+        # ── stage 1: heartbeat loop (60 attempts max) ──
+        payloads = []
+        if quest.app_id:
+            payloads.append({"application_id": quest.app_id, "terminal": False})
+        payloads.append({"stream_key": f"call:{quest.id}:1", "terminal": False})
+        if self.uid:
+            payloads.append({"stream_key": f"call:{self.uid}:1", "terminal": False})
+
+        interval = 5
+        attempts = 0
+        max_attempts = 60
+        active = payloads[0] if payloads else None
+        while attempts < max_attempts and not quest.is_completed():
+            attempts += 1
+            d = None
+            for p in payloads:
+                try:
+                    d = await _api(session, "POST",
+                        f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                        headers=self.headers, json_body=p, retries=1)
+                    active = p
+                    break
+                except APIError:
+                    continue
+            if d:
+                quest.data["user_status"] = d
+            if quest.is_completed() or quest.progress_value() >= quest.target:
+                break
+            await asyncio.sleep(interval)
+
+        if quest.is_completed():
+            return "completed"
+
+        # ── stage 2: force /progress ──
+        try:
+            d = await _api(session, "POST",
+                f"https://discord.com/api/v9/quests/{quest.id}/progress",
+                headers=self.headers,
+                json_body={"task_id": task, "progress": {"value": target}},
+                retries=1)
+            if d:
+                quest.data["user_status"] = d
+            if quest.is_completed():
+                return "completed"
+        except APIError as e:
+            print(f"[achievements] /progress force failed: {e.status}")
+
+        # ── stage 3: /activities/achievement/{id}/progress ──
+        try:
+            d = await _api(session, "POST",
+                f"https://discord.com/api/v9/activities/achievement/{quest.id}/progress",
+                headers=self.headers,
+                json_body={"task_id": task, "progress": {"value": target}},
+                retries=1)
+            if d:
+                quest.data["user_status"] = d
+            if quest.is_completed():
+                return "completed"
+        except APIError as e:
+            if e.status != 404:
+                print(f"[achievements] /activities/achievement failed: {e.status}")
+
+        # ── stage 4: external-task-progress override ──
+        try:
+            d = await _api(session, "POST",
+                f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
+                headers=self.headers,
+                json_body={"task_id": task, "progress": {"value": target}},
+                retries=2)
+            if d:
+                quest.data["user_status"] = d
+            if quest.is_completed():
+                return "completed"
+        except APIError as e:
+            print(f"[achievements] external-task-progress failed: {e.status}")
+
+        # ── stage 5: terminal heartbeat ──
+        if active:
+            try:
+                terminal = dict(active); terminal["terminal"] = True
+                await _api(session, "POST",
+                    f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                    headers=self.headers, json_body=terminal, retries=1)
+            except Exception:
+                pass
+
+        if quest.is_completed():
+            return "completed"
+        print(f"[achievements] quest may not have completed cleanly: {quest.name}")
+        return "recovering"
 
     async def _mission(self, session, quest):
         task = quest.selected_task
@@ -412,6 +528,7 @@ class QuestsCog:
             for i, q in enumerate(quests):
                 if q.is_claimed(): tag = f"{S.GREEN}claimed{S.RESET}"
                 elif q.is_completed(): tag = f"{S.GREEN}done{S.RESET}"
+                elif q.selected_task in ACHIEVEMENT_TASKS: tag = f"{S.MAGENTA}achievement{S.RESET}"
                 elif q.selected_task in MISSION_TASKS: tag = f"{S.YELLOW}mission{S.RESET}"
                 elif q.is_supported(): tag = f"{S.CYAN}ok{S.RESET}"
                 else: tag = f"{S.RED}unsupported{S.RESET}"
