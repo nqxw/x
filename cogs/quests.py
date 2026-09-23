@@ -514,7 +514,8 @@ async def autoquest_run(token):
 
 
 class QuestsCog:
-    COMMANDS = {"quest", "questrun", "questall", "autoquest", "autoclaim", "orbbadge"}
+    COMMANDS = {"quest", "questrun", "questall", "autoquest", "autoclaim",
+                "orbbadge", "questdump"}
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
@@ -618,3 +619,54 @@ class QuestsCog:
             except Exception: pass
             ok, text = await claim_orb(S.TOKEN)
             await message.channel.send(S.ui_ok("claimed") if ok else S.ui_err(f"failed: {text[:80]}"), delete_after=8)
+
+        elif cmd == "questdump":
+            try: await message.delete()
+            except Exception: pass
+            idx = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
+            svc = QuestService(S.TOKEN)
+            async with aiohttp.ClientSession() as session:
+                quests = await svc.fetch(session)
+            if not quests or idx >= len(quests):
+                return await message.channel.send(S.ui_err("index out of range"), delete_after=6)
+            q = quests[idx]
+
+            def _dump(obj, label, max_len=1900):
+                try:
+                    text = json.dumps(obj, indent=2)
+                except Exception:
+                    text = str(obj)
+                if len(text) > max_len:
+                    text = text[:max_len - 20] + "\n... (truncated)"
+                return f"**{label}**\n```json\n{text}\n```"
+
+            # 1. task summary
+            task_names = list(q.tasks.keys())
+            info_lines = [
+                f"  name:          {q.name}",
+                f"  id:            {q.id}",
+                f"  app_id:        {q.app_id}",
+                f"  selected_task: {q.selected_task}",
+                f"  target:        {q.target}",
+                f"  progress:      {q.progress_value()} / {q.target}",
+                f"  completed:     {q.is_completed()}",
+                f"  claimed:       {q.is_claimed()}",
+                f"  task types:    {', '.join(task_names) if task_names else '—'}",
+            ]
+            await message.channel.send(S.ui_box("quest info", info_lines))
+
+            # 2. task_config block for the selected task
+            ach_block = q.tasks.get(q.selected_task) or {}
+            if ach_block:
+                await message.channel.send(_dump(ach_block, f"task_config: {q.selected_task}"))
+
+            # 3. all task configs (in case the interesting one isn't selected)
+            all_tasks = q.tasks
+            if all_tasks:
+                await message.channel.send(_dump(all_tasks, "all task configs"))
+
+            # 4. user_status
+            if q.user_status:
+                await message.channel.send(_dump(q.user_status, "user_status"))
+            else:
+                await message.channel.send(S.ui_info("no user_status — quest not enrolled yet"))
