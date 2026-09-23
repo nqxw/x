@@ -1,7 +1,10 @@
 # cogs/spoofer.py | platform / device spoofing.
-# multi-layer class patch: DiscordWebSocket._sendstr / .send / .send_as_json
-# plus aiohttp.ClientWebSocketResponse.send_str / .send_json / .send_bytes.
-# whatever path the IDENTIFY uses, one of these six catches it.
+# - patches the IDENTIFY send path (class-level, survives reconnects)
+# - safe reconnect that doesn't kill the client
+# - watchdog that recovers a stalled ws
+# - MULTI-SESSION: spawns concurrent auxiliary gateway connections on the
+#   same token, one per platform, so the profile shows multiple platform
+#   indicators at once (same mechanism Discord's own multi-device uses)
 import asyncio
 import json
 import re
@@ -34,10 +37,20 @@ PLATFORM_PRESETS = {
 }
 
 
+# canonical platforms — one entry per distinct OS/browser/device triple.
+# aliases (windows→desktop, phone→mobile, quest→vr, ps→playstation) collapse.
+UNIQUE_PLATFORMS = [
+    "desktop", "macos", "linux", "web", "mobile",
+    "ios", "ipad", "console", "xbox", "playstation",
+    "vr", "embedded",
+]
+
+
 _OP2_RE = re.compile(r'"op"\s*:\s*2\b')
-_PATCHED = {}                # id(obj) -> {"attr": original_callable}
+_PATCHED = {}
 _LIVE_COG = [None]
 _PRESET_HOLDER = [None]
+_AUX_SESSIONS = {}   # platform_key -> {"task": asyncio.Task, "ws": ws, "session": aiohttp.ClientSession}
 
 
 def _is_identify_frame(data):
@@ -59,7 +72,6 @@ def _is_identify_payload(payload):
 
 
 def _rewrite_frame(data):
-    """Rewrite a raw JSON string IDENTIFY frame. Returns new string or None."""
     if not _is_identify_frame(data):
         return None
     preset = _PRESET_HOLDER[0]
@@ -84,7 +96,6 @@ def _rewrite_frame(data):
 
 
 def _rewrite_payload_dict(payload):
-    """Rewrite a dict IDENTIFY payload in place. Returns True if rewritten."""
     preset = _PRESET_HOLDER[0]
     if preset is None or not _is_identify_payload(payload):
         return False
@@ -101,13 +112,11 @@ def _rewrite_payload_dict(payload):
 
 
 def _patch_class(cls, attr, wrapper_factory, kind):
-    """Idempotent class patch. kind is 'str', 'dict', or 'bytes'."""
     if not callable(getattr(cls, attr, None)):
         return False
     key = (id(cls), attr)
     if key in _PATCHED:
         return True
-
     original = getattr(cls, attr)
     wrapper = wrapper_factory(original, kind)
     try:
@@ -121,9 +130,6 @@ def _patch_class(cls, attr, wrapper_factory, kind):
 
 
 def _install_patches():
-    """Install all send-path patches. Idempotent."""
-
-    # ── layer 1: aiohttp raw socket ──
     try:
         import aiohttp
         aws = aiohttp.ClientWebSocketResponse
@@ -168,7 +174,6 @@ def _install_patches():
     except Exception as e:
         print(f"[spoofer] aiohttp patch layer failed: {e}")
 
-    # ── layer 2: discord.py-self ws wrapper ──
     ws_cls = None
     try:
         from discord.gateway import DiscordWebSocket as _ws_cls
@@ -187,7 +192,6 @@ def _install_patches():
             pass
 
     if ws_cls is not None:
-        # _sendstr — async, takes a raw string
         def _mk_ws_str(original, _kind):
             async def wrapper(self, data, *a, **kw):
                 try:
@@ -199,19 +203,6 @@ def _install_patches():
                 return await original(self, data, *a, **kw)
             return wrapper
 
-        # send — async, takes a raw string (older self builds)
-        def _mk_ws_send(original, _kind):
-            async def wrapper(self, data, *a, **kw):
-                try:
-                    r = _rewrite_frame(data)
-                    if r is not None:
-                        data = r
-                except Exception as e:
-                    print(f"[spoofer] ws.send error: {e}")
-                return await original(self, data, *a, **kw)
-            return wrapper
-
-        # send_as_json — async, takes a dict
         def _mk_ws_json(original, _kind):
             async def wrapper(self, payload, *a, **kw):
                 try:
@@ -231,7 +222,8 @@ def _install_patches():
 
 class SpooferCog:
     COMMANDS = {"platform", "spoof", "spoofer", "vr", "console",
-                "spoofreset", "spoofstatus", "spooferdiag"}
+                "spoofreset", "spoofstatus", "spooferdiag",
+                "spoofmulti", "spoofall"}
 
     def __init__(self):
         self.bot = None
@@ -239,8 +231,247 @@ class SpooferCog:
         self._last_props = None
         self._identify_count = 0
         self._reconnect_count = 0
+        self._reconnect_in_progress = False
+        self._last_reconnect_ts = 0.0
+        self._watchdog_task = None
         _LIVE_COG[0] = self
         _install_patches()
+        self._start_watchdog()
+
+    # ── watchdog ──
+
+    def _start_watchdog(self):
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        self._watchdog_task = loop.create_task(self._watchdog())
+
+    async def _watchdog(self):
+        dead_since = 0.0
+        while True:
+            try:
+                client = S.CLIENT
+                if client is not None:
+                    ws = getattr(client, "ws", None)
+                    closed = False
+                    try:
+                        closed = bool(ws and getattr(ws, "_closed", False))
+                    except Exception:
+                        pass
+                    if (ws is None or closed) and not client.is_closed():
+                        if dead_since == 0.0:
+                            dead_since = time.time()
+                        elif time.time() - dead_since > 10:
+                            print("[spoofer] watchdog: ws dead >10s, nudging reconnect")
+                            try:
+                                if not self._reconnect_in_progress:
+                                    await self._safe_reconnect()
+                            except Exception as e:
+                                print(f"[spoofer] watchdog reconnect err: {e}")
+                            dead_since = time.time()
+                    else:
+                        dead_since = 0.0
+            except Exception as e:
+                print(f"[spoofer] watchdog error: {e}")
+            await asyncio.sleep(5)
+
+    # ── main-session reconnect ──
+
+    async def _safe_reconnect(self):
+        client = S.CLIENT
+        if client is None:
+            return
+        now = time.time()
+        if self._reconnect_in_progress:
+            return
+        if now - self._last_reconnect_ts < 3.0:
+            return
+        self._reconnect_in_progress = True
+        self._last_reconnect_ts = now
+        self._reconnect_count += 1
+
+        try:
+            conn = getattr(client, "_connection", None)
+            if conn is not None:
+                try:
+                    conn._session_id = None
+                except Exception:
+                    pass
+                try:
+                    conn._reconnect_attempts = 0
+                except Exception:
+                    pass
+            ws = getattr(client, "ws", None)
+            if ws is not None:
+                try:
+                    await ws.close(code=1000)
+                except Exception:
+                    try:
+                        await ws.close(code=4000)
+                    except Exception as e:
+                        print(f"[spoofer] ws close failed: {e}")
+        finally:
+            asyncio.get_event_loop().call_later(3.0, self._clear_reconnect_flag)
+
+    def _clear_reconnect_flag(self):
+        self._reconnect_in_progress = False
+
+    # ══════════════════════════════════════════════════════════════════
+    #  MULTI-SESSION — raw gateway connections per platform
+    # ══════════════════════════════════════════════════════════════════
+
+    async def _aux_gateway_loop(self, platform_key, preset):
+        """Maintain a raw gateway connection identifying as `preset`.
+        Each aux session tags the account with its own platform, and Discord
+        merges all active sessions into the platform indicator row."""
+        try:
+            import aiohttp
+        except Exception as e:
+            print(f"[spoofer] aux {platform_key}: aiohttp import failed: {e}")
+            return
+
+        url = "wss://gateway.discord.gg/?v=9&encoding=json"
+        session = None
+        ws = None
+        hb_task = None
+        try:
+            session = aiohttp.ClientSession()
+            ws = await session.ws_connect(url, heartbeat=None, timeout=30)
+            _AUX_SESSIONS[platform_key]["ws"] = ws
+            _AUX_SESSIONS[platform_key]["session"] = session
+
+            # read Hello (op 10)
+            hello_msg = await ws.receive_json()
+            if hello_msg.get("op") != 10:
+                print(f"[spoofer] aux {platform_key}: expected Hello, got op {hello_msg.get('op')}")
+                return
+            hb_interval = hello_msg["d"]["heartbeat_interval"] / 1000.0
+
+            # send IDENTIFY with spoofed properties
+            token = getattr(S, "TOKEN", None) or ""
+            if not token:
+                print(f"[spoofer] aux {platform_key}: no token in state")
+                return
+
+            identify = {
+                "op": 2,
+                "d": {
+                    "token": token,
+                    "capabilities": 16381,
+                    "properties": {
+                        "os": preset["os"],
+                        "browser": preset["browser"],
+                        "device": preset["device"],
+                    },
+                    "presence": {
+                        "status": "online",
+                        "since": 0,
+                        "activities": [],
+                        "afk": False,
+                    },
+                    "compress": False,
+                    "client_state": {"guild_versions": {}},
+                }
+            }
+            await ws.send_json(identify)
+            print(f"[spoofer] aux {platform_key}: sent IDENTIFY as {preset['label']}")
+
+            # heartbeat task
+            hb_task = asyncio.create_task(self._aux_heartbeat(ws, hb_interval, platform_key))
+
+            # drain the socket — anything that arrives (Ready, heartbeats ack, etc)
+            async for msg in ws:
+                # we don't process events; we just keep the session alive
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[spoofer] aux {platform_key} error: {type(e).__name__}: {e}")
+        finally:
+            if hb_task and not hb_task.done():
+                hb_task.cancel()
+            try:
+                if ws is not None and not ws.closed:
+                    await ws.close()
+            except Exception:
+                pass
+            try:
+                if session is not None:
+                    await session.close()
+            except Exception:
+                pass
+            print(f"[spoofer] aux {platform_key}: session closed")
+
+    async def _aux_heartbeat(self, ws, interval, platform_key):
+        """Send op 1 heartbeat at Discord's interval. keep-alive."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if ws.closed:
+                    return
+                await ws.send_json({"op": 1, "d": None})
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[spoofer] aux {platform_key} heartbeat err: {e}")
+
+    async def _spawn_aux(self, platform_key):
+        """Spawn an auxiliary gateway session for `platform_key`.
+        Returns (ok: bool, message: str)."""
+        if platform_key in _AUX_SESSIONS:
+            return False, f"{platform_key} already active"
+        preset = PLATFORM_PRESETS.get(platform_key)
+        if not preset:
+            return False, f"unknown platform: {platform_key}"
+
+        task = asyncio.create_task(self._aux_gateway_loop(platform_key, preset))
+        _AUX_SESSIONS[platform_key] = {
+            "task": task,
+            "ws": None,
+            "session": None,
+        }
+        # small delay so Discord doesn't rate-limit concurrent IDENTIFYs
+        await asyncio.sleep(1.5)
+        return True, preset["label"]
+
+    async def _kill_aux(self, platform_key):
+        entry = _AUX_SESSIONS.pop(platform_key, None)
+        if not entry:
+            return False
+        task = entry.get("task")
+        ws = entry.get("ws")
+        session = entry.get("session")
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        try:
+            if ws is not None and not ws.closed:
+                await ws.close()
+        except Exception:
+            pass
+        try:
+            if session is not None:
+                await session.close()
+        except Exception:
+            pass
+        return True
+
+    async def _kill_all_aux(self):
+        keys = list(_AUX_SESSIONS.keys())
+        for k in keys:
+            try:
+                await self._kill_aux(k)
+            except Exception:
+                pass
+        return len(keys)
+
+    # ── diag ──
 
     def _build_diag(self):
         lines = []
@@ -248,7 +479,6 @@ class SpooferCog:
             import aiohttp
             aws = aiohttp.ClientWebSocketResponse
             for attr in ("send_str", "send_json", "send_bytes"):
-                m = getattr(aws, attr, None)
                 lines.append(f"aiohttp.{attr}: "
                              f"{'patched' if (id(aws), attr) in _PATCHED else 'unpatched'}")
         except Exception as e:
@@ -256,7 +486,6 @@ class SpooferCog:
         try:
             from discord.gateway import DiscordWebSocket as _ws
             for attr in ("_sendstr", "send", "send_as_json"):
-                m = getattr(_ws, attr, None)
                 lines.append(f"DiscordWebSocket.{attr}: "
                              f"{'patched' if (id(_ws), attr) in _PATCHED else 'unpatched'}")
         except Exception as e:
@@ -264,6 +493,8 @@ class SpooferCog:
         lines.append(f"preset held: {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
         lines.append(f"identify count: {self._identify_count}")
         lines.append(f"patched attr count: {len(_PATCHED)}")
+        lines.append(f"reconnect in progress: {self._reconnect_in_progress}")
+        lines.append(f"aux sessions: {len(_AUX_SESSIONS)} [{','.join(_AUX_SESSIONS.keys())}]")
         return lines
 
     def _current_preset_label(self):
@@ -281,44 +512,7 @@ class SpooferCog:
         S._current_platform = preset_key
         return True
 
-    async def _fast_reconnect(self):
-        client = S.CLIENT
-        if client is None:
-            return
-        conn = getattr(client, "_connection", None)
-        ws = getattr(client, "ws", None)
-        self._reconnect_count += 1
-
-        if conn is not None:
-            for attr in ("_session_id", "sequence", "_resume_gateway_url",
-                         "_resume_gateway", "session_id"):
-                try:
-                    setattr(conn, attr, None)
-                except Exception:
-                    pass
-            try:
-                conn._reconnect_attempts = 0
-            except Exception:
-                pass
-
-        if ws is not None:
-            try:
-                await ws.close(code=1000)
-            except Exception:
-                try:
-                    await ws.close(code=4000)
-                except Exception as e:
-                    print(f"[spoofer] close failed: {e}")
-
-        try:
-            await client.connect(reconnect=True)
-        except TypeError:
-            try:
-                await client.connect()
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[spoofer] manual reconnect kick failed (non-fatal): {e}")
+    # ── dispatcher ──
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
@@ -326,6 +520,7 @@ class SpooferCog:
             await message.edit(content=S.ui_err("client not ready"))
             return
 
+        # ── diag ──
         if cmd == "spooferdiag":
             lines = self._build_diag()
             print("[spooferdiag] ====")
@@ -335,6 +530,7 @@ class SpooferCog:
             await message.edit(content=S._ansi_block(lines))
             return
 
+        # ── platform ──
         if cmd == "platform":
             if len(args) < 2:
                 cur = getattr(S, "_current_platform", "desktop")
@@ -352,9 +548,10 @@ class SpooferCog:
                 return
             preset = PLATFORM_PRESETS[plat]
             await message.edit(content=S.ui_ok(f"platform → {preset['label']}"))
-            await self._fast_reconnect()
+            await self._safe_reconnect()
             return
 
+        # ── spoof / spoofer ──
         if cmd in ("spoof", "spoofer"):
             if len(args) < 2:
                 await message.edit(content=S.ui_info(
@@ -364,46 +561,139 @@ class SpooferCog:
             if sub == "status":
                 await self._send_status(message); return
             if sub == "reset":
+                await self._kill_all_aux()
                 if not await self._set_platform("desktop", message):
                     return
-                await message.edit(content=S.ui_ok("platform reset → Desktop"))
-                await self._fast_reconnect(); return
+                await message.edit(content=S.ui_ok("platform reset → Desktop, aux sessions cleared"))
+                await self._safe_reconnect(); return
             if not await self._set_platform(sub, message):
                 return
             preset = PLATFORM_PRESETS[sub]
             await message.edit(content=S.ui_ok(f"spoofed → {preset['label']}"))
-            await self._fast_reconnect()
+            await self._safe_reconnect()
             return
 
+        # ── vr / console ──
         if cmd in ("vr", "console"):
             if not await self._set_platform(cmd, message):
                 return
             preset = PLATFORM_PRESETS[cmd]
             await message.edit(content=S.ui_ok(f"platform → {preset['label']}"))
-            await self._fast_reconnect()
+            await self._safe_reconnect()
             return
 
+        # ── spoofstatus ──
         if cmd == "spoofstatus":
             await self._send_status(message); return
 
+        # ── spoofreset ──
         if cmd == "spoofreset":
+            n = await self._kill_all_aux()
             if not await self._set_platform("desktop", message):
                 return
-            await message.edit(content=S.ui_ok("platform reset → Desktop"))
-            await self._fast_reconnect(); return
+            await message.edit(content=S.ui_ok(
+                f"platform reset → Desktop, {n} aux session(s) cleared"))
+            await self._safe_reconnect(); return
+
+        # ── spoofall — spawn EVERY unique platform as an aux session ──
+        if cmd == "spoofall":
+            await message.edit(content=S.ui_info(
+                f"spawning aux sessions for {len(UNIQUE_PLATFORMS)} platforms..."))
+            ok, fail = [], []
+            for p in UNIQUE_PLATFORMS:
+                try:
+                    o, msg = await self._spawn_aux(p)
+                    (ok if o else fail).append(p if o else f"{p}({msg})")
+                except Exception as e:
+                    fail.append(f"{p}({e})")
+            lines = [
+                f"  spawned: {len(ok)}",
+                f"    {', '.join(ok) if ok else '—'}",
+                "",
+                f"  failed:  {len(fail)}",
+                f"    {', '.join(fail) if fail else '—'}",
+                "",
+                "  discord merges all sessions into the platform row",
+                "  on your profile — open it to check",
+            ]
+            await message.channel.send(S._ansi_block(lines))
+            return
+
+        # ── spoofmulti — manage aux sessions ──
+        if cmd == "spoofmulti":
+            if len(args) < 2:
+                await message.edit(content=S.ui_info(
+                    "usage: spoofmulti <a,b,c>  |  spoofmulti list  |  "
+                    "spoofmulti stop [platform]"))
+                return
+            sub = args[1].lower()
+            if sub == "list":
+                if not _AUX_SESSIONS:
+                    await message.edit(content=S.ui_info("no aux sessions"))
+                    return
+                lines = ["  active aux sessions:"]
+                for k in _AUX_SESSIONS:
+                    p = PLATFORM_PRESETS.get(k, {})
+                    task = _AUX_SESSIONS[k].get("task")
+                    live = task and not task.done()
+                    lines.append(f"    {k:<12} {p.get('label','?'):<20} "
+                                 f"{'live' if live else 'dead'}")
+                await message.edit(content=S._ansi_block(lines))
+                return
+            if sub == "stop":
+                if len(args) >= 3:
+                    target = args[2].lower()
+                    if await self._kill_aux(target):
+                        await message.edit(content=S.ui_ok(f"stopped {target}"))
+                    else:
+                        await message.edit(content=S.ui_err(f"{target} not active"))
+                    return
+                n = await self._kill_all_aux()
+                await message.edit(content=S.ui_ok(f"stopped {n} session(s)"))
+                return
+
+            # args[1] onwards is the comma list
+            raw = " ".join(args[1:]).replace(" ", "")
+            presets = [p for p in raw.split(",") if p]
+            if not presets:
+                await message.edit(content=S.ui_err("no platforms listed"))
+                return
+            ok, fail = [], []
+            for p in presets:
+                try:
+                    o, msg = await self._spawn_aux(p)
+                    (ok if o else fail).append(p if o else f"{p}({msg})")
+                except Exception as e:
+                    fail.append(f"{p}({e})")
+            lines = [
+                f"  spawned: {', '.join(ok) if ok else '—'}",
+                f"  failed:  {', '.join(fail) if fail else '—'}",
+                f"  active:  {', '.join(_AUX_SESSIONS.keys()) if _AUX_SESSIONS else '—'}",
+            ]
+            await message.channel.send(S._ansi_block(lines))
+            return
 
     async def _send_status(self, message):
         p = self._last_props or {}
         active = _PRESET_HOLDER[0]
+        aux_lines = []
+        for k in _AUX_SESSIONS:
+            pdef = PLATFORM_PRESETS.get(k, {})
+            task = _AUX_SESSIONS[k].get("task")
+            live = task and not task.done()
+            aux_lines.append(f"    {k:<12} {pdef.get('label','?'):<20} "
+                             f"{'live' if live else 'dead'}")
         lines = [
             f"  tracked:      {getattr(S, '_current_platform', '?')}",
             f"  preset held:  {active['label'] if active else '—'}",
-            f"  patched attrs:{len(_PATCHED)}",
             f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
             f"  identify #:   {self._identify_count}",
             f"  reconnects:   {self._reconnect_count}",
+            f"  reconnecting: {self._reconnect_in_progress}",
             f"  $os:          {p.get('$os', '?')}",
             f"  $browser:     {p.get('$browser', '?')}",
             f"  $device:      {p.get('$device', '?')}",
-        ]
+            "",
+            f"  aux sessions: {len(_AUX_SESSIONS)}",
+        ] + aux_lines
         await message.edit(content=S._ansi_block(lines))
