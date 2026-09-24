@@ -158,7 +158,8 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.3.1-modifyself"   # ← CHANGED
+VERSION = "2.3.1-modifyself" # ← CHANGED
+OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
