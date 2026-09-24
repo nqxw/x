@@ -1,6 +1,7 @@
 # cogs/auto.py | giveaway, nitrosniper, autoreact, multireact, vsniper, superreact
 import asyncio
 import sys
+import urllib.parse
 import aiohttp
 import modifyself_shim as discord
 from . import state as S
@@ -24,6 +25,36 @@ def _sync(**kw):
             setattr(_main, k, v)
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────
+# RAW REACTION HELPER
+# shim's history-message .add_reaction() is broken — it drops the
+# positional `route` arg into HTTPClient.request() for reconstructed
+# messages. hit the endpoint directly instead; same result, no shim.
+# PUT /channels/{ch}/messages/{msg}/reactions/{emoji}/@me
+# ─────────────────────────────────────────────────────────────
+
+async def _react(channel_id, message_id, emoji, session=None):
+    emoji_enc = urllib.parse.quote(emoji, safe="")
+    url = (f"https://discord.com/api/v9/channels/{channel_id}"
+           f"/messages/{message_id}/reactions/{emoji_enc}/@me")
+    headers = {
+        "Authorization": S.TOKEN,
+        "User-Agent": S.USER_AGENT,
+        "Content-Length": "0",
+    }
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.put(url, headers=headers) as r:
+            return r.status
+    except Exception as e:
+        return f"err:{e}"
+    finally:
+        if own_session:
+            await session.close()
 
 
 async def _vsniper_loop():
@@ -78,29 +109,45 @@ class AutoCog:
             await message.edit(content=S.ui_ok("stopped"))
 
         elif cmd == "superreact":
-            # superreact <emoji> [count]  — react to the last N messages concurrently
+            # superreact <emoji> [count] — react to the last N messages
             if len(args) < 2:
                 return await message.edit(
                     content=S.ui_err("usage: superreact <emoji> [count]"))
             emoji = args[1]
             count = int(args[2]) if len(args) > 2 and args[2].isdigit() else 10
             count = max(1, min(count, 50))
+
             try:
                 targets = []
                 async for m in message.channel.history(limit=count + 5):
                     if m.id == message.id:
                         continue
-                    targets.append(m)
+                    targets.append(m.id)
                     if len(targets) >= count:
                         break
+
                 if not targets:
                     return await message.edit(content=S.ui_info("nothing to react to"))
-                await asyncio.gather(
-                    *(m.add_reaction(emoji) for m in targets),
-                    return_exceptions=True,
-                )
-                await message.edit(
-                    content=S.ui_ok(f"superreact → {emoji} × {len(targets)} msgs"))
+
+                ch_id = message.channel.id
+                async with aiohttp.ClientSession() as session:
+                    results = await asyncio.gather(*(
+                        _react(ch_id, mid, emoji, session=session)
+                        for mid in targets
+                    ), return_exceptions=True)
+
+                ok = sum(1 for r in results if r in (200, 204))
+                fails = len(targets) - ok
+
+                if ok == 0:
+                    sample = next((r for r in results if isinstance(r, (int, str))), "?")
+                    return await message.edit(content=S.ui_err(
+                        f"superreact: all {len(targets)} failed (last={sample})"))
+
+                msg = f"superreact → {emoji} × {ok}/{len(targets)} msgs"
+                if fails:
+                    msg += f"  ({fails} failed)"
+                await message.edit(content=S.ui_ok(msg))
             except Exception as e:
                 await message.edit(content=S.ui_err(f"superreact: {e}"))
 
