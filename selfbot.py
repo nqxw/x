@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# lunar — v2.3.1-modifyself
+# lunar — v2.4.0-access
 
 import modifyself_shim as discord   # ← CHANGED (was: import discord)
 
@@ -158,13 +158,111 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.3.1-modifyself" # ← CHANGED
-OWNER_ID = 1551632054574121051
+VERSION = "2.4.0-access"
+OWNER_ID = 1551632054574121051   # ← hardcoded fallback, overwritten by access_load()
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
               "Electron/28.2.10 Safari/537.36")
+
+# ─────────────────────────────────────────────
+# ACCESS CONTROL
+# ─────────────────────────────────────────────
+
+_admins: set = set()
+_devs: set = set()
+
+ADMIN_COMMANDS = frozenset({
+    "admin",
+    "setadmin", "adminremove", "adminlist",
+    "blacklist", "whitelist",
+    "serverblacklist", "channelblacklist", "rolerestrict",
+    "guards", "perms", "perm",
+    "nuke", "massban", "masskick",
+})
+
+DEVELOPER_COMMANDS = frozenset({
+    "eval", "restart", "reconnect", "proxy", "plugin", "session",
+    "logs",
+    "setdev", "devremove", "devlist",
+    "accesslist",
+})
+
+OWNER_COMMANDS = frozenset({
+    "setowner",
+})
+
+_ACCESS_FILE = "database/access.json"
+
+def _current_owner():
+    # prefer cstate's OWNER_ID — that's where setowner writes
+    try:
+        from cogs import state as cstate
+        v = getattr(cstate, "OWNER_ID", None)
+        if isinstance(v, int):
+            return v
+    except Exception:
+        pass
+    return OWNER_ID
+
+def access_save():
+    try:
+        os.makedirs(os.path.dirname(_ACCESS_FILE), exist_ok=True)
+        with open(_ACCESS_FILE, "w") as f:
+            json.dump({
+                "owner":  _current_owner(),   # ← reads live owner (cstate), not stale __main__
+                "admins": sorted(_admins),
+                "devs":   sorted(_devs),
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[access] save error: {e}")
+
+def access_load():
+    global OWNER_ID, _admins, _devs
+    if not os.path.exists(_ACCESS_FILE):
+        return
+    try:
+        with open(_ACCESS_FILE) as f:
+            d = json.load(f)
+        if isinstance(d.get("owner"), int):
+            OWNER_ID = int(d["owner"])
+        _admins = set(int(x) for x in d.get("admins", []))
+        _devs   = set(int(x) for x in d.get("devs", []))
+        # also seed cstate so the shared reference starts at the right value
+        try:
+            from cogs import state as cstate
+            cstate.OWNER_ID = OWNER_ID
+            cstate._admins  = _admins
+            cstate._devs    = _devs
+        except Exception:
+            pass
+        print(f"[access] loaded owner={OWNER_ID} admins={len(_admins)} devs={len(_devs)}")
+    except Exception as e:
+        print(f"[access] load error: {e}")
+
+def _access_level(uid: int) -> str:
+    if uid == _current_owner():
+        return "owner"
+    if uid in _admins:
+        return "admin"
+    if uid in _devs:
+        return "dev"
+    return "user"
+
+def _access_ok(uid: int, cmd: str) -> bool:
+    lvl = _access_level(uid)
+    if lvl == "owner":
+        return True
+    if cmd in OWNER_COMMANDS:
+        return False
+    if cmd in ADMIN_COMMANDS and lvl != "admin":
+        return False
+    if cmd in DEVELOPER_COMMANDS and lvl != "dev":
+        return False
+    return True
+
+access_load()
 
 # ─────────────────────────────────────────────
 # UI HELPERS
@@ -237,6 +335,7 @@ HELP_DATA = {
         ("questall","solve all quests at once"),("autoquest on/off","auto-run quests on startup"),
         ("autoclaim on/off","auto-claim completed quests"),("autoclaim run","sweep and claim now"),
         ("orbbadge","claim orb badge"),("questdump [idx]","dump raw quest config"),
+        ("questdiag","show quest diagnostics"),
     ],
     "sniper": [
         ("sniper on/off","toggle nitro gift sniper"),("logger on/off","toggle message logger"),
@@ -247,7 +346,7 @@ HELP_DATA = {
         ("ar remove <trigger>","remove auto-response"),("ar list","list all auto-responses"),
     ],
     "voice": [
-        ("vcjoin [ch_id]","join a voice channel"),("vcleave","leave voice channel"),
+        ("vcjoin <ch_id>","join a voice channel"),("vcleave","leave voice channel"),
         ("vcmute <user_id>","server mute user"),("vcunmute <user_id>","server unmute user"),
         ("vcdeafen <user_id>","server deafen user"),("vcundeafen <user_id>","server undeafen user"),
         ("vckick <user_id>","kick user from vc"),("vcmove <user> <ch_id>","move user to channel"),
@@ -257,6 +356,7 @@ HELP_DATA = {
         ("selfdeaf","toggle your own server deafen"),
         ("selfstream","toggle your stream (go live)"),
         ("selfcamera","toggle your camera/video"),
+        ("vcdiag","voice diagnostics dump"),
     ],
     "rpc": [
         ("rpc <1-6> <field> <value>","set a rich presence slot"),
@@ -333,10 +433,12 @@ HELP_DATA = {
         ("host clear","wipe hosted list + stop sessions"),
     ],
     "admin": [
-        ("admin add <uid>","add an admin"),
-        ("admin remove <uid>","remove an admin"),
-        ("admin list","list admins + owner"),
-        ("admin setowner <uid>","set owner (bootstraps admin system)"),
+        ("admin add <uid>","owner only — grant admin tier"),
+        ("admin remove <uid>","owner only — revoke admin tier"),
+        ("admin devadd <uid>","owner only — grant dev tier"),
+        ("admin devremove <uid>","owner only — revoke dev tier"),
+        ("admin list","list owner + admins + devs"),
+        ("admin setowner <uid>","owner only — transfer ownership"),
     ],
     "lastfm": [
         ("lastfm set <user> [key]","link your last.fm account"),("lastfm np","now playing track"),
@@ -426,14 +528,23 @@ HELP_DATA = {
         ("triggers clear","wipe every trigger"),
     ],
     "developer": [
-        ("host say <idx> <msg>","force hosted account to say"),
-        ("host broadcast <msg>","broadcast from all accounts"),
-        ("logs [n]","tail lunar console"),("eval <code>","evaluate python code"),
-        ("restart","restart the lunar process"),("reconnect","force gateway reconnect"),
+        ("eval <code>","owner+dev only — evaluate python code"),
+        ("restart","restart the lunar process"),
+        ("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
-        ("plugin load <path>","load a plugin from /plugins"),("plugin unload <name>","unload a plugin"),
+        ("plugin load <path>","load a plugin from /plugins"),
+        ("plugin unload <name>","unload a plugin"),
         ("plugin list","list loaded plugins"),
-        ("session switch <idx>","switch active session token"),("session list","list saved sessions"),
+        ("session switch <idx>","switch active session token"),
+        ("session list","list saved sessions"),
+        ("setdev <uid>","owner only — grant developer tier"),
+        ("devremove <uid>","owner only — revoke developer tier"),
+        ("devlist","owner only — list developers"),
+        ("setadmin <uid>","owner only — grant admin tier"),
+        ("adminremove <uid>","owner only — revoke admin tier"),
+        ("adminlist","owner only — list admins"),
+        ("setowner <uid>","owner only — transfer ownership"),
+        ("accesslist","owner only — show owner/admins/devs"),
     ],
     "server": [
         ("serverinfo","current server info"),("members [n]","list server members"),
@@ -654,10 +765,12 @@ def build_help_root(page=1):
         "guards":"blacklists, whitelists, restrictions, per-cmd toggles",
         "resilience":"auto-reconnect, session log, rate limits, cache, queue",
         "tasks":"background task manager","triggers":"message / reaction / voice / member triggers",
-        "developer":"dev tools, plugins, proxy, sessions","server":"server management",
+        "developer":"dev tools, plugins, proxy, sessions, access",
+        "server":"server management",
         "information":"user & server lookup","groupchat":"group dm & anti-gc",
         "utility":"text, afk, translate","tracking":"message & profile tracking",
-        "downloads":"media downloader","social":"friends & social","auto":"automation, snipers, superreact",
+        "downloads":"media downloader","social":"friends & social",
+        "auto":"automation, snipers, superreact",
         "spoofer":"platform / device spoofing",
         "profile":"account profile","status":"custom status",
         "mass":"mass action tools","nuke":"destructive ops + backup","scrape":"scrape & export",
@@ -1193,6 +1306,19 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
+        # ── access control (shared by reference — cog mutations propagate) ──
+        cstate.OWNER_ID           = OWNER_ID
+        cstate._admins            = _admins
+        cstate._devs              = _devs
+        cstate.ADMIN_COMMANDS     = ADMIN_COMMANDS
+        cstate.DEVELOPER_COMMANDS = DEVELOPER_COMMANDS
+        cstate.OWNER_COMMANDS     = OWNER_COMMANDS
+        cstate.access_save        = access_save
+        cstate.access_load        = access_load
+        cstate._access_level      = _access_level
+        cstate._access_ok         = _access_ok
+        cstate._current_owner     = _current_owner
+
         for mod_name, cls_name in COG_MODULES:
             try:
                 mod = importlib.import_module(mod_name)
@@ -1466,7 +1592,7 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
-    # ── AUTO-REACT (concurrent — ~20x faster than the serial 0.15s/emoji loop) ──
+    # ── AUTO-REACT (concurrent) ──
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
         try:
             react_tasks = []
@@ -1507,6 +1633,19 @@ async def _dispatch_message(_client, message):
         _cooldown_last[key] = time.time()
 
     if not _perm_check(cmd, message):
+        return
+
+    # ── ACCESS GATE — tier enforcement ──
+    if not _access_ok(message.author.id, cmd):
+        lvl = _access_level(message.author.id)
+        need = "owner"
+        if cmd in ADMIN_COMMANDS:      need = "admin"
+        elif cmd in DEVELOPER_COMMANDS: need = "dev"
+        try:
+            await message.edit(content=ui_err(
+                f"`{cmd}` requires {need} access — your tier: {lvl}"))
+        except Exception:
+            pass
         return
 
     db_stats_inc(cmd)
