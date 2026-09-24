@@ -1,9 +1,21 @@
 # cogs/resilience.py | auto-reconnect, session log, rate-limit tracking, cache, queue
 import asyncio
+import sys
 import time
 from datetime import datetime
 import modifyself_shim as discord
 from . import state as S
+
+
+def _sync(**kw):
+    main = sys.modules.get("__main__")
+    if main is None:
+        return
+    for k, v in kw.items():
+        try:
+            setattr(main, k, v)
+        except Exception:
+            pass
 
 
 async def _queue_worker(name):
@@ -71,12 +83,14 @@ class ResilienceCog:
         if cmd == "autoreconnect":
             S._auto_reconnect = ((args[1].lower() in ("on", "enable"))
                                  if len(args) > 1 else not S._auto_reconnect)
+            _sync(_auto_reconnect=S._auto_reconnect)
             await message.edit(content=S.ui_ok(
                 f"autoreconnect → {'on' if S._auto_reconnect else 'off'}"))
 
         elif cmd == "autorestart":
             S._auto_restart = ((args[1].lower() in ("on", "enable"))
                                if len(args) > 1 else not S._auto_restart)
+            _sync(_auto_restart=S._auto_restart)
             await message.edit(content=S.ui_ok(
                 f"autorestart → {'on' if S._auto_restart else 'off'}"))
 
@@ -101,6 +115,7 @@ class ResilienceCog:
         elif cmd == "ratelimit":
             S._rate_limit_tracking = ((args[1].lower() in ("on", "enable"))
                                       if len(args) > 1 else not S._rate_limit_tracking)
+            _sync(_rate_limit_tracking=S._rate_limit_tracking)
             await message.edit(content=S.ui_ok(
                 f"ratelimit tracking → {'on' if S._rate_limit_tracking else 'off'}"))
 
@@ -142,6 +157,7 @@ class ResilienceCog:
             elif sub == "auto":
                 S._cache_auto = ((args[2].lower() in ("on", "enable"))
                                  if len(args) > 2 else not S._cache_auto)
+                _sync(_cache_auto=S._cache_auto)
                 await message.edit(content=S.ui_ok(
                     f"cache auto → {'on' if S._cache_auto else 'off'}"))
             else:
@@ -151,12 +167,15 @@ class ResilienceCog:
             sub = args[1].lower() if len(args) > 1 else ""
             if sub == "on":
                 S._queue_enabled = True
+                _sync(_queue_enabled=True)
                 await message.edit(content=S.ui_ok("queue on"))
             elif sub == "off":
                 S._queue_enabled = False
+                _sync(_queue_enabled=False)
                 await message.edit(content=S.ui_ok("queue off"))
             elif sub == "workers" and len(args) >= 3 and args[2].isdigit():
                 S._queue_workers = max(1, int(args[2]))
+                _sync(_queue_workers=S._queue_workers)
                 await message.edit(content=S.ui_ok(f"workers → {S._queue_workers}"))
             elif sub == "status":
                 await message.edit(content=S.ui_box("queue", [

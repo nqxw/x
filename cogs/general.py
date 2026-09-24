@@ -1,5 +1,6 @@
 # cogs/general.py | ping, info, say, spam, purge, snipe, editsnipe, copycat, status, platform, hypesquad, sniper, logger, readlog, ar
 import asyncio
+import sys
 import os
 import time
 import random
@@ -7,6 +8,17 @@ import string
 import re
 import modifyself_shim as discord
 from . import state as S
+
+
+def _sync(**kw):
+    main = sys.modules.get("__main__")
+    if main is None:
+        return
+    for k, v in kw.items():
+        try:
+            setattr(main, k, v)
+        except Exception:
+            pass
 
 
 async def _spam_worker(channel, count, text):
@@ -47,7 +59,8 @@ class GeneralCog:
         elif cmd == "spam":
             if len(args) < 3:
                 return await message.edit(content=S.ui_err("usage: spam <n> <text>"))
-            try: count = int(args[1])
+            try:
+                count = int(args[1])
             except ValueError:
                 return await message.edit(content=S.ui_err("n must be a number"))
             count = min(count, 200)
@@ -190,6 +203,7 @@ class GeneralCog:
             if plat not in S.PLATFORM_MAP:
                 return await message.edit(content=S.ui_err(f"unknown platform: {plat}"))
             S._current_platform = plat
+            _sync(_current_platform=plat)
             await message.edit(content=S.ui_ok(f"platform → {plat}"))
             try:
                 gw = getattr(client, "_gateway", None)
@@ -215,11 +229,13 @@ class GeneralCog:
 
         elif cmd == "sniper":
             S.SNIPER_ENABLED = len(args) < 2 or args[1].lower() == "on"
+            _sync(SNIPER_ENABLED=S.SNIPER_ENABLED)
             await message.edit(content=S.ui_ok(
                 f"sniper → {'ON' if S.SNIPER_ENABLED else 'OFF'}"))
 
         elif cmd == "logger":
             S.LOGGER_ENABLED = len(args) < 2 or args[1].lower() == "on"
+            _sync(LOGGER_ENABLED=S.LOGGER_ENABLED)
             await message.edit(content=S.ui_ok(
                 f"logger → {'ON' if S.LOGGER_ENABLED else 'OFF'}"))
 

@@ -1,8 +1,21 @@
 # cogs/utility.py | text transforms, AFK, translate, typing, ghostping, pins, autodelete, firstmessage
 import asyncio
+import sys
 import random
+import aiohttp
 import modifyself_shim as discord
 from . import state as S
+
+
+def _sync(**kw):
+    main = sys.modules.get("__main__")
+    if main is None:
+        return
+    for k, v in kw.items():
+        try:
+            setattr(main, k, v)
+        except Exception:
+            pass
 
 
 def _uwuify(text):
@@ -17,7 +30,8 @@ def _uwuify(text):
 
 
 def _owoify(text):
-    for a, b in [("r","w"),("l","w"),("R","W"),("L","W"),("n","ny"),("N","NY")]:
+    for a, b in [("r", "w"), ("l", "w"), ("R", "W"), ("L", "W"),
+                 ("n", "ny"), ("N", "NY")]:
         text = text.replace(a, b)
     return f"owo {text} owo"
 
@@ -45,6 +59,10 @@ async def _typing_loop(channel):
                 await asyncio.sleep(9)
         except Exception:
             await asyncio.sleep(5)
+
+
+def _h():
+    return {"Authorization": S.TOKEN, "User-Agent": S.USER_AGENT}
 
 
 class UtilityCog:
@@ -84,7 +102,8 @@ class UtilityCog:
 
         elif cmd == "animatetype":
             if len(args) < 2: return await message.edit(content=S.ui_err("usage: animatetype <text>"))
-            text = " ".join(args[1:]); built = ""
+            text = " ".join(args[1:])
+            built = ""
             for ch in text:
                 built += ch
                 try: await message.edit(content=built)
@@ -110,20 +129,25 @@ class UtilityCog:
         elif cmd == "afk":
             S._afk_enabled = True
             S._afk_msg = " ".join(args[1:]) if len(args) > 1 else "I'm AFK right now."
+            _sync(_afk_enabled=True, _afk_msg=S._afk_msg)
             await message.edit(content=S.ui_ok(f"AFK set: {S._afk_msg}"))
 
         elif cmd == "afkstop":
             S._afk_enabled = False
             S._afk_msg = None
+            _sync(_afk_enabled=False, _afk_msg=None)
             await message.edit(content=S.ui_ok("AFK disabled"))
 
         elif cmd == "translate":
-            if len(args) < 3: return await message.edit(content=S.ui_err("usage: translate <lang> <text>"))
-            translated = await S.translate_text(" ".join(args[2:]), args[1]) if S.translate_text else ""
+            if len(args) < 3:
+                return await message.edit(content=S.ui_err("usage: translate <lang> <text>"))
+            translated = (await S.translate_text(" ".join(args[2:]), args[1])
+                          if S.translate_text else "")
             await message.edit(content=f"```\n{translated}\n```")
 
         elif cmd == "ghostping":
-            if len(args) < 2: return await message.edit(content=S.ui_err("usage: ghostping <user_id>"))
+            if len(args) < 2:
+                return await message.edit(content=S.ui_err("usage: ghostping <user_id>"))
             try: await message.delete()
             except Exception: pass
             m = await message.channel.send(f"<@{args[1]}>")
@@ -131,20 +155,32 @@ class UtilityCog:
             await m.delete()
 
         elif cmd == "pin":
-            if len(args) < 2: return await message.edit(content=S.ui_err("usage: pin <msg_id>"))
+            if len(args) < 2:
+                return await message.edit(content=S.ui_err("usage: pin <msg_id>"))
             try:
-                msg = await message.channel.fetch_message(int(args[1]))
-                await msg.pin()
-                await message.edit(content=S.ui_ok("pinned"))
+                async with aiohttp.ClientSession() as s:
+                    async with s.put(
+                        f"https://discord.com/api/v9/channels/{message.channel.id}/pins/{args[1]}",
+                        headers=_h()) as r:
+                        if r.status in (200, 204):
+                            await message.edit(content=S.ui_ok("pinned"))
+                        else:
+                            await message.edit(content=S.ui_err(f"failed {r.status}"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 
         elif cmd == "unpin":
-            if len(args) < 2: return await message.edit(content=S.ui_err("usage: unpin <msg_id>"))
+            if len(args) < 2:
+                return await message.edit(content=S.ui_err("usage: unpin <msg_id>"))
             try:
-                msg = await message.channel.fetch_message(int(args[1]))
-                await msg.unpin()
-                await message.edit(content=S.ui_ok("unpinned"))
+                async with aiohttp.ClientSession() as s:
+                    async with s.delete(
+                        f"https://discord.com/api/v9/channels/{message.channel.id}/pins/{args[1]}",
+                        headers=_h()) as r:
+                        if r.status in (200, 204):
+                            await message.edit(content=S.ui_ok("unpinned"))
+                        else:
+                            await message.edit(content=S.ui_err(f"failed {r.status}"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 
@@ -176,15 +212,17 @@ class UtilityCog:
                 await message.channel.send(S.ui_box("first message", [
                     f"  {S.DIM}author{S.RESET}  {msg.author}",
                     f"  {S.DIM}content{S.RESET} {msg.content[:200] or '(empty)'}",
-                    f"  {S.DIM}url{S.RESET}     {msg.jump_url if hasattr(msg, 'jump_url') else '(n/a)'}",
+                    f"  {S.DIM}url{S.RESET}     {getattr(msg, 'jump_url', '(n/a)')}",
                 ]))
 
         elif cmd == "autodelete":
             if len(args) > 1 and args[1].lower() == "off":
                 S._autodelete_secs = 0
+                _sync(_autodelete_secs=0)
                 await message.edit(content=S.ui_ok("autodelete off"))
             elif len(args) > 1 and args[1].isdigit():
                 S._autodelete_secs = int(args[1])
+                _sync(_autodelete_secs=S._autodelete_secs)
                 await message.edit(content=S.ui_ok(f"autodelete {args[1]}s"))
             else:
                 await message.edit(content=S.ui_err("usage: autodelete <secs> | off"))

@@ -7,42 +7,88 @@ from uuid import uuid4
 from . import state as S
 
 
+async def _open_dm_channel(uid):
+    """raw REST: POST /users/@me/channels → channel id"""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://discord.com/api/v9/users/@me/channels",
+                headers={"Authorization": S.TOKEN,
+                         "Content-Type": "application/json",
+                         "User-Agent": S.USER_AGENT},
+                json={"recipient_id": str(uid)},
+            ) as r:
+                if r.status == 200:
+                    return (await r.json()).get("id")
+                return None
+    except Exception:
+        return None
+
+
+async def _send_dm_rest(channel_id, content):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"https://discord.com/api/v9/channels/{channel_id}/messages",
+                headers={"Authorization": S.TOKEN,
+                         "Content-Type": "application/json",
+                         "User-Agent": S.USER_AGENT},
+                json={"content": content},
+            ) as r:
+                return r.status in (200, 201)
+    except Exception:
+        return False
+
+
 async def _mass_friend_ids(ids):
     done = 0
-    h = {"Authorization": S.TOKEN, "Content-Type":"application/json", "User-Agent": S.USER_AGENT}
+    h = {"Authorization": S.TOKEN, "Content-Type": "application/json",
+         "User-Agent": S.USER_AGENT}
     async with aiohttp.ClientSession() as s:
         for uid in ids:
             try:
                 async with s.put(f"https://discord.com/api/v9/users/@me/relationships/{uid}",
                                  headers=h, json={"type": 1}) as r:
-                    if r.status in (200,201,204): done += 1
-            except Exception: pass
+                    if r.status in (200, 201, 204):
+                        done += 1
+            except Exception:
+                pass
             await asyncio.sleep(1.5)
     return done
 
 
 async def _mass_role(guild, role_id, ids):
     role = next((r for r in guild.roles if r.id == int(role_id)), None)
-    if not role: return 0
+    if not role:
+        return 0
     done = 0
     for uid in ids:
         m = guild.get_member(int(uid))
-        if not m: continue
-        try: await m.add_roles(role); done += 1
-        except Exception: pass
+        if not m:
+            continue
+        try:
+            await m.add_roles(role)
+            done += 1
+        except Exception:
+            pass
         await asyncio.sleep(0.6)
     return done
 
 
 async def _mass_unrole(guild, role_id, ids):
     role = next((r for r in guild.roles if r.id == int(role_id)), None)
-    if not role: return 0
+    if not role:
+        return 0
     done = 0
     for uid in ids:
         m = guild.get_member(int(uid))
-        if not m: continue
-        try: await m.remove_roles(role); done += 1
-        except Exception: pass
+        if not m:
+            continue
+        try:
+            await m.remove_roles(role)
+            done += 1
+        except Exception:
+            pass
         await asyncio.sleep(0.6)
     return done
 
@@ -51,8 +97,10 @@ async def _mass_ban(guild, ids, reason="mass ban"):
     done = 0
     for uid in ids:
         try:
-            await guild.ban(int(uid), reason=reason); done += 1
-        except Exception: pass
+            await guild.ban(int(uid), reason=reason)
+            done += 1
+        except Exception:
+            pass
         await asyncio.sleep(0.8)
     return done
 
@@ -61,24 +109,32 @@ async def _mass_kick(guild, ids, reason="mass kick"):
     done = 0
     for uid in ids:
         m = guild.get_member(int(uid))
-        if not m: continue
-        try: await m.kick(reason=reason); done += 1
-        except Exception: pass
+        if not m:
+            continue
+        try:
+            await m.kick(reason=reason)
+            done += 1
+        except Exception:
+            pass
         await asyncio.sleep(0.8)
     return done
 
 
 async def _mass_join(invite, tokens):
     done = 0
-    h_tmpl = {"Content-Type":"application/json","User-Agent": S.USER_AGENT}
+    h_tmpl = {"Content-Type": "application/json", "User-Agent": S.USER_AGENT}
     async with aiohttp.ClientSession() as s:
         for tk in tokens:
             try:
-                async with s.post(f"https://discord.com/api/v9/invites/{invite}",
+                async with s.post(
+                    f"https://discord.com/api/v9/invites/{invite}",
                     headers={**h_tmpl, "Authorization": tk.strip()},
-                    json={"session_id": str(uuid4())[:12]}) as r:
-                    if r.status in (200,204): done += 1
-            except Exception: pass
+                    json={"session_id": str(uuid4())[:12]},
+                ) as r:
+                    if r.status in (200, 204):
+                        done += 1
+            except Exception:
+                pass
             await asyncio.sleep(1.5)
     return done
 
@@ -89,10 +145,14 @@ async def _mass_leave(guild_id, tokens):
     async with aiohttp.ClientSession() as s:
         for tk in tokens:
             try:
-                async with s.delete(f"https://discord.com/api/v9/users/@me/guilds/{guild_id}",
-                                    headers={**h_tmpl, "Authorization": tk.strip()}) as r:
-                    if r.status in (200,204): done += 1
-            except Exception: pass
+                async with s.delete(
+                    f"https://discord.com/api/v9/users/@me/guilds/{guild_id}",
+                    headers={**h_tmpl, "Authorization": tk.strip()},
+                ) as r:
+                    if r.status in (200, 204):
+                        done += 1
+            except Exception:
+                pass
             await asyncio.sleep(1.0)
     return done
 
@@ -121,65 +181,78 @@ class MassCog:
                 t.cancel()
 
     def _format_response(self, content):
-        if isinstance(content, str):
-            lines = content.split('\n')
-        else:
-            lines = content
+        lines = content.split('\n') if isinstance(content, str) else content
         return S._ansi_block(lines)
 
     async def _send_and_delete(self, message, content, delete_after=2):
-        try: await message.delete()
-        except Exception: pass
+        try:
+            await message.delete()
+        except Exception:
+            pass
         try:
             reply = await message.channel.send(content)
         except Exception:
             return None
+
         async def _del():
             await asyncio.sleep(delete_after)
-            try: await reply.delete()
-            except Exception: pass
+            try:
+                await reply.delete()
+            except Exception:
+                pass
         self._spawn(_del())
         return reply
 
     async def _delete_after_delay(self, message, delay=2):
         await asyncio.sleep(delay)
-        try: await message.delete()
-        except Exception: pass
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
-        try: await message.delete()
-        except Exception: pass
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
-        if cmd == "massdm": return await self._cmd_massdm(message, args)
-        if cmd == "stopdm": return await self._cmd_stopdm(message, args)
-        if cmd == "dmstats": return await self._cmd_dmstats(message, args)
+        if cmd == "massdm":
+            return await self._cmd_massdm(message, args)
+        if cmd == "stopdm":
+            return await self._cmd_stopdm(message, args)
+        if cmd == "dmstats":
+            return await self._cmd_dmstats(message, args)
 
         if cmd == "massdmfile":
             if len(args) < 3 or not os.path.exists(args[1]):
-                return await message.channel.send(S.ui_err("usage: massdmfile <path> <msg>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massdmfile <path> <msg>"), delete_after=5)
             txt = " ".join(args[2:])
-            with open(args[1]) as f: ids = [l.strip() for l in f if l.strip()]
+            with open(args[1]) as f:
+                ids = [l.strip() for l in f if l.strip()]
             done = 0
             for uid in ids:
-                try:
-                    u = await client.fetch_user(int(uid))
-                    await u.send(txt); done += 1
-                except Exception: pass
+                ch_id = await _open_dm_channel(uid)
+                if ch_id and await _send_dm_rest(ch_id, txt):
+                    done += 1
                 await asyncio.sleep(1.2)
             await message.channel.send(S.ui_ok(f"sent to {done}/{len(ids)}"))
 
         elif cmd == "massfriend":
             if len(args) < 2 or not os.path.exists(args[1]):
-                return await message.channel.send(S.ui_err("usage: massfriend <file>"), delete_after=5)
-            with open(args[1]) as f: ids = [l.strip() for l in f if l.strip()]
+                return await message.channel.send(
+                    S.ui_err("usage: massfriend <file>"), delete_after=5)
+            with open(args[1]) as f:
+                ids = [l.strip() for l in f if l.strip()]
             done = await _mass_friend_ids(ids)
             await message.channel.send(S.ui_ok(f"sent {done}/{len(ids)}"))
 
         elif cmd == "massjoin":
             if len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: massjoin <invite> <count>"), delete_after=5)
-            invite = args[1].replace("https://discord.gg/","").replace("discord.gg/","")
+                return await message.channel.send(
+                    S.ui_err("usage: massjoin <invite> <count>"), delete_after=5)
+            invite = args[1].replace("https://discord.gg/", "").replace("discord.gg/", "")
             count = int(args[2]) if args[2].isdigit() else 1
             tokens = S.HOSTED_TOKENS[:count]
             done = await _mass_join(invite, tokens)
@@ -187,89 +260,115 @@ class MassCog:
 
         elif cmd == "massleave":
             if len(args) < 2:
-                return await message.channel.send(S.ui_err("usage: massleave <guild_id>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massleave <guild_id>"), delete_after=5)
             done = await _mass_leave(args[1], S.HOSTED_TOKENS)
             await message.channel.send(S.ui_ok(f"left {done}/{len(S.HOSTED_TOKENS)}"))
 
         elif cmd == "massrole":
             if not message.guild or len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: massrole <role_id> <uids...>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massrole <role_id> <uids...>"), delete_after=5)
             done = await _mass_role(message.guild, args[1], args[2:])
             await message.channel.send(S.ui_ok(f"role assigned to {done}"))
 
         elif cmd == "massunrole":
             if not message.guild or len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: massunrole <role_id> <uids...>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massunrole <role_id> <uids...>"), delete_after=5)
             done = await _mass_unrole(message.guild, args[1], args[2:])
             await message.channel.send(S.ui_ok(f"removed from {done}"))
 
         elif cmd == "massban":
             if not message.guild or len(args) < 2:
-                return await message.channel.send(S.ui_err("usage: massban <uids...>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massban <uids...>"), delete_after=5)
             done = await _mass_ban(message.guild, args[1:])
             await message.channel.send(S.ui_ok(f"banned {done}"))
 
         elif cmd == "masskick":
             if not message.guild or len(args) < 2:
-                return await message.channel.send(S.ui_err("usage: masskick <uids...>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: masskick <uids...>"), delete_after=5)
             done = await _mass_kick(message.guild, args[1:])
             await message.channel.send(S.ui_ok(f"kicked {done}"))
 
         elif cmd == "massch":
             if not message.guild or len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: massch <name> <n>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massch <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 50)):
-                try: await message.guild.create_text_channel(args[1])
-                except Exception: pass
+                try:
+                    await message.guild.create_text_channel(args[1])
+                except Exception:
+                    pass
             await message.channel.send(S.ui_ok(f"created {min(n,50)}"))
 
         elif cmd == "massvc":
             if not message.guild or len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: massvc <name> <n>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massvc <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 50)):
-                try: await message.guild.create_voice_channel(args[1])
-                except Exception: pass
+                try:
+                    await message.guild.create_voice_channel(args[1])
+                except Exception:
+                    pass
             await message.channel.send(S.ui_ok(f"created {min(n,50)}"))
 
         elif cmd == "masscat":
             if not message.guild or len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: masscat <name> <n>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: masscat <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 20)):
-                try: await message.guild.create_category(args[1])
-                except Exception: pass
+                try:
+                    await message.guild.create_category(args[1])
+                except Exception:
+                    pass
             await message.channel.send(S.ui_ok(f"created {min(n,20)}"))
 
         elif cmd == "massrolecreate":
             if not message.guild or len(args) < 3:
-                return await message.channel.send(S.ui_err("usage: massrolecreate <name> <n>"), delete_after=5)
+                return await message.channel.send(
+                    S.ui_err("usage: massrolecreate <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 50)):
-                try: await message.guild.create_role(name=args[1])
-                except Exception: pass
+                try:
+                    await message.guild.create_role(name=args[1])
+                except Exception:
+                    pass
             await message.channel.send(S.ui_ok(f"created {min(n,50)}"))
 
         elif cmd == "massreact":
             if len(args) < 2:
-                return await message.channel.send(S.ui_err("usage: massreact <emoji>"), delete_after=5)
-            emoji = args[1]; done = 0
+                return await message.channel.send(
+                    S.ui_err("usage: massreact <emoji>"), delete_after=5)
+            emoji = args[1]
+            done = 0
             async for msg in message.channel.history(limit=10):
-                try: await msg.add_reaction(emoji); done += 1
-                except Exception: pass
+                try:
+                    await msg.add_reaction(emoji)
+                    done += 1
+                except Exception:
+                    pass
                 await asyncio.sleep(0.4)
             await message.channel.send(S.ui_ok(f"reacted to {done}"))
 
         elif cmd == "massdelete":
             n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
             d = 0
-            async for msg in message.channel.history(limit=n*2):
+            async for msg in message.channel.history(limit=n * 2):
                 if msg.author.id == client.user.id:
-                    try: await msg.delete()
-                    except Exception: pass
-                    d += 1; await asyncio.sleep(0.3)
-                    if d >= n: break
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+                    d += 1
+                    await asyncio.sleep(0.3)
+                    if d >= n:
+                        break
             await message.channel.send(S.ui_ok(f"deleted {d}"), delete_after=5)
 
     async def _cmd_massdm(self, message, args):
@@ -277,7 +376,6 @@ class MassCog:
             if len(args) < 2:
                 await self._send_and_delete(message, S.ui_err("usage: massdm <message>"))
                 return
-
             if self.dm_running:
                 await self._send_and_delete(message, S.ui_warn("a mass DM is already running"))
                 return
@@ -298,17 +396,20 @@ class MassCog:
                          f"• Total DMs: {len(dm_channels)}\n"
                          f"• Message: {msg_text[:50]}{'...' if len(msg_text) > 50 else ''}\n"
                          f"• Status: Running...")
-            try: await message.delete()
-            except Exception: pass
+            try:
+                await message.delete()
+            except Exception:
+                pass
             status_msg = await message.channel.send(self._format_response(start_msg))
 
             for i, channel in enumerate(dm_channels):
-                if not self.dm_running: break
-
+                if not self.dm_running:
+                    break
                 try:
                     has_any = False
                     async for _m in channel.history(limit=1):
-                        has_any = True; break
+                        has_any = True
+                        break
                     if not has_any:
                         self.dm_stats["skipped"] += 1
                         continue
@@ -319,7 +420,7 @@ class MassCog:
                 try:
                     await channel.send(msg_text)
                     self.dm_stats["sent"] += 1
-                except Exception as e:
+                except Exception:
                     self.dm_stats["failed"] += 1
 
                 if (i + 1) % 5 == 0:
@@ -330,8 +431,8 @@ class MassCog:
                                 f"• Skipped: {self.dm_stats['skipped']}")
                     try:
                         await status_msg.edit(content=self._format_response(progress))
-                    except Exception: pass
-
+                    except Exception:
+                        pass
                 await asyncio.sleep(3)
 
             self.dm_running = False
@@ -343,13 +444,15 @@ class MassCog:
             try:
                 await status_msg.edit(content=self._format_response(final))
                 self._spawn(self._delete_after_delay(status_msg, 2))
-            except Exception: pass
+            except Exception:
+                pass
 
         except Exception as e:
             self.dm_running = False
             try:
                 await self._send_and_delete(message, S.ui_err(f"error in mass DM: {e}"))
-            except Exception: pass
+            except Exception:
+                pass
 
     async def _cmd_stopdm(self, message, args):
         try:

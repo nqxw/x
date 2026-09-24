@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from collections import defaultdict
 
-# ── CHANGED: framework swap (was: import discord) ──
+# ── framework ──
 import modifyself_shim as discord
 
 # ── filled in at boot by selfbot.py ──
@@ -25,8 +25,96 @@ MAIN_CLIENT = None
 TOKEN: str = ""
 PREFIX: str = "."
 USER_AGENT: str = ""
-VERSION: str = "2.3.0-modifyself"
+VERSION: str = "2.4.0-access"
 HAS_HCAPTCHA: bool = False
+
+# ── access tier ──
+# hardcoded fallback; overwritten by access_load() from database/access.json
+OWNER_ID: int = 1551632054574121051
+_admins: set = set()
+_devs: set = set()
+
+ADMIN_COMMANDS = frozenset({
+    "admin",
+    "setadmin", "adminremove", "adminlist",
+    "blacklist", "whitelist",
+    "serverblacklist", "channelblacklist", "rolerestrict",
+    "guards", "perms", "perm",
+    "nuke", "massban", "masskick",
+})
+
+DEVELOPER_COMMANDS = frozenset({
+    "eval", "restart", "reconnect", "proxy", "plugin", "session",
+    "logs",
+    "setdev", "devremove", "devlist",
+    "accesslist",
+})
+
+OWNER_COMMANDS = frozenset({
+    "setowner",
+})
+
+_ACCESS_FILE = "database/access.json"
+
+def access_save():
+    try:
+        os.makedirs(os.path.dirname(_ACCESS_FILE), exist_ok=True)
+        with open(_ACCESS_FILE, "w") as f:
+            json.dump({
+                "owner":  OWNER_ID,
+                "admins": sorted(_admins),
+                "devs":   sorted(_devs),
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[access] save error: {e}")
+
+def access_load():
+    global OWNER_ID, _admins, _devs
+    if not os.path.exists(_ACCESS_FILE):
+        return
+    try:
+        with open(_ACCESS_FILE) as f:
+            d = json.load(f)
+        if isinstance(d.get("owner"), int):
+            OWNER_ID = int(d["owner"])
+        _admins = set(int(x) for x in d.get("admins", []))
+        _devs   = set(int(x) for x in d.get("devs", []))
+        print(f"[access] loaded owner={OWNER_ID} admins={len(_admins)} devs={len(_devs)}")
+    except Exception as e:
+        print(f"[access] load error: {e}")
+
+def _current_owner():
+    try:
+        from cogs import state as cstate
+        v = getattr(cstate, "OWNER_ID", None)
+        if isinstance(v, int):
+            return v
+    except Exception:
+        pass
+    return OWNER_ID
+
+def _access_level(uid: int) -> str:
+    if uid == _current_owner():
+        return "owner"
+    if uid in _admins:
+        return "admin"
+    if uid in _devs:
+        return "dev"
+    return "user"
+
+def _access_ok(uid: int, cmd: str) -> bool:
+    lvl = _access_level(uid)
+    if lvl == "owner":
+        return True
+    if cmd in OWNER_COMMANDS:
+        return False
+    if cmd in ADMIN_COMMANDS and lvl != "admin":
+        return False
+    if cmd in DEVELOPER_COMMANDS and lvl != "dev":
+        return False
+    return True
+
+access_load()
 
 # ── UI palette ──
 ESC = "\x1b"
@@ -76,24 +164,24 @@ def _paginate(title, subtitle, rows, page=1):
     return _ansi_block(lines)
 
 # ── config hooks (set by selfbot.py at boot to avoid circular import) ──
-load_config = None       # () -> dict
-save_config = None       # (dict) -> None
-log_msg = None           # (tag, content) -> None
-db_inc_stat = None       # (cmd) -> None
-log_enabled = None       # () -> bool
+load_config = None
+save_config = None
+log_msg = None
+db_inc_stat = None
+log_enabled = None
 
 # ── cog-owned function pointers (set by selfbot.py at boot) ──
-HOSTED_DISPATCH = None            # async (client, message) -> None — for hosted account on_message
-async_hosted_token_add = None     # async (token, username=None) -> None
-async_hosted_token_remove = None  # async (token) -> None
-neko_gif = None                   # async (action) -> url | None
-translate_text = None             # async (text, lang) -> str
-send_temp = None                  # async (channel, content) -> Message
-set_hypesquad = None              # async (house_id) -> (bool, str)
-clear_hypesquad = None            # async () -> bool
-encrypt_file = None               # (path) -> bool
-decrypt_file = None               # (path) -> bool
-_perm_check_ref = None            # selfbot._perm_check (guard sync)
+HOSTED_DISPATCH = None
+async_hosted_token_add = None
+async_hosted_token_remove = None
+neko_gif = None
+translate_text = None
+send_temp = None
+set_hypesquad = None
+clear_hypesquad = None
+encrypt_file = None
+decrypt_file = None
+_perm_check_ref = None
 
 # ── permission + guard state ──
 _user_blacklist: set = set()
@@ -126,17 +214,17 @@ def _perm_check(cmd, message) -> bool:
         return message.author.id in _perm_allow[cmd]
     return True
 
-# ── hosted accounts (host cog owns these) ──
+# ── hosted accounts ──
 HOSTED_TOKENS: list = []
 _host_sessions: list = []
 _hosted_clients: list = []
 _hosted_spawned: bool = False
-_host_lock = None   # asyncio.Lock, set lazily
+_host_lock = None
 
 # ── quest state ──
 _hcaptcha_agent = None
 
-# ── automod / monitor state ──
+# ── automod / monitor ──
 _monitor = {"joins": False, "leaves": False, "roles": False, "nicks": False,
             "invites": False, "log_ch": None, "keywords": []}
 _invite_cache: dict = {}
@@ -149,15 +237,15 @@ _buttons_enabled = True
 _modals_enabled = True
 _pending_interactions: list = []
 
-# ── backup / nuke state ──
+# ── backup / nuke ──
 _server_backups: dict = {}
 _nuke_backups: dict = {}
 
-# ── scheduler state ──
+# ── scheduler ──
 _scheduler: list = []
 _scheduler_task = None
 
-# ── task manager ──
+# ── tasks ──
 _managed_tasks: dict = {}
 _TASK_STORE = "database/tasks.json"
 _TRIGGER_STORE = "database/triggers.json"
@@ -166,7 +254,7 @@ _TRIGGER_STORE = "database/triggers.json"
 _triggers = {"message": [], "reaction": [], "voice": [], "member": []}
 _trigger_fired_counts: dict = {}
 
-# ── db state ──
+# ── db ──
 _db_path = "database/selfbot.db"
 _db = None
 
@@ -207,7 +295,7 @@ def db_stats_all():
 def db_stats_clear():
     _db.execute("DELETE FROM stats"); _db.commit()
 
-# ── lastfm state ──
+# ── lastfm ──
 LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 _lfm: dict = {}
 _PERIOD = {"w":"7day","week":"7day","m":"1month","month":"1month",
@@ -215,10 +303,10 @@ _PERIOD = {"w":"7day","week":"7day","m":"1month","month":"1month",
 _PLABEL = {"7day":"this week","1month":"this month","3month":"3 months",
            "6month":"6 months","12month":"this year","overall":"all time"}
 
-# ── social state ──
+# ── social ──
 _autoaddback = False
 
-# ── status state ──
+# ── status ──
 _speak_lang = None
 
 # ── agc ──
@@ -235,33 +323,32 @@ def agc_load_wl():
         except Exception: _agc_whitelist = set()
 
 def agc_save_wl():
+    os.makedirs("config", exist_ok=True)
     with open("config/agc_whitelist.json", "w") as f:
         json.dump(list(_agc_whitelist), f)
 
-# ── admin helpers (host cog owns) ──
+# ── admin helpers (legacy — preserved for cogs that still call them) ──
 def _load_admins() -> list:
-    cfg = load_config() or {}
-    admins = cfg.get("admins", [])
-    if not isinstance(admins, list): return []
-    return [str(x) for x in admins]
+    return [str(x) for x in sorted(_admins)]
 
 def _save_admins(admins: list):
-    cfg = load_config() or {}
-    cfg["admins"] = [str(x) for x in admins]
-    save_config(cfg)
+    global _admins
+    _admins = set(int(x) for x in admins)
+    access_save()
 
 def _owner_id() -> str:
-    cfg = load_config() or {}
-    return str(cfg.get("owner_id", "") or "")
+    return str(_current_owner())
 
 def _set_owner(uid: str):
-    cfg = load_config() or {}
-    cfg["owner_id"] = str(uid)
-    save_config(cfg)
+    global OWNER_ID
+    OWNER_ID = int(uid)
+    access_save()
 
 def _is_owner(user_id) -> bool:
-    o = _owner_id()
-    return bool(o) and str(user_id) == o
+    try:
+        return int(user_id) == _current_owner()
+    except Exception:
+        return False
 
 def _parse_uid_str(user: str):
     if not user: return None
@@ -336,6 +423,7 @@ async def hosted_send(token, channel_id, content):
 # ── scheduler helpers ──
 def sched_save():
     try:
+        os.makedirs("database", exist_ok=True)
         with open("database/scheduler.json", "w") as f:
             json.dump(_scheduler, f, indent=2)
     except Exception: pass
@@ -347,7 +435,7 @@ def sched_load():
             with open("database/scheduler.json") as f: _scheduler = json.load(f)
         except Exception: _scheduler = []
 
-# ── settings state ──
+# ── settings ──
 _server_prefixes: dict = {}
 _aliases: dict = {}
 _cooldowns: dict = {}
@@ -358,7 +446,7 @@ _has_crypto = False
 _HAS_CRYPTO = False
 _key_path = "config/.key"
 
-# ── resilience state ──
+# ── resilience ──
 _reconnect_count = 0
 _last_ready_ts = 0
 _session_events: list = []
@@ -374,7 +462,6 @@ _queue_enabled = False
 _queue_workers = 3
 _queue_worker_tasks: list = []
 
-# caches owned by resilience / general
 _snipe_cache: dict = {}
 _editsnipe_cache: dict = {}
 _typing_tasks: dict = {}
@@ -382,7 +469,7 @@ _tracking: dict = {}
 _cache_auto = True
 _tracked_users: set = set()
 
-# ── general cog state ──
+# ── general ──
 SNIPE_LIMIT = 20
 LOG_FILE = "message_log.txt"
 SNIPER_ENABLED = True
@@ -404,7 +491,7 @@ _spam_tasks: dict = {}
 AUTO_RESPONSES: dict = {}
 _mimic_dict: dict = {}
 
-# ── fun / auto / utility state ──
+# ── fun / auto / utility ──
 _autoreact_emoji = None
 _multireact_pool: list = []
 _multireact_enabled = False
@@ -416,7 +503,7 @@ _afk_enabled = False
 _afk_msg = None
 _autodelete_secs = 0
 
-# ── developer state ──
+# ── developer ──
 _proxy = None
 _plugins: dict = {}
 _sessions: list = []

@@ -1,37 +1,39 @@
-# cogs/spoofer.py | platform / device spoofing — patches modifyself's
-# GatewayWebSocket.send_json at the CLASS level. every ws object (initial +
-# every reconnect) is covered automatically.
+# cogs/spoofer.py | platform / device spoofing
 #
-# v3 — reconnect is owned by modifyself_shim.Client.reconnect_gateway(),
-# which holds a class-level lock so no two reconnect paths ever race.
+# v4 — the class patch never landed on every build because modifyself's
+# GatewayWebSocket lives at different import paths across versions. now:
+#   1. tries 6 import paths for the class, patches on first hit
+#   2. falls back to instance-level patch on client._gateway after ready
+#   3. session purge hooked so IDENTIFY is fresh (not RESUME)
+#   4. Quest device strings corrected (real client sends "Quest", not "vr")
 import asyncio
-import json
-import re
+import sys
 import time
 import modifyself_shim as discord
 from . import state as S
 
 
 PLATFORM_PRESETS = {
-    "desktop":     {"os": "Windows",  "browser": "Chrome",         "device": "",            "label": "Windows Desktop"},
-    "windows":     {"os": "Windows",  "browser": "Chrome",         "device": "",            "label": "Windows Desktop"},
-    "macos":       {"os": "Mac OS X", "browser": "Chrome",         "device": "",            "label": "macOS Desktop"},
-    "linux":       {"os": "Linux",    "browser": "Chrome",         "device": "",            "label": "Linux Desktop"},
-    "web":         {"os": "Windows",  "browser": "Chrome",         "device": "",            "label": "Web (Chrome)"},
-    "browser":     {"os": "Windows",  "browser": "Chrome",         "device": "",            "label": "Web (Chrome)"},
-    "phone":       {"os": "Android",  "browser": "Discord Android","device": "Android",     "label": "Phone (Android)"},
-    "mobile":      {"os": "Android",  "browser": "Discord Android","device": "Android",     "label": "Phone (Android)"},
-    "android":     {"os": "Android",  "browser": "Discord Android","device": "Android",     "label": "Android"},
-    "ios":         {"os": "iOS",      "browser": "Discord iOS",    "device": "iPhone",      "label": "iOS"},
-    "iphone":      {"os": "iOS",      "browser": "Discord iOS",    "device": "iPhone",      "label": "iPhone"},
-    "ipad":        {"os": "iOS",      "browser": "Discord iOS",    "device": "iPad",        "label": "iPad"},
-    "console":     {"os": "Windows",  "browser": "Chrome",         "device": "console",     "label": "Console"},
-    "xbox":        {"os": "Windows",  "browser": "Chrome",         "device": "xbox",        "label": "Xbox"},
-    "playstation": {"os": "Windows",  "browser": "Chrome",         "device": "playstation", "label": "PlayStation"},
-    "ps":          {"os": "Windows",  "browser": "Chrome",         "device": "playstation", "label": "PlayStation"},
-    "vr":          {"os": "Android",  "browser": "Discord VR",     "device": "vr",          "label": "VR Headset"},
-    "quest":       {"os": "Android",  "browser": "Discord VR",     "device": "vr",          "label": "Meta Quest"},
-    "embedded":    {"os": "Windows",  "browser": "Chrome",         "device": "",            "label": "Embedded"},
+    "desktop":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Windows Desktop"},
+    "windows":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Windows Desktop"},
+    "macos":       {"os": "Mac OS X", "browser": "Chrome",          "device": "",             "label": "macOS Desktop"},
+    "linux":       {"os": "Linux",    "browser": "Chrome",          "device": "",             "label": "Linux Desktop"},
+    "web":         {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Web (Chrome)"},
+    "browser":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Web (Chrome)"},
+    "phone":       {"os": "Android",  "browser": "Discord Android", "device": "Android",      "label": "Phone (Android)"},
+    "mobile":      {"os": "Android",  "browser": "Discord Android", "device": "Android",      "label": "Phone (Android)"},
+    "android":     {"os": "Android",  "browser": "Discord Android", "device": "Android",      "label": "Android"},
+    "ios":         {"os": "iOS",      "browser": "Discord iOS",     "device": "iPhone",       "label": "iOS"},
+    "iphone":      {"os": "iOS",      "browser": "Discord iOS",     "device": "iPhone",       "label": "iPhone"},
+    "ipad":        {"os": "iOS",      "browser": "Discord iOS",     "device": "iPad",         "label": "iPad"},
+    "console":     {"os": "Windows",  "browser": "Chrome",          "device": "console",      "label": "Console"},
+    "xbox":        {"os": "Windows",  "browser": "Chrome",          "device": "xbox",         "label": "Xbox"},
+    "playstation": {"os": "Windows",  "browser": "Chrome",          "device": "playstation",  "label": "PlayStation"},
+    "ps":          {"os": "Windows",  "browser": "Chrome",          "device": "playstation",  "label": "PlayStation"},
+    "vr":          {"os": "Android",  "browser": "Discord VR",      "device": "Quest",        "label": "VR Headset"},
+    "quest":       {"os": "Android",  "browser": "Discord VR",      "device": "Quest 3",      "label": "Meta Quest"},
+    "quest2":      {"os": "Android",  "browser": "Discord VR",      "device": "Quest 2",      "label": "Meta Quest 2"},
+    "embedded":    {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Embedded"},
 }
 
 
@@ -40,7 +42,6 @@ _PRESET_HOLDER = [None]
 
 
 def _rewrite_identify_dict(data: dict, preset) -> bool:
-    """Rewrite an op:2 IDENTIFY payload dict in place."""
     if not isinstance(data, dict) or data.get("op") != 2:
         return False
     d = data.get("d")
@@ -51,7 +52,6 @@ def _rewrite_identify_dict(data: dict, preset) -> bool:
     props["browser"] = preset["browser"]
     props["device"] = preset["device"]
 
-    # align user agent to the chosen os/browser combo, else the spoof is obvious
     ua_map = {
         ("Android", "Discord Android"): (
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
@@ -81,22 +81,47 @@ def _rewrite_identify_dict(data: dict, preset) -> bool:
     if cog is not None:
         cog._last_props = dict(props)
         cog._identify_count += 1
-    print(f"[spoofer] rewrote IDENTIFY → {preset['label']}")
+    print(f"[spoofer] IDENTIFY rewritten → {preset['label']} "
+          f"(os={preset['os']} browser={preset['browser']} device={preset['device']})")
     return True
 
 
+# ─────────────────────────────────────────────────────────────
+# CLASS-LEVEL PATCH — try 6 import paths
+# ─────────────────────────────────────────────────────────────
+
+_GW_PATHS = (
+    ("modifyself.gateway.websocket", "GatewayWebSocket"),
+    ("modifyself.gateway.ws",        "GatewayWebSocket"),
+    ("modifyself.gateway",           "GatewayWebSocket"),
+    ("modifyself.ws",                "GatewayWebSocket"),
+    ("modifyself.client",            "GatewayWebSocket"),
+    ("modifyself.gateway.connection", "GatewayWebSocket"),
+)
+
+
+def _find_gw_class():
+    for mod_path, cls_name in _GW_PATHS:
+        try:
+            mod = __import__(mod_path, fromlist=[cls_name])
+            return getattr(mod, cls_name), f"{mod_path}.{cls_name}"
+        except (ImportError, AttributeError):
+            continue
+    return None, None
+
+
 def _install_patches():
-    """Class-level patch on GatewayWebSocket.send_json — idempotent."""
-    try:
-        from modifyself.gateway.websocket import GatewayWebSocket as _GW
-    except Exception as e:
-        print(f"[spoofer] cannot import GatewayWebSocket: {e}")
+    _GW_CLASS, _found_path = _find_gw_class()
+    if _GW_CLASS is None:
+        print("[spoofer] class patch: GatewayWebSocket not importable at any known path — "
+              "will fall back to instance-level patch on ready")
         return False
 
-    if getattr(_GW, "_spoofer_patched", False):
+    if getattr(_GW_CLASS, "_spoofer_patched", False):
+        print(f"[spoofer] class patch already installed at {_found_path}")
         return True
 
-    original_send = _GW.send_json
+    original_send = _GW_CLASS.send_json
 
     async def patched_send_json(self, data):
         try:
@@ -108,10 +133,71 @@ def _install_patches():
             print(f"[spoofer] send_json patch error: {e}")
         return await original_send(self, data)
 
-    _GW.send_json = patched_send_json
-    _GW._spoofer_patched = True
-    print("[spoofer] class patch installed: GatewayWebSocket.send_json")
+    _GW_CLASS.send_json = patched_send_json
+    _GW_CLASS._spoofer_patched = True
+    print(f"[spoofer] class patch installed: {_found_path}.send_json")
     return True
+
+
+def _install_instance_patch(client) -> bool:
+    if client is None:
+        return False
+    gw = getattr(client, "_gateway", None)
+    if gw is None:
+        print("[spoofer] instance patch: client._gateway is None")
+        return False
+    if getattr(gw, "_spoofer_instance_patched", False):
+        return True
+
+    original_send = gw.send_json
+
+    async def patched_send_json(data):
+        try:
+            if isinstance(data, dict):
+                preset = _PRESET_HOLDER[0]
+                if preset is not None and data.get("op") == 2:
+                    _rewrite_identify_dict(data, preset)
+        except Exception as e:
+            print(f"[spoofer] instance send_json patch error: {e}")
+        return await original_send(data)
+
+    gw.send_json = patched_send_json
+    gw._spoofer_instance_patched = True
+    print(f"[spoofer] instance patch installed: {type(gw).__module__}."
+          f"{type(gw).__name__}.send_json")
+    return True
+
+
+def _install_session_purge(client):
+    if client is None:
+        return
+    state = getattr(client, "_state", None)
+    if state is None:
+        return
+    if getattr(state, "_spoofer_purge_hooked", False):
+        return
+
+    gw = getattr(client, "_gateway", None)
+    if gw is None or not hasattr(gw, "connect"):
+        return
+
+    original_connect = gw.connect
+
+    async def purged_connect(*args, **kwargs):
+        preset = _PRESET_HOLDER[0]
+        if preset is not None:
+            for target in (gw, state, client):
+                for attr in ("_session_id", "_sequence", "_resume_gateway_url"):
+                    try:
+                        if getattr(target, attr, None) is not None:
+                            setattr(target, attr, None)
+                    except Exception:
+                        pass
+        return await original_connect(*args, **kwargs)
+
+    gw.connect = purged_connect
+    state._spoofer_purge_hooked = True
+    print("[spoofer] session purge hooked on gateway.connect")
 
 
 class SpooferCog:
@@ -127,20 +213,28 @@ class SpooferCog:
         self._watchdog_task = None
         self._reconnect_grace_until = 0.0
         _LIVE_COG[0] = self
-        _install_patches()
+
+        class_ok = _install_patches()
+        client = S.CLIENT
+        inst_ok = _install_instance_patch(client)
+        _install_session_purge(client)
+
+        if not (class_ok or inst_ok):
+            print("[spoofer] WARNING: neither class nor instance patch installed — "
+                  "spoof commands will set the local preset but won't rewrite IDENTIFY")
+
         self._start_watchdog()
 
     def _start_watchdog(self):
-        if self._watchdog_task and not self._watchdog_task.done(): return
-        try: loop = asyncio.get_event_loop()
-        except RuntimeError: return
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
         self._watchdog_task = loop.create_task(self._watchdog())
 
     async def _watchdog(self):
-        """
-        Detect a stalled gateway. give modifyself a 30s grace window after a
-        manual reconnect before nudging it, so we don't fight the library.
-        """
         dead_since = 0.0
         while True:
             try:
@@ -171,21 +265,32 @@ class SpooferCog:
 
     def _build_diag(self):
         lines = []
-        try:
-            from modifyself.gateway.websocket import GatewayWebSocket as _GW
-            lines.append(f"GatewayWebSocket.send_json: "
-                         f"{'patched' if getattr(_GW, '_spoofer_patched', False) else 'unpatched'}")
-        except Exception as e:
-            lines.append(f"import failed: {e}")
-        lines.append(f"preset held: {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
-        lines.append(f"identify count: {self._identify_count}")
-        lines.append(f"reconnect grace until: "
-                     f"{max(0, int(self._reconnect_grace_until - time.time()))}s")
+        cls, path = _find_gw_class()
+        class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
+        lines.append(f"class patch:    {'YES' if class_ok else 'NO'}  ({path or '?'})")
+
         client = S.CLIENT
         gw = getattr(client, "_gateway", None) if client else None
+        inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
+        lines.append(f"instance patch: {'YES' if inst_ok else 'NO'}")
+
+        state = getattr(client, "_state", None) if client else None
+        purge_ok = bool(getattr(state, "_spoofer_purge_hooked", False)) if state else False
+        lines.append(f"session purge:  {'YES' if purge_ok else 'NO'}")
+
+        lines.append(f"preset held:    {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
+        lines.append(f"identify count: {self._identify_count}")
+        lines.append(f"reconnect grace:{max(0, int(self._reconnect_grace_until - time.time()))}s")
+
         if gw is not None:
-            try: lines.append(f"gateway: {gw.get_state()}")
-            except Exception as e: lines.append(f"gateway state err: {e}")
+            try:
+                lines.append(f"gateway state:  {gw.get_state()}")
+            except Exception as e:
+                lines.append(f"gateway state err: {e}")
+            lines.append(f"last props os:  {(self._last_props or {}).get('os', '?')}")
+            lines.append(f"last props br:  {(self._last_props or {}).get('browser', '?')}")
+            lines.append(f"last props dev: {(self._last_props or {}).get('device', '?')}")
+
         return lines
 
     def _current_preset_label(self):
@@ -201,18 +306,32 @@ class SpooferCog:
         self._patched_preset = preset
         _PRESET_HOLDER[0] = preset
         S._current_platform = preset_key
+
+        main = sys.modules.get("__main__")
+        if main is not None:
+            try: main._current_platform = preset_key
+            except Exception: pass
+
         return True
 
     async def _safe_reconnect(self):
-        """
-        Force a fresh IDENTIFY. Routed through
-        modifyself_shim.Client.reconnect_gateway() which holds a class-level
-        lock, so this never races modifyself's own reconnect task.
-        """
         client = S.CLIENT
-        if client is None: return
+        if client is None:
+            return
         self._reconnect_count += 1
         print(f"[spoofer] reconnect #{self._reconnect_count} requested")
+
+        gw = getattr(client, "_gateway", None)
+        state = getattr(client, "_state", None)
+        for target in (gw, state, client):
+            if target is None:
+                continue
+            for attr in ("_session_id", "_sequence", "_resume_gateway_url"):
+                try:
+                    if getattr(target, attr, None) is not None:
+                        setattr(target, attr, None)
+                except Exception:
+                    pass
 
         self._reconnect_grace_until = time.time() + 30
         try:
@@ -294,10 +413,14 @@ class SpooferCog:
                 state_str = f"{st.get('state')} / conn={st.get('is_connected')}"
             except Exception:
                 pass
+        cls, _ = _find_gw_class()
+        class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
+        inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
         lines = [
             f"  tracked:      {getattr(S, '_current_platform', '?')}",
             f"  preset held:  {active['label'] if active else '—'}",
-            f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
+            f"  class patch:  {'YES' if class_ok else 'NO'}",
+            f"  inst patch:   {'YES' if inst_ok else 'NO'}",
             f"  identify #:   {self._identify_count}",
             f"  reconnects:   {self._reconnect_count}",
             f"  gateway:      {state_str}",
