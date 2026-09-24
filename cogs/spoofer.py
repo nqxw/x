@@ -2,10 +2,8 @@
 # GatewayWebSocket.send_json at the CLASS level. every ws object (initial +
 # every reconnect) is covered automatically.
 #
-# v2 — reconnect is handled by modifyself's own `_handle_disconnect` path.
-# we do NOT call gw.connect() ourselves — that races with the library's
-# reconnect task and leaves the gateway dead. we just clear session state
-# so the next attempt sends IDENTIFY instead of RESUME.
+# v3 — reconnect is owned by modifyself_shim.Client.reconnect_gateway(),
+# which holds a class-level lock so no two reconnect paths ever race.
 import asyncio
 import json
 import re
@@ -37,7 +35,6 @@ PLATFORM_PRESETS = {
 }
 
 
-_PATCHED = {}
 _LIVE_COG = [None]
 _PRESET_HOLDER = [None]
 
@@ -152,23 +149,18 @@ class SpooferCog:
                     gw = getattr(client, "_gateway", None)
                     now = time.time()
                     if gw is not None and now >= self._reconnect_grace_until:
-                        is_connected = getattr(gw, "is_connected", False)
-                        is_closed = getattr(gw, "is_closed", False)
+                        is_connected = bool(getattr(gw, "is_connected", False))
+                        is_closed = bool(getattr(gw, "is_closed", False))
                         if not is_connected and not is_closed:
                             if dead_since == 0.0:
                                 dead_since = now
                             elif now - dead_since > 15:
-                                print("[spoofer] watchdog: gateway stalled >15s, "
-                                      "clearing session state for a fresh IDENTIFY")
-                                # clear session so the next reconnect sends IDENTIFY
-                                try: gw._session_id = None
-                                except Exception: pass
-                                try: gw._sequence = None
-                                except Exception: pass
-                                # close so modifyself's own _handle_disconnect runs
-                                try: await gw.close()
+                                print("[spoofer] watchdog: gateway stalled >15s — "
+                                      "calling reconnect_gateway")
+                                try:
+                                    await client.reconnect_gateway()
                                 except Exception as e:
-                                    print(f"[spoofer] watchdog close failed: {e}")
+                                    print(f"[spoofer] watchdog reconnect err: {e}")
                                 self._reconnect_grace_until = time.time() + 30
                                 dead_since = 0.0
                         else:
@@ -213,33 +205,25 @@ class SpooferCog:
 
     async def _safe_reconnect(self):
         """
-        Force a fresh IDENTIFY by clearing session state and closing the ws.
-        modifyself's own `_handle_disconnect` → `_reconnect` task picks up
-        from there. we do NOT call gw.connect() ourselves — that's the race
-        that leaves the gateway dead.
+        Force a fresh IDENTIFY. Routed through
+        modifyself_shim.Client.reconnect_gateway() which holds a class-level
+        lock, so this never races modifyself's own reconnect task.
         """
         client = S.CLIENT
         if client is None: return
-        gw = getattr(client, "_gateway", None)
-        if gw is None: return
-
         self._reconnect_count += 1
         print(f"[spoofer] reconnect #{self._reconnect_count} requested")
 
-        # clear session so the next attempt IDENTIFYs instead of RESUMEs
-        try: gw._session_id = None
-        except Exception: pass
-        try: gw._sequence = None
-        except Exception: pass
-
-        # close with a resumable code so modifyself kicks its own reconnect
-        try:
-            await gw.close()
-        except Exception as e:
-            print(f"[spoofer] close failed: {e}")
-
-        # give the library 30s to reconnect before the watchdog steps in
         self._reconnect_grace_until = time.time() + 30
+        try:
+            ok = await client.reconnect_gateway()
+            if ok:
+                print(f"[spoofer] reconnect #{self._reconnect_count} OK")
+            else:
+                print(f"[spoofer] reconnect #{self._reconnect_count} failed — "
+                      f"watchdog will retry in 30s")
+        except Exception as e:
+            print(f"[spoofer] reconnect raised: {e}")
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
