@@ -6,6 +6,7 @@ import time
 import random
 import string
 import re
+import aiohttp
 import modifyself_shim as discord
 from . import state as S
 
@@ -19,6 +20,68 @@ def _sync(**kw):
             setattr(main, k, v)
         except Exception:
             pass
+
+
+def _auth_headers():
+    return {"Authorization": S.TOKEN, "User-Agent": S.USER_AGENT}
+
+
+async def _purge_own_messages(session, channel_id, own_uid, limit):
+    """
+    Raw REST purge. Paginates GET /channels/{ch}/messages?limit=100&before=ID
+    and deletes every message whose author.id == own_uid.
+    Bypasses channel.history() entirely — that path depends on the shim's
+    HTTPClient patch landing, which isn't guaranteed on every build.
+    """
+    h = _auth_headers()
+    deleted = 0
+    before = None
+    guard = 0
+    while deleted < limit and guard < 20:
+        guard += 1
+        qs = "?limit=100"
+        if before:
+            qs += f"&before={before}"
+        try:
+            async with session.get(
+                f"https://discord.com/api/v9/channels/{channel_id}/messages{qs}",
+                headers=h,
+            ) as r:
+                if r.status != 200:
+                    print(f"[purge] history HTTP {r.status}")
+                    break
+                batch = await r.json()
+        except Exception as e:
+            print(f"[purge] fetch error: {e}")
+            break
+        if not batch:
+            break
+        for m in batch:
+            if deleted >= limit:
+                break
+            author = m.get("author") or {}
+            if str(author.get("id")) != str(own_uid):
+                continue
+            try:
+                async with session.delete(
+                    f"https://discord.com/api/v9/channels/{channel_id}/messages/{m['id']}",
+                    headers=h,
+                ) as dr:
+                    if dr.status in (200, 204):
+                        deleted += 1
+                    elif dr.status == 429:
+                        try:
+                            info = await dr.json()
+                            await asyncio.sleep(float(info.get("retry_after", 2.0)))
+                        except Exception:
+                            await asyncio.sleep(2.0)
+            except Exception:
+                pass
+            await asyncio.sleep(0.35)
+        before = batch[-1]["id"]
+        if len(batch) < 100:
+            break
+    return deleted
 
 
 async def _spam_worker(channel, count, text):
@@ -96,25 +159,43 @@ class GeneralCog:
 
         elif cmd == "purge":
             limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
+            ch_id = message.channel.id
+            own_uid = client.user.id
             try: await message.delete()
             except Exception: pass
-            d = 0
-            async for msg in message.channel.history(limit=500):
-                if msg.author.id == client.user.id:
-                    try: await msg.delete()
-                    except Exception: pass
-                    d += 1
-                    await asyncio.sleep(0.3)
-                    if d >= limit: break
+            try:
+                async with aiohttp.ClientSession() as session:
+                    d = await _purge_own_messages(session, ch_id, own_uid, limit)
+                if d:
+                    try:
+                        await message.channel.send(
+                            S.ui_ok(f"purged {d}"), delete_after=4)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[purge] {type(e).__name__}: {e}")
+                try:
+                    await message.channel.send(
+                        S.ui_err(f"purge: {e}"), delete_after=6)
+                except Exception:
+                    pass
 
         elif cmd == "purgeall":
+            ch_id = message.channel.id
+            own_uid = client.user.id
             try: await message.delete()
             except Exception: pass
-            async for msg in message.channel.history(limit=1000):
-                if msg.author.id == client.user.id:
-                    try: await msg.delete()
-                    except Exception: pass
-                    await asyncio.sleep(0.3)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    d = await _purge_own_messages(session, ch_id, own_uid, 1000)
+                if d:
+                    try:
+                        await message.channel.send(
+                            S.ui_ok(f"purged {d}"), delete_after=4)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[purgeall] {type(e).__name__}: {e}")
 
         elif cmd == "clear":
             try: await message.delete()
