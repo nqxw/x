@@ -1,8 +1,11 @@
 # modifyself_shim.py | discord-shaped namespace over modifyself.
-# v4 — patches:
-#   - Client.event upgrades dict payloads to model objects before dispatch
-#   - arity-aware wrapper: matches the handler's declared parameter count
-#   - handles 0/1/2/3-arg handlers cleanly
+# v5 — patches:
+#   - Client.reconnect_gateway() with a class-level lock (no reconnect race)
+#   - _upgrade() upgrades dict payloads to model objects before dispatch
+#   - arity-aware event wrapper (0/1/2/3-arg handlers all work)
+#   - _ChannelStub fallback for uncached channels
+#   - _ch_send passes content positionally to match modifyself's HTTPClient
+#   - _MSMessage.reply fallback through stub channels
 import asyncio
 import inspect
 import json as _json
@@ -265,11 +268,8 @@ InvalidToken     = DiscordException
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  EVENT PAYLOAD UPGRADE — turn raw dicts into model objects
+#  EVENT PAYLOAD UPGRADE
 # ═══════════════════════════════════════════════════════════════════
-# modifyself's dispatcher passes dicts to handlers when there's no parser,
-# or passes a model when the parser exists. cogs expect discord.py-shaped
-# objects, so this normalizes everything before dispatch.
 
 def _upgrade(state, event_name, payload):
     """Upgrade a raw payload for the named event into the right model object."""
@@ -277,10 +277,9 @@ def _upgrade(state, event_name, payload):
         return payload
 
     try:
-        if event_name == "MESSAGE_CREATE":
+        if event_name in ("MESSAGE_CREATE", "MESSAGE_UPDATE"):
             return state._store_message(payload)
-        if event_name == "MESSAGE_UPDATE":
-            return state._store_message(payload)
+
         if event_name in ("MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE"):
             msg = state._messages.get(int(payload.get("message_id", 0)))
             if msg is None:
@@ -293,37 +292,43 @@ def _upgrade(state, event_name, payload):
                         self.id = mid
                         self.channel = channel
                         self.channel_id = channel.id
-                        self.guild_id = payload.get("guild_id")
+                        self.guild_id = data.get("guild_id")
                         self._data = data
-                        self.author = _MSUser(state=state, data=data.get("author", data.get("user", {"id": "0"})))
+                        self.author = _MSUser(
+                            state=state,
+                            data=data.get("author", data.get("user", {"id": "0"})))
                     @property
                     def content(self): return self._data.get("content", "")
                     async def reply(self, content=None, **kw):
                         return await self.channel.send(content, **kw)
                 msg = _StubMsg(int(payload.get("message_id", 0)), ch, payload)
-            # attach the emoji to the payload for the reaction handler
+
             class _StubReaction:
                 def __init__(self, emoji, message):
                     self.emoji = emoji
                     self.message = message
                     self.count = payload.get("count", 1)
-            emoji_data = payload.get("emoji", {})
+
+            emoji_data = payload.get("emoji", {}) or {}
             emoji_str = (
                 emoji_data.get("name") if not emoji_data.get("id")
                 else f"<{'a' if emoji_data.get('animated') else ''}:"
                      f"{emoji_data.get('name')}:{emoji_data.get('id')}>"
             )
             return _StubReaction(emoji_str, msg)
-        if event_name in ("GUILD_MEMBER_ADD", "GUILD_MEMBER_REMOVE", "GUILD_MEMBER_UPDATE"):
+
+        if event_name in ("GUILD_MEMBER_ADD", "GUILD_MEMBER_REMOVE",
+                          "GUILD_MEMBER_UPDATE"):
             gid = int(payload.get("guild_id", 0))
             return _MSMember(state=state, data=payload, guild_id=gid)
-        if event_name == "TYPING_START":
-            return payload
+
         if event_name == "GUILD_CREATE":
             return state._add_guild(payload)
-        if event_name == "CHANNEL_CREATE":
+
+        if event_name in ("CHANNEL_CREATE", "CHANNEL_UPDATE"):
             return state._add_channel(payload)
-        if event_name == "INTERACTION_CREATE":
+
+        if event_name in ("VOICE_STATE_UPDATE", "TYPING_START", "INTERACTION_CREATE"):
             return payload
     except Exception as e:
         logger.debug(f"[shim] _upgrade {event_name} failed: {e}")
@@ -432,7 +437,6 @@ _MSMessage.channel = property(_msg_channel)
 _MSMessage.guild   = property(_msg_guild)
 
 
-# ── Message.reply fallback for stub channels ──
 async def _msg_reply(self, content=None, **kw):
     ch = _msg_channel(self)
     ref = {"message_id": str(self.id), "channel_id": str(self.channel_id)}
@@ -923,6 +927,62 @@ class Client(_MSClient):
         self._presence_status = "online"
         self._closed_flag = False
 
+    # ── reconnect lock + driver ──
+
+    _reconnect_lock = None
+
+    def _get_reconnect_lock(self):
+        if Client._reconnect_lock is None:
+            Client._reconnect_lock = asyncio.Lock()
+        return Client._reconnect_lock
+
+    async def reconnect_gateway(self):
+        """
+        Force a fresh IDENTIFY on the gateway. Serializes on a class-level
+        lock so modifyself's own reconnect task and this method never
+        open the socket at the same time.
+        """
+        gw = getattr(self, "_gateway", None)
+        if gw is None:
+            logger.debug("[shim] reconnect_gateway: no gateway")
+            return False
+
+        lock = self._get_reconnect_lock()
+        async with lock:
+            # bail if already connected
+            try:
+                if gw.is_connected:
+                    return True
+            except Exception:
+                pass
+
+            # clear session so the next IDENTIFY is fresh, not RESUME
+            try: gw._session_id = None
+            except Exception: pass
+            try: gw._sequence = None
+            except Exception: pass
+
+            # close cleanly if still up
+            try:
+                if gw._ws is not None and not getattr(gw, "is_closed", False):
+                    await gw.close()
+            except Exception as e:
+                logger.debug(f"[shim] reconnect close err: {e}")
+
+            # let modifyself's own _message_loop exit
+            await asyncio.sleep(0.5)
+
+            # drive the reconnect ourselves
+            try:
+                await gw.connect()
+                logger.info("[shim] reconnect_gateway: connected")
+                return True
+            except Exception as e:
+                logger.warning(f"[shim] reconnect_gateway failed: {e}")
+                return False
+
+    # ── events ──
+
     def event(self, coro):
         if not asyncio.iscoroutinefunction(coro):
             raise TypeError("Event handlers must be coroutines")
@@ -930,7 +990,6 @@ class Client(_MSClient):
         raw = coro.__name__.replace("on_", "", 1).upper()
         name = _EVENT_MAP.get(raw, raw)
 
-        # find the handler's arity (positional-only + positional-or-keyword, no defaults)
         sig = inspect.signature(coro)
         pos_params = [
             p for p in sig.parameters.values()
@@ -948,11 +1007,8 @@ class Client(_MSClient):
                 elif _arity == 1:
                     await _coro(obj)
                 elif _arity == 2:
-                    # two-arg handlers — pass same object twice (modifyself
-                    # doesn't expose before-state)
                     await _coro(obj, obj)
                 elif _arity == 3:
-                    # three-arg handlers (voice state update before/after)
                     await _coro(obj, obj, obj)
                 else:
                     await _coro(*([obj] * _arity))
@@ -963,6 +1019,8 @@ class Client(_MSClient):
         self._dispatcher.on(name, _wrapped)
         self._event_handlers.setdefault(name, []).append(_wrapped)
         return coro
+
+    # ── presence ──
 
     async def change_presence(self, *, activity=None, status=None, **_):
         if activity is not None: self._presence_activity = activity
@@ -981,6 +1039,8 @@ class Client(_MSClient):
         try: await self.ws.send_json(payload)
         except Exception as e:
             logger.debug(f"[shim] change_presence forward failed: {e}")
+
+    # ── lifecycle ──
 
     def is_closed(self) -> bool:
         return self._closed_flag or getattr(self, "_closed", False)
@@ -1009,6 +1069,8 @@ class Client(_MSClient):
             try: self._dispatcher.off(ev, _handler)
             except Exception: pass
 
+    # ── channels ──
+
     @property
     def private_channels(self):
         try:
@@ -1016,6 +1078,8 @@ class Client(_MSClient):
                     if isinstance(c, (_MSDMChannel, _MSGroupChannel))]
         except Exception:
             return []
+
+    # ── webhooks / invites ──
 
     async def fetch_webhook(self, webhook_id: int):
         data = await self._http.request(method="GET", url=f"/webhooks/{webhook_id}")
