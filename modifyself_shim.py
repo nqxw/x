@@ -1,6 +1,7 @@
 # modifyself_shim.py | discord-shaped namespace over modifyself.
-# v5 — patches:
-#   - Client.reconnect_gateway() with a class-level lock (no reconnect race)
+# v5.1 — patches:
+#   - Client.reconnect_gateway() always runs (no early-return on is_connected)
+#   - class-level lock prevents reconnect races
 #   - _upgrade() upgrades dict payloads to model objects before dispatch
 #   - arity-aware event wrapper (0/1/2/3-arg handlers all work)
 #   - _ChannelStub fallback for uncached channels
@@ -938,9 +939,12 @@ class Client(_MSClient):
 
     async def reconnect_gateway(self):
         """
-        Force a fresh IDENTIFY on the gateway. Serializes on a class-level
-        lock so modifyself's own reconnect task and this method never
-        open the socket at the same time.
+        Force a fresh IDENTIFY on the gateway. Always runs — no shortcut
+        on is_connected, because a spoofed IDENTIFY is exactly what
+        callers want even while the current session is live.
+
+        Serializes on a class-level lock so modifyself's own reconnect
+        task and this method never open the socket at the same time.
         """
         gw = getattr(self, "_gateway", None)
         if gw is None:
@@ -949,30 +953,27 @@ class Client(_MSClient):
 
         lock = self._get_reconnect_lock()
         async with lock:
-            # bail if already connected
-            try:
-                if gw.is_connected:
-                    return True
-            except Exception:
-                pass
-
             # clear session so the next IDENTIFY is fresh, not RESUME
             try: gw._session_id = None
             except Exception: pass
             try: gw._sequence = None
             except Exception: pass
+            try: gw._resume_gateway_url = None
+            except Exception: pass
 
-            # close cleanly if still up
+            # close the socket if it's still up
             try:
-                if gw._ws is not None and not getattr(gw, "is_closed", False):
+                if getattr(gw, "_ws", None) is not None:
                     await gw.close()
+                    logger.debug("[shim] reconnect_gateway: closed old ws")
             except Exception as e:
                 logger.debug(f"[shim] reconnect close err: {e}")
 
-            # let modifyself's own _message_loop exit
-            await asyncio.sleep(0.5)
+            # wait for modifyself's own _message_loop to unwind
+            await asyncio.sleep(1.0)
 
-            # drive the reconnect ourselves
+            # drive the reconnect — HELLO arrives, we IDENTIFY with the
+            # spoofed properties, the ws.send_json patch fires
             try:
                 await gw.connect()
                 logger.info("[shim] reconnect_gateway: connected")
