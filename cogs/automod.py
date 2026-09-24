@@ -1,4 +1,5 @@
 # cogs/automod.py | automod words/actions, raidmode, quarantine, ticket, verify
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -75,8 +76,7 @@ class AutomodCog:
                 S._ticket_cfg["category_id"] = args[2]
                 await message.channel.send(S.ui_ok("ticket category set"))
             elif sub == "close":
-                import discord
-                if isinstance(message.channel, discord.TextChannel):
+                if hasattr(message.channel, "delete"):
                     try: await message.channel.delete()
                     except Exception as e: await message.channel.send(S.ui_err(str(e)))
             else:
@@ -87,13 +87,14 @@ class AutomodCog:
                 S._verify_cfg["role_id"] = args[2]
                 await message.channel.send(S.ui_ok("verified role set"))
             elif sub == "button":
-                import discord
                 label = " ".join(args[2:]) if len(args) > 2 else "Verify"
                 try:
                     view = discord.ui.View()
-                    view.add_item(discord.ui.Button(label=label, custom_id="verify_button",
-                                                    style=discord.ButtonStyle.success))
-                    await message.channel.send("click to verify", view=view)
+                    view.add_item(discord.ui.Button(
+                        label=label, custom_id="verify_button",
+                        style=discord.ButtonStyle.success))
+                    await message.channel.send("click to verify",
+                                                components=view.to_components())
                 except Exception as e:
                     await message.channel.send(S.ui_err(f"button send failed: {e}"), delete_after=6)
             else:

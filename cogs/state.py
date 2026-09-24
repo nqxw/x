@@ -12,18 +12,20 @@ import string
 import sqlite3
 import asyncio
 import aiohttp
-import discord
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from collections import defaultdict
 
+# ── CHANGED: framework swap (was: import discord) ──
+import modifyself_shim as discord
+
 # ── filled in at boot by selfbot.py ──
-CLIENT: discord.Client | None = None
-MAIN_CLIENT: discord.Client | None = None
+CLIENT = None
+MAIN_CLIENT = None
 TOKEN: str = ""
 PREFIX: str = "."
 USER_AGENT: str = ""
-VERSION: str = "2.2.7"
+VERSION: str = "2.3.0-modifyself"
 HAS_HCAPTCHA: bool = False
 
 # ── UI palette ──
@@ -134,8 +136,6 @@ _host_lock = None   # asyncio.Lock, set lazily
 # ── quest state ──
 _hcaptcha_agent = None
 
-# ── voice / mass / nuke / scrape / webhooks: no persistent state ──
-
 # ── automod / monitor state ──
 _monitor = {"joins": False, "leaves": False, "roles": False, "nicks": False,
             "invites": False, "log_ch": None, "keywords": []}
@@ -157,7 +157,7 @@ _nuke_backups: dict = {}
 _scheduler: list = []
 _scheduler_task = None
 
-# ── task manager (moved from selfbot.py) ──
+# ── task manager ──
 _managed_tasks: dict = {}
 _TASK_STORE = "database/tasks.json"
 _TRIGGER_STORE = "database/triggers.json"
@@ -168,7 +168,7 @@ _trigger_fired_counts: dict = {}
 
 # ── db state ──
 _db_path = "database/selfbot.db"
-_db: sqlite3.Connection | None = None
+_db = None
 
 def db_open():
     global _db
@@ -355,7 +355,7 @@ _cooldown_last: dict = {}
 _profiles: dict = {}
 _encrypt_enabled = False
 _has_crypto = False
-_HAS_CRYPTO = False    # mirror name; keep both if some code references either
+_HAS_CRYPTO = False
 _key_path = "config/.key"
 
 # ── resilience state ──

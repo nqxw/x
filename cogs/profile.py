@@ -3,6 +3,7 @@ import base64
 import json
 from datetime import datetime
 import aiohttp
+import modifyself_shim as discord
 from . import state as S
 
 

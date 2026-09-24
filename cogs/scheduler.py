@@ -3,7 +3,7 @@ import asyncio
 import time
 import json
 import os
-import discord
+import modifyself_shim as discord
 from uuid import uuid4
 from . import state as S
 

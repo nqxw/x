@@ -1,5 +1,6 @@
 # cogs/tracking.py | track/untrack/tracklist — message + profile history per user
 from datetime import datetime
+import modifyself_shim as discord
 from . import state as S
 
 

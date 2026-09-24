@@ -1,5 +1,6 @@
 # cogs/lastfm.py | last.fm now playing, recent, top, stats, compare
 import aiohttp
+import modifyself_shim as discord
 from . import state as S
 
 

@@ -2,6 +2,7 @@
 import asyncio
 import re
 import aiohttp
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -15,16 +16,17 @@ class WebhooksCog:
         sub = args[1].lower() if len(args) > 1 else ""
 
         if sub == "create":
-            name = args[2] if len(args) > 2 else "voltrix"
+            name = args[2] if len(args) > 2 else "lunar"
             try:
                 wh = await message.channel.create_webhook(name=name)
-                await message.channel.send(S.ui_ok(f"webhook: {wh.url}"))
+                await message.channel.send(S.ui_ok(f"webhook: {wh.token or wh.id}"))
             except Exception as e:
                 await message.channel.send(S.ui_err(str(e)), delete_after=5)
 
         elif sub == "delete" and len(args) >= 3:
             try:
-                wh = await client.fetch_webhook(int(args[2])); await wh.delete()
+                wh = await client.fetch_webhook(int(args[2]))
+                await wh.delete()
                 await message.channel.send(S.ui_ok("deleted"))
             except Exception as e:
                 await message.channel.send(S.ui_err(str(e)), delete_after=5)
@@ -82,7 +84,7 @@ class WebhooksCog:
 
         elif sub == "clear":
             n = 0
-            for ch in message.guild.text_channels:
+            for ch in message.guild.channels:
                 try:
                     for wh in await ch.webhooks():
                         try: await wh.delete(); n += 1

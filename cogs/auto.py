@@ -1,6 +1,7 @@
 # cogs/auto.py | giveaway, nitrosniper, autoreact, multireact, vsniper
 import asyncio
 import aiohttp
+import modifyself_shim as discord
 from . import state as S
 
 

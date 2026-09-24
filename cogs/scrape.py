@@ -3,6 +3,7 @@ import os
 import json
 import time
 import csv
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -32,7 +33,7 @@ class ScrapeCog:
             elif sub == "invites" and message.guild:
                 try:
                     invs = await message.guild.invites()
-                    rows = [f"  {S.GREY}•{S.RESET} {i.code}  {S.DIM}uses={i.uses} by {i.inviter}{S.RESET}"
+                    rows = [f"  {S.GREY}•{S.RESET} {i.get('code')}  {S.DIM}uses={i.get('uses')}{S.RESET}"
                             for i in invs]
                     await message.channel.send(
                         S._paginate("invites", message.guild.name, rows) if rows else S.ui_info("none"))
@@ -46,7 +47,7 @@ class ScrapeCog:
                 out = []
                 async for m in ch.history(limit=n):
                     out.append({"author": str(m.author), "id": m.id, "content": m.content,
-                                "ts": m.created_at.isoformat()})
+                                "ts": m.timestamp.isoformat() if hasattr(m.timestamp, "isoformat") else str(m.timestamp)})
                 p = f"exports/channel_{ch.id}_{int(time.time())}.json"
                 with open(p, "w") as f: json.dump(out, f, indent=2)
                 await message.channel.send(S.ui_ok(f"exported {len(out)} → {p}"))
@@ -64,10 +65,10 @@ class ScrapeCog:
                     return await message.channel.send(S.ui_err("guild not found"), delete_after=5)
                 p = f"exports/members_{g.id}_{int(time.time())}.csv"
                 with open(p, "w", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f); w.writerow(["id", "name", "nick", "joined", "bot"])
+                    w = csv.writer(f); w.writerow(["id","name","nick","joined","bot"])
                     for m in g.members:
                         w.writerow([m.id, str(m), m.nick or "",
-                                    m.joined_at.isoformat() if m.joined_at else "", m.bot])
+                                    m.joined_at.isoformat() if m.joined_at else "", False])
                 await message.channel.send(S.ui_ok(f"exported {len(g.members)} → {p}"))
             elif sub == "messages" and len(args) >= 3:
                 ch = client.get_channel(int(args[2]))
@@ -77,7 +78,7 @@ class ScrapeCog:
                 out = []
                 async for m in ch.history(limit=n):
                     out.append({"author": str(m.author), "content": m.content,
-                                "ts": m.created_at.isoformat()})
+                                "ts": m.timestamp.isoformat() if hasattr(m.timestamp, "isoformat") else str(m.timestamp)})
                 p = f"exports/messages_{ch.id}_{int(time.time())}.json"
                 with open(p, "w") as f: json.dump(out, f, indent=2)
                 await message.channel.send(S.ui_ok(f"exported {len(out)} → {p}"))
@@ -88,8 +89,7 @@ class ScrapeCog:
                 invs = await g.invites()
                 p = f"exports/invites_{g.id}_{int(time.time())}.json"
                 with open(p, "w") as f:
-                    json.dump([{"code": i.code, "uses": i.uses, "inviter": str(i.inviter)}
-                               for i in invs], f, indent=2)
+                    json.dump(invs, f, indent=2, default=str)
                 await message.channel.send(S.ui_ok(f"exported {len(invs)} → {p}"))
             else:
                 await message.channel.send(S.ui_info("usage: export members/messages/invites"))

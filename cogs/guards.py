@@ -1,4 +1,5 @@
 # cogs/guards.py | blacklist / whitelist / server-block / channel-block / role-restrict / status / reset
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -24,7 +25,6 @@ class GuardsCog:
         elif cmd == "guards":
             await self._guards(message, args)
 
-    # ── user blacklist ──
     async def _blacklist(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "add" and len(args) >= 3:
@@ -43,7 +43,6 @@ class GuardsCog:
         else:
             await message.channel.send(S.ui_info("usage: blacklist add/remove/list/clear"))
 
-    # ── user whitelist ──
     async def _whitelist(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "add" and len(args) >= 3:
@@ -62,7 +61,6 @@ class GuardsCog:
         else:
             await message.channel.send(S.ui_info("usage: whitelist add/remove/list/clear"))
 
-    # ── server-scoped command blocks ──
     async def _serverblacklist(self, message, args):
         if not message.guild:
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
@@ -85,7 +83,6 @@ class GuardsCog:
             await message.channel.send(S.ui_info(
                 "usage: serverblacklist add/remove/list/clear"))
 
-    # ── channel-scoped command blocks ──
     async def _channelblacklist(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         cid = str(message.channel.id)
@@ -106,7 +103,6 @@ class GuardsCog:
             await message.channel.send(S.ui_info(
                 "usage: channelblacklist add/remove/list/clear"))
 
-    # ── role restrictions ──
     async def _rolerestrict(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "add" and len(args) >= 4:
@@ -129,7 +125,6 @@ class GuardsCog:
             await message.channel.send(S.ui_info(
                 "usage: rolerestrict add/remove/list/clear"))
 
-    # ── guards status / reset ──
     async def _guards(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "status":

@@ -2,6 +2,7 @@
 import os
 import json
 import time
+import modifyself_shim as discord
 from . import state as S
 from .nuke import _backup_server, _restore_server
 

@@ -2,6 +2,7 @@
 import asyncio
 import random
 import aiohttp
+import modifyself_shim as discord
 from . import state as S
 
 

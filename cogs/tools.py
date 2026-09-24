@@ -6,6 +6,7 @@ import string
 import aiohttp
 from uuid import uuid4
 from datetime import datetime
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -51,8 +52,7 @@ class ToolsCog:
                                     else S.ui_err(f"failed {r3.status}"),
                                     delete_after=8)
                         else:
-                            await message.channel.send(S.ui_err(f"failed {r2.status}"),
-                                                       delete_after=6)
+                            await message.channel.send(S.ui_err(f"failed {r2.status}"), delete_after=6)
             except Exception as e:
                 await message.channel.send(S.ui_err(str(e)), delete_after=6)
 
@@ -101,8 +101,7 @@ class ToolsCog:
 
         elif cmd == "fetchlyrics":
             if len(args) < 2:
-                return await message.edit(content=S.ui_err(
-                    "usage: fetchlyrics <artist - title>"))
+                return await message.edit(content=S.ui_err("usage: fetchlyrics <artist - title>"))
             query = " ".join(args[1:])
             try:
                 async with aiohttp.ClientSession() as s:
@@ -141,8 +140,8 @@ class ToolsCog:
                 return await message.channel.send(S.ui_err("not found"), delete_after=5)
             count = 0; out = []
             async for msg in ch.history(limit=2000):
-                out.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] "
-                           f"{msg.author}: {msg.content}")
+                ts = msg.timestamp.strftime('%Y-%m-%d %H:%M:%S') if hasattr(msg.timestamp, 'strftime') else str(msg.timestamp)
+                out.append(f"[{ts}] {msg.author}: {msg.content}")
                 count += 1
             fname = f"exports/archive_{ch.id}.txt"
             with open(fname, "w", encoding="utf-8") as f:

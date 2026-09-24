@@ -1,6 +1,7 @@
 # cogs/triggers.py | message / reaction / voice / member triggers + fired counts
 import json
 import os
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -25,8 +26,6 @@ class TriggersCog:
     COMMANDS = {"trigger", "triggers"}
 
     def register(self, client):
-        """Hook reaction + voice + member events. Message triggers fire from
-        the dispatcher pre-hook (see selfbot.py) — reaction/voice/member here."""
         cog = self
 
         @client.event
@@ -45,12 +44,9 @@ class TriggersCog:
         async def on_member_remove(member):
             await cog._on_member(member, "leave")
 
-    # ── EVENT HANDLERS ──
-
     async def _on_reaction(self, reaction, user):
         client = S.CLIENT
-        if user.id == client.user.id:
-            return
+        if user.id == client.user.id: return
         for t in S._triggers.get("reaction", []):
             try:
                 if (str(reaction.emoji) == str(t.get("emoji"))
@@ -74,18 +70,14 @@ class TriggersCog:
                 ev = t.get("event", "")
                 ch_filter = t.get("channel_id")
                 fire = False
-                if ev == "join" and before.channel is None and after.channel is not None:
-                    fire = True
-                elif ev == "leave" and before.channel is not None and after.channel is None:
-                    fire = True
+                if ev == "join" and before.channel is None and after.channel is not None: fire = True
+                elif ev == "leave" and before.channel is not None and after.channel is None: fire = True
                 elif (ev == "move" and before.channel and after.channel
-                      and before.channel != after.channel):
-                    fire = True
+                      and before.channel != after.channel): fire = True
                 if fire:
                     if ch_filter and str((after.channel or before.channel).id) != str(ch_filter):
                         continue
                     S._trigger_fired_counts[t["name"]] = S._trigger_fired_counts.get(t["name"], 0) + 1
-                    # monitor log if set
                     if S._monitor["log_ch"]:
                         ch = S.CLIENT.get_channel(int(S._monitor["log_ch"]))
                         if ch:
@@ -109,8 +101,6 @@ class TriggersCog:
                             except Exception: pass
             except Exception: pass
 
-    # ── COMMAND DISPATCH ──
-
     async def handle(self, message, cmd, args):
         try: await message.delete()
         except Exception: pass
@@ -120,16 +110,11 @@ class TriggersCog:
                 return await message.channel.send(S.ui_info(
                     "usage: trigger message/reaction/voice/member add/remove/list"))
             kind = args[1].lower(); action = args[2].lower()
-            if kind == "message":
-                await self._message_trigger(message, action, args)
-            elif kind == "reaction":
-                await self._reaction_trigger(message, action, args)
-            elif kind == "voice":
-                await self._voice_trigger(message, action, args)
-            elif kind == "member":
-                await self._member_trigger(message, action, args)
-            else:
-                await message.channel.send(S.ui_info("kind: message/reaction/voice/member"))
+            if kind == "message": await self._message_trigger(message, action, args)
+            elif kind == "reaction": await self._reaction_trigger(message, action, args)
+            elif kind == "voice": await self._voice_trigger(message, action, args)
+            elif kind == "member": await self._member_trigger(message, action, args)
+            else: await message.channel.send(S.ui_info("kind: message/reaction/voice/member"))
 
         elif cmd == "triggers":
             sub = args[1].lower() if len(args) > 1 else ""
@@ -166,8 +151,7 @@ class TriggersCog:
             await message.channel.send(S.ui_ok(f"message trigger `{name}` added"))
         elif action == "remove" and len(args) >= 4:
             name = args[3]
-            S._triggers["message"] = [t for t in S._triggers["message"]
-                                       if t.get("name") != name]
+            S._triggers["message"] = [t for t in S._triggers["message"] if t.get("name") != name]
             triggers_save()
             await message.channel.send(S.ui_ok("removed"))
         elif action == "list":
@@ -177,8 +161,7 @@ class TriggersCog:
             await message.channel.send(S._paginate("message triggers", "", rows)
                                         if rows else S.ui_info("none"))
         else:
-            await message.channel.send(S.ui_info(
-                "usage: trigger message add/remove/list"))
+            await message.channel.send(S.ui_info("usage: trigger message add/remove/list"))
 
     async def _reaction_trigger(self, message, action, args):
         if action == "add" and len(args) >= 6:
@@ -197,8 +180,7 @@ class TriggersCog:
             await message.channel.send(S.ui_ok(f"reaction trigger `{name}` added"))
         elif action == "remove" and len(args) >= 4:
             name = args[3]
-            S._triggers["reaction"] = [t for t in S._triggers["reaction"]
-                                        if t.get("name") != name]
+            S._triggers["reaction"] = [t for t in S._triggers["reaction"] if t.get("name") != name]
             triggers_save()
             await message.channel.send(S.ui_ok("removed"))
         elif action == "list":
@@ -208,20 +190,17 @@ class TriggersCog:
             await message.channel.send(S._paginate("reaction triggers", "", rows)
                                         if rows else S.ui_info("none"))
         else:
-            await message.channel.send(S.ui_info(
-                "usage: trigger reaction add/remove/list"))
+            await message.channel.send(S.ui_info("usage: trigger reaction add/remove/list"))
 
     async def _voice_trigger(self, message, action, args):
         if action == "add" and len(args) >= 6:
             name = args[3]; event = args[4]; ch_id = args[5]
-            S._triggers["voice"].append({"name": name, "event": event,
-                                          "channel_id": ch_id})
+            S._triggers["voice"].append({"name": name, "event": event, "channel_id": ch_id})
             triggers_save()
             await message.channel.send(S.ui_ok(f"voice trigger `{name}` added"))
         elif action == "remove" and len(args) >= 4:
             name = args[3]
-            S._triggers["voice"] = [t for t in S._triggers["voice"]
-                                     if t.get("name") != name]
+            S._triggers["voice"] = [t for t in S._triggers["voice"] if t.get("name") != name]
             triggers_save()
             await message.channel.send(S.ui_ok("removed"))
         elif action == "list":
@@ -231,8 +210,7 @@ class TriggersCog:
             await message.channel.send(S._paginate("voice triggers", "", rows)
                                         if rows else S.ui_info("none"))
         else:
-            await message.channel.send(S.ui_info(
-                "usage: trigger voice add/remove/list"))
+            await message.channel.send(S.ui_info("usage: trigger voice add/remove/list"))
 
     async def _member_trigger(self, message, action, args):
         if action == "add" and len(args) >= 5:
@@ -242,8 +220,7 @@ class TriggersCog:
             await message.channel.send(S.ui_ok(f"member trigger `{name}` added"))
         elif action == "remove" and len(args) >= 4:
             name = args[3]
-            S._triggers["member"] = [t for t in S._triggers["member"]
-                                      if t.get("name") != name]
+            S._triggers["member"] = [t for t in S._triggers["member"] if t.get("name") != name]
             triggers_save()
             await message.channel.send(S.ui_ok("removed"))
         elif action == "list":
@@ -252,5 +229,4 @@ class TriggersCog:
             await message.channel.send(S._paginate("member triggers", "", rows)
                                         if rows else S.ui_info("none"))
         else:
-            await message.channel.send(S.ui_info(
-                "usage: trigger member add/remove/list"))
+            await message.channel.send(S.ui_info("usage: trigger member add/remove/list"))

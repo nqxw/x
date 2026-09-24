@@ -1,7 +1,7 @@
 # cogs/server.py | serverinfo, members, channels, roles, ban/kick/mute, setnick, topic, slowmode, icon/banner/name
 import aiohttp
 from datetime import timedelta
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -24,8 +24,6 @@ class ServerCog:
                 f"  {S.DIM}members{S.RESET}     {g.member_count}",
                 f"  {S.DIM}channels{S.RESET}    {len(g.channels)}",
                 f"  {S.DIM}roles{S.RESET}       {len(g.roles)}",
-                f"  {S.DIM}created{S.RESET}     {g.created_at.strftime('%Y-%m-%d')}",
-                f"  {S.DIM}boost level{S.RESET} {g.premium_tier}",
             ]))
 
         elif cmd == "members":
@@ -59,16 +57,14 @@ class ServerCog:
                 return await message.edit(content=S.ui_err(f"usage: {cmd} <user_id>"))
             try:
                 member = g.get_member(int(args[1]))
-                if cmd == "ban":
-                    await g.ban(member, reason=" ".join(args[2:]) or "no reason")
-                elif cmd == "kick":
-                    await g.kick(member, reason=" ".join(args[2:]) or "no reason")
+                if cmd == "ban": await g.ban(int(args[1]))
+                elif cmd == "kick": await g.kick(int(args[1]))
                 elif cmd == "mute":
                     until = discord.utils.utcnow() + timedelta(minutes=10)
                     await member.timeout(until)
                 elif cmd == "unmute":
                     await member.timeout(None)
-                await message.edit(content=S.ui_ok(f"{cmd} → {member}"))
+                await message.edit(content=S.ui_ok(f"{cmd} → {args[1]}"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 
@@ -106,8 +102,7 @@ class ServerCog:
                 return await message.edit(content=S.ui_err("usage: servericon <url>"))
             try:
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(args[1]) as r:
-                        img = await r.read()
+                    async with s.get(args[1]) as r: img = await r.read()
                 await message.guild.edit(icon=img)
                 await message.edit(content=S.ui_ok("icon set"))
             except Exception as e:
@@ -118,8 +113,7 @@ class ServerCog:
                 return await message.edit(content=S.ui_err("usage: serverbanner <url>"))
             try:
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(args[1]) as r:
-                        img = await r.read()
+                    async with s.get(args[1]) as r: img = await r.read()
                 await message.guild.edit(banner=img)
                 await message.edit(content=S.ui_ok("banner set"))
             except Exception as e:

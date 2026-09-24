@@ -6,7 +6,7 @@ import os
 import time
 import traceback
 import aiohttp
-import discord
+import modifyself_shim as discord   # ← CHANGED
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -204,24 +204,18 @@ class QuestService:
         if not quest.is_enrolled(): await self.enroll(session, quest)
         if not quest.is_supported(): return "unsupported"
         task = quest.selected_task
-
-        # ── achievements ──
         if task in ACHIEVEMENT_TASKS:
             return await self._achievements(session, quest)
-
         if task in VIDEO_TASKS:
             return await self._video(session, quest)
-
         if task in HEARTBEAT_TASKS:
             payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
             if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
             if task == "PLAY_ACTIVITY":
                 payloads.insert(0, {"stream_key": f"call:{self.uid or quest.id}:1", "terminal": False})
             return await self._heartbeat(session, quest, payloads)
-
         if task in MISSION_TASKS or task not in (*VIDEO_TASKS, *HEARTBEAT_TASKS, *ACHIEVEMENT_TASKS):
             return await self._mission(session, quest)
-
         payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
         if quest.app_id: payloads.append({"application_id": quest.app_id, "terminal": False})
         return await self._heartbeat(session, quest, payloads)
@@ -245,26 +239,14 @@ class QuestService:
         return "completed" if quest.is_completed() or quest.progress_value() >= quest.target else "recovering"
 
     async def _achievements(self, session, quest):
-        """Achievement-type quest handler.
-        Flow:
-          1. heartbeat loop with activity payloads until we hit 60 attempts or
-             the quest completes
-          2. if not complete, force /quests/{id}/progress
-          3. if 403/404, try /activities/achievement/{quest_id}/progress
-          4. fall back to /external-task-progress
-          5. terminal heartbeat
-        """
         task = quest.selected_task
         target = quest.target or 1.0
-
-        # ── stage 1: heartbeat loop (60 attempts max) ──
         payloads = []
         if quest.app_id:
             payloads.append({"application_id": quest.app_id, "terminal": False})
         payloads.append({"stream_key": f"call:{quest.id}:1", "terminal": False})
         if self.uid:
             payloads.append({"stream_key": f"call:{self.uid}:1", "terminal": False})
-
         interval = 5
         attempts = 0
         max_attempts = 60
@@ -286,54 +268,39 @@ class QuestService:
             if quest.is_completed() or quest.progress_value() >= quest.target:
                 break
             await asyncio.sleep(interval)
-
         if quest.is_completed():
             return "completed"
-
-        # ── stage 2: force /progress ──
         try:
             d = await _api(session, "POST",
                 f"https://discord.com/api/v9/quests/{quest.id}/progress",
                 headers=self.headers,
                 json_body={"task_id": task, "progress": {"value": target}},
                 retries=1)
-            if d:
-                quest.data["user_status"] = d
-            if quest.is_completed():
-                return "completed"
+            if d: quest.data["user_status"] = d
+            if quest.is_completed(): return "completed"
         except APIError as e:
             print(f"[achievements] /progress force failed: {e.status}")
-
-        # ── stage 3: /activities/achievement/{id}/progress ──
         try:
             d = await _api(session, "POST",
                 f"https://discord.com/api/v9/activities/achievement/{quest.id}/progress",
                 headers=self.headers,
                 json_body={"task_id": task, "progress": {"value": target}},
                 retries=1)
-            if d:
-                quest.data["user_status"] = d
-            if quest.is_completed():
-                return "completed"
+            if d: quest.data["user_status"] = d
+            if quest.is_completed(): return "completed"
         except APIError as e:
             if e.status != 404:
                 print(f"[achievements] /activities/achievement failed: {e.status}")
-
-        # ── stage 4: external-task-progress override ──
         try:
             d = await _api(session, "POST",
                 f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
                 headers=self.headers,
                 json_body={"task_id": task, "progress": {"value": target}},
                 retries=2)
-            if d:
-                quest.data["user_status"] = d
-            if quest.is_completed():
-                return "completed"
+            if d: quest.data["user_status"] = d
+            if quest.is_completed(): return "completed"
         except APIError as e:
             print(f"[achievements] external-task-progress failed: {e.status}")
-
-        # ── stage 5: terminal heartbeat ──
         if active:
             try:
                 terminal = dict(active); terminal["terminal"] = True
@@ -342,7 +309,6 @@ class QuestService:
                     headers=self.headers, json_body=terminal, retries=1)
             except Exception:
                 pass
-
         if quest.is_completed():
             return "completed"
         print(f"[achievements] quest may not have completed cleanly: {quest.name}")
@@ -632,15 +598,12 @@ class QuestsCog:
             q = quests[idx]
 
             def _dump(obj, label, max_len=1900):
-                try:
-                    text = json.dumps(obj, indent=2)
-                except Exception:
-                    text = str(obj)
+                try: text = json.dumps(obj, indent=2)
+                except Exception: text = str(obj)
                 if len(text) > max_len:
                     text = text[:max_len - 20] + "\n... (truncated)"
                 return f"**{label}**\n```json\n{text}\n```"
 
-            # 1. task summary
             task_names = list(q.tasks.keys())
             info_lines = [
                 f"  name:          {q.name}",
@@ -655,17 +618,11 @@ class QuestsCog:
             ]
             await message.channel.send(S.ui_box("quest info", info_lines))
 
-            # 2. task_config block for the selected task
             ach_block = q.tasks.get(q.selected_task) or {}
             if ach_block:
                 await message.channel.send(_dump(ach_block, f"task_config: {q.selected_task}"))
-
-            # 3. all task configs (in case the interesting one isn't selected)
-            all_tasks = q.tasks
-            if all_tasks:
-                await message.channel.send(_dump(all_tasks, "all task configs"))
-
-            # 4. user_status
+            if q.tasks:
+                await message.channel.send(_dump(q.tasks, "all task configs"))
             if q.user_status:
                 await message.channel.send(_dump(q.user_status, "user_status"))
             else:

@@ -1,5 +1,5 @@
 # cogs/interactions.py | buttons, modals, verify button handler, pending queue
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -10,22 +10,11 @@ class InteractionsCog:
         @client.event
         async def on_interaction(interaction):
             try:
-                tname = getattr(interaction.type, "name", str(interaction.type))
-                if tname == "component" and S._buttons_enabled:
-                    cid = interaction.data.get("custom_id", "") if interaction.data else ""
-                    if cid.startswith("verify_") and S._verify_cfg["role_id"]:
-                        member = interaction.user
-                        guild = interaction.guild
-                        role = (guild.get_role(int(S._verify_cfg["role_id"]))
-                                if guild else None)
-                        if role and member:
-                            try: await member.add_roles(role)
-                            except Exception: pass
-                            try:
-                                await interaction.response.send_message(
-                                    "verified.", ephemeral=True)
-                            except Exception: pass
-                elif tname == "modal_submit" and S._modals_enabled:
+                data = interaction.data or {}
+                cid = data.get("custom_id", "") if isinstance(data, dict) else ""
+                if cid.startswith("verify_") and S._verify_cfg["role_id"]:
+                    # interaction handling is not fully exposed by modifyself;
+                    # store for later if a payload flow exists
                     S._pending_interactions.append(interaction)
             except Exception as e:
                 print(f"[interaction] {e}")

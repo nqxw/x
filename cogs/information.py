@@ -1,5 +1,6 @@
 # cogs/information.py | userinfo, avatar, whois, checkname, channelinfo, roleinfo
 import aiohttp
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -110,14 +111,13 @@ class InformationCog:
         elif cmd == "roleinfo":
             if not message.guild or len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: roleinfo <role_id>"))
-            role = message.guild.get_role(int(args[1]))
+            role = next((r for r in message.guild.roles if r.id == int(args[1])), None)
             if not role:
                 return await message.edit(content=S.ui_err("not found"))
             await message.edit(content=S.ui_box("role info", [
                 f"  {S.DIM}name{S.RESET}        {role.name}",
                 f"  {S.DIM}id{S.RESET}          {role.id}",
                 f"  {S.DIM}color{S.RESET}       #{role.color.value:06x}",
-                f"  {S.DIM}members{S.RESET}     {len(role.members)}",
                 f"  {S.DIM}position{S.RESET}    {role.position}",
                 f"  {S.DIM}mentionable{S.RESET} {'yes' if role.mentionable else 'no'}",
                 f"  {S.DIM}hoisted{S.RESET}     {'yes' if role.hoist else 'no'}",

@@ -2,6 +2,7 @@
 import re
 import aiohttp
 from datetime import datetime
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -15,19 +16,15 @@ class StatusCog:
                 "statushistory", "speaklanguage", "speaklanguagestop"}
 
     async def handle(self, message, cmd, args):
-        if cmd in ("setstatus", "customstatus"):
-            await self._setstatus(message, args)
-        elif cmd == "clearstatus":
-            await self._clearstatus(message)
-        elif cmd in ("stealstatus", "copystatus"):
-            await self._stealstatus(message, args)
-        elif cmd == "statushistory":
-            await self._history(message)
+        if cmd in ("setstatus", "customstatus"): await self._setstatus(message, args)
+        elif cmd == "clearstatus": await self._clearstatus(message)
+        elif cmd in ("stealstatus", "copystatus"): await self._stealstatus(message, args)
+        elif cmd == "statushistory": await self._history(message)
         elif cmd == "speaklanguage":
             if len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: speaklanguage <lang>"))
             S._speak_lang = args[1]
-            await message.edit(content=S.ui_ok(f"auto → {S._speak_lang}"))
+            await message.edit(content=S.ui_ok(f"auto  {S._speak_lang}"))
         elif cmd == "speaklanguagestop":
             S._speak_lang = None
             await message.edit(content=S.ui_ok("stopped"))
@@ -39,10 +36,6 @@ class StatusCog:
                 f"  {S.PREFIX}setstatus <text>",
                 f"  {S.PREFIX}setstatus <emoji>, <text>",
                 f"  {S.PREFIX}setstatus <:name:id>, <text>",
-                "", f"  {S.DIM}examples:{S.RESET}",
-                f"  {S.PREFIX}setstatus Gaming now",
-                f"  {S.PREFIX}setstatus 🎮, Gaming now",
-                f"  {S.PREFIX}setstatus <:pepe:123456789>, vibing",
             ]))
         full_text = " ".join(args[1:])
         emoji_name = None; emoji_id = None
@@ -78,7 +71,7 @@ class StatusCog:
                         await message.edit(content=S.ui_ok(f"status set: {emoji_name or ''} {text}".strip()))
                     elif r.status == 429:
                         retry = (await r.json()).get("retry_after", 1)
-                        await message.edit(content=S.ui_warn(f"rate limited — retry in {retry}s"))
+                        await message.edit(content=S.ui_warn(f"rate limited � retry in {retry}s"))
                     else:
                         await message.edit(content=S.ui_err(f"failed {r.status}"))
         except Exception as e:

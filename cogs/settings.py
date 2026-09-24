@@ -1,9 +1,8 @@
-# cogs/settings.py | prefix, aliases, cooldowns, profiles, config import/export,
-#                    encrypt, enable/disable, version, reload, serverprefix
+# cogs/settings.py | prefix, aliases, cooldowns, profiles, config import/export, encrypt, enable/disable
 import os
 import json
 import time
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -13,34 +12,22 @@ class SettingsCog:
                 "enable", "disable", "disabled"}
 
     async def handle(self, message, cmd, args):
-        if cmd == "prefix":
-            await self._prefix(message, args)
-        elif cmd == "version":
-            await message.edit(content=S.ui_info(f"sy's selfbot v{S.VERSION}"))
-        elif cmd == "reload":
-            await message.edit(content=S.ui_ok("config reloaded"))
-        elif cmd == "serverprefix":
-            await self._serverprefix(message, args)
-        elif cmd == "serverprefixclear":
-            await self._serverprefixclear(message)
-        elif cmd == "alias":
-            await self._alias(message, args)
-        elif cmd == "cooldown":
-            await self._cooldown(message, args)
-        elif cmd == "profile":
-            await self._profile(message, args)
-        elif cmd == "config":
-            await self._config(message, args)
-        elif cmd == "encrypt":
-            await self._encrypt(message, args)
+        if cmd == "prefix": await self._prefix(message, args)
+        elif cmd == "version": await message.edit(content=S.ui_info(f"lunar v{S.VERSION}"))
+        elif cmd == "reload": await message.edit(content=S.ui_ok("config reloaded"))
+        elif cmd == "serverprefix": await self._serverprefix(message, args)
+        elif cmd == "serverprefixclear": await self._serverprefixclear(message)
+        elif cmd == "alias": await self._alias(message, args)
+        elif cmd == "cooldown": await self._cooldown(message, args)
+        elif cmd == "profile": await self._profile(message, args)
+        elif cmd == "config": await self._config(message, args)
+        elif cmd == "encrypt": await self._encrypt(message, args)
         elif cmd == "enable":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: enable <cmd>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: enable <cmd>"))
             S._cmd_disabled.discard(args[1].lower())
             await message.edit(content=S.ui_ok(f"enabled `{args[1]}`"))
         elif cmd == "disable":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: disable <cmd>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: disable <cmd>"))
             S._cmd_disabled.add(args[1].lower())
             await message.edit(content=S.ui_ok(f"disabled `{args[1]}`"))
         elif cmd == "disabled":
@@ -48,22 +35,15 @@ class SettingsCog:
             await message.edit(content=S._paginate("disabled commands", "", rows)
                                         if rows else S.ui_info("none"))
 
-    # ── prefix ──
     async def _prefix(self, message, args):
-        if len(args) < 2:
-            return await message.edit(content=S.ui_info(f"current prefix: {S.PREFIX}"))
+        if len(args) < 2: return await message.edit(content=S.ui_info(f"current prefix: {S.PREFIX}"))
         S.PREFIX = args[1]
-        cfg = S.load_config() or {}
-        cfg["prefix"] = S.PREFIX
-        S.save_config(cfg)
-        # also update the module-level PREFIX in selfbot.py so the dispatcher sees it
+        cfg = S.load_config() or {}; cfg["prefix"] = S.PREFIX; S.save_config(cfg)
         import sys
         main = sys.modules.get("__main__")
-        if main and hasattr(main, "PREFIX"):
-            main.PREFIX = S.PREFIX
+        if main and hasattr(main, "PREFIX"): main.PREFIX = S.PREFIX
         await message.edit(content=S.ui_ok(f"prefix changed to `{S.PREFIX}`"))
 
-    # ── serverprefix ──
     async def _serverprefix(self, message, args):
         try: await message.delete()
         except Exception: pass
@@ -85,12 +65,10 @@ class SettingsCog:
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
         S._server_prefixes.pop(str(message.guild.id), None)
         cfg = S.load_config() or {}
-        if "server_prefixes" in cfg:
-            cfg["server_prefixes"].pop(str(message.guild.id), None)
+        if "server_prefixes" in cfg: cfg["server_prefixes"].pop(str(message.guild.id), None)
         S.save_config(cfg)
         await message.channel.send(S.ui_ok("cleared"))
 
-    # ── alias ──
     async def _alias(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "add" and len(args) >= 4:
@@ -106,7 +84,6 @@ class SettingsCog:
         else:
             await message.edit(content=S.ui_info("usage: alias add/remove/list"))
 
-    # ── cooldown ──
     async def _cooldown(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "set" and len(args) >= 4 and args[3].isdigit():
@@ -122,7 +99,6 @@ class SettingsCog:
         else:
             await message.edit(content=S.ui_info("usage: cooldown set/clear/list"))
 
-    # ── profile ──
     async def _profile(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "save" and len(args) >= 3:
@@ -133,8 +109,7 @@ class SettingsCog:
         elif sub == "load" and len(args) >= 3:
             p = f"database/profiles/{args[2]}.json"
             if os.path.exists(p):
-                with open(p) as f:
-                    S.save_config(json.load(f))
+                with open(p) as f: S.save_config(json.load(f))
                 await message.edit(content=S.ui_ok("loaded (restart to fully apply)"))
             else:
                 await message.edit(content=S.ui_err("not found"))
@@ -155,22 +130,18 @@ class SettingsCog:
         else:
             await message.edit(content=S.ui_info("usage: profile save/load/list/delete"))
 
-    # ── config export / import ──
     async def _config(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "export":
             p = f"exports/config_{int(time.time())}.json"
-            with open(p, "w") as f:
-                json.dump(S.load_config() or {}, f, indent=2)
+            with open(p, "w") as f: json.dump(S.load_config() or {}, f, indent=2)
             await message.edit(content=S.ui_ok(f"→ {p}"))
         elif sub == "import" and len(args) >= 3 and os.path.exists(args[2]):
-            with open(args[2]) as f:
-                S.save_config(json.load(f))
+            with open(args[2]) as f: S.save_config(json.load(f))
             await message.edit(content=S.ui_ok("imported"))
         else:
             await message.edit(content=S.ui_info("usage: config export | import <path>"))
 
-    # ── encrypt on/off ──
     async def _encrypt(self, message, args):
         if not S._has_crypto:
             return await message.edit(content=S.ui_err("cryptography not installed"))

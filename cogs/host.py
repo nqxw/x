@@ -3,21 +3,21 @@ import asyncio
 import time
 import traceback
 import aiohttp
-import discord
+import modifyself_shim as discord
 
 from . import state as S
 
 
 async def _run_hosted_client(hc, tok):
     try:
-        await hc.start(tok)
+        await hc.start()
     except Exception as e:
         print(f"[hosted:{getattr(hc, '_bot_index', '?')}] CONNECT ERROR: {type(e).__name__}: {e}")
 
 
 async def _spawn_one_hosted(token: str, prefix: str):
     try:
-        hc = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
+        hc = discord.Client(token=token)
         hc._host_prefix = prefix
 
         @hc.event
@@ -26,7 +26,6 @@ async def _spawn_one_hosted(token: str, prefix: str):
 
         @hc.event
         async def _hc_on_message(_m, _hc=hc):
-            # dispatch hook is set by selfbot.py on the global dispatcher
             if S.HOSTED_DISPATCH is not None:
                 try: await S.HOSTED_DISPATCH(_hc, _m)
                 except Exception as e:
@@ -55,7 +54,6 @@ class HostCog:
         elif cmd == "host":
             await self._host(message, args)
 
-    # ── ADMIN ──
     async def _admin(self, message, args):
         try: await message.delete()
         except Exception: pass
@@ -112,7 +110,6 @@ class HostCog:
                 S.ui_box("admins", rows) if rows else S.ui_info("no admins configured"),
                 delete_after=15)
 
-    # ── HOST ──
     async def _host(self, message, args):
         try: await message.delete()
         except Exception: pass

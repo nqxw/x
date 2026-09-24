@@ -1,7 +1,7 @@
 # cogs/social.py | friends, blocks, pending, DMs, autoaddback
 import asyncio
 import aiohttp
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 

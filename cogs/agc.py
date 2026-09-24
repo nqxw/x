@@ -4,7 +4,7 @@ import base64
 import json
 import os
 import aiohttp
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -17,7 +17,6 @@ class AgcCog:
     COMMANDS = {"agc"}
 
     def register(self, client):
-        """Hook on_group_channel_create."""
         cog = self
 
         @client.event

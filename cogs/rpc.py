@@ -1,5 +1,5 @@
 # cogs/rpc.py
-import discord
+import modifyself_shim as discord   # ← CHANGED (was: import discord)
 import asyncio
 import time
 import re
@@ -8,12 +8,6 @@ import io
 import aiohttp
 import hashlib
 from pathlib import Path
-from discord.ext import commands
-
-try:
-    from cogs import state as cstate
-except Exception:
-    cstate = None
 
 try:
     from utils.ascii_helper import AsciiHelper
@@ -29,7 +23,6 @@ except Exception as e:
 
 
 DEFAULT_APP_ID = 1453358037506199743
-ROBLOX_APP_ID = 1552026905023356938
 PURPLESTREAM_URL = "https://www.twitch.tv/hadeontop"
 ICON_PLACEHOLDER = "https://cdn.pfps.gg/pfps/20715-237182-lonely-girl-animated.gif"
 
@@ -61,7 +54,7 @@ PLATFORM_PRESET_MAP = {
     "quest": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "meta": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
     "oculus": {"application_id": 1498387526501535835, "platform": "meta_quest", "asset": "vrchat"},
-    "roblox": {"application_id": ROBLOX_APP_ID, "platform": None, "asset": "roblox"},
+    "roblox": {"application_id": 1552026905023356938, "platform": None, "asset": "roblox"},
 }
 
 INLINE_KEYS = ["name", "details", "state", "type", "timestamp", "platform",
@@ -82,8 +75,7 @@ SPOTIFY_FIELDS_TO_KEEP = {
 }
 
 
-class RPCCog(commands.Cog, name="Rich Presence"):
-
+class RPCCog:
     COMMANDS = {
         "rpc1", "rpc2", "rpc3", "rpc4", "rpc5", "rpc6",
         "roblox", "spotify", "youtube", "xbox", "ps", "ps4",
@@ -95,11 +87,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
     }
 
     def __init__(self, bot=None):
-        if bot is None and cstate is not None:
-            bot = getattr(cstate, "CLIENT", None) or getattr(cstate, "MAIN_CLIENT", None)
-        if bot is None:
-            raise RuntimeError("RPCCog: no client available — pass bot or set cstate.CLIENT before init")
-
         self.bot = bot
         self.rpc_slots = [None] * 6
         self._slot_platform_preset = [None] * 6
@@ -111,18 +98,8 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         self._emoji_rotation_task = None
         self.current_status = ""
         self.current_emoji = ""
-        self._interceptor_active = False
-        self._interceptor_ws = None
-        self._original_ws_send = None
         self._clearing = False
-        self._bg_tasks = []
-        self._deferred_started = False
-        try:
-            self.bot.loop.create_task(self._deferred_start())
-        except Exception:
-            asyncio.ensure_future(self._deferred_start())
-
-    # ── dispatcher entry point ──
+        self._save_tasks = []
 
     async def handle(self, message, cmd, args):
         try:
@@ -165,10 +142,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 self._clearing = True
                 try:
                     self.rpc_slots = [None] * 6
-                    if self.bot.ws:
-                        await self.bot.ws.send(json.dumps({
+                    try:
+                        await self.bot.ws.send_json({
                             "op": 3, "d": {"since": 0, "activities": [],
-                                            "status": "online", "afk": False}}))
+                                            "status": "online", "afk": False}})
+                    except Exception:
+                        pass
                     self._save_rpc_slots()
                 finally:
                     self._clearing = False
@@ -257,8 +236,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 await message.channel.send(ascii.error(f"`{cmd}` errored — check console"))
             except Exception:
                 pass
-
-    # ── slot subcommand dispatch ──
 
     async def _handle_slot(self, message, slot, rest):
         ch = message.channel
@@ -408,8 +385,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             self.rpc_slots[slot] = None
             await self.apply_activities(); await ch.send(ascii.info(f"{label} cleared"))
 
-    # ── quick commands ──
-
     async def _handle_quick(self, message, cmd, rest):
         ch = message.channel
         words = list(rest)
@@ -468,113 +443,18 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         shown = parts[0] if parts else "ok"
         await ch.send(ascii.success(f"{cmd} → slot {slot+1}: {shown}"))
 
-    # ── lifecycle ──
-
-    async def _deferred_start(self):
-        if self._deferred_started:
+    async def apply_activities(self):
+        active = [a for a in self.rpc_slots if a is not None]
+        if not active:
             return
-        self._deferred_started = True
         try:
-            await self.bot.wait_until_ready()
-        except Exception:
-            pass
-        self._load_rpc_slots()
-        self._load_asset_urls()
-        try:
-            await self._refresh_all_assets()
-            await self._start_presence_interceptor()
+            payload = {"op": 3, "d": {
+                "since": 0, "activities": active,
+                "status": "online", "afk": False}}
+            await self.bot.ws.send_json(payload)
+            self._save_rpc_slots()
         except Exception as e:
-            print(f"[RPC] deferred start error: {e}")
-        if any(a is not None for a in self.rpc_slots):
-            try:
-                await self._push()
-                print("[RPC] Restored RPC slots on startup")
-            except Exception as e:
-                print(f"[RPC] restore push failed: {e}")
-        self._bg_tasks.append(asyncio.create_task(self.auto_refresh_presence()))
-        self._bg_tasks.append(asyncio.create_task(self.auto_refresh_cdn_assets()))
-
-    async def cog_unload(self):
-        await self._stop_presence_interceptor()
-        self.status_rotation_active = False
-        self.emoji_rotation_active = False
-        for t in (self._status_rotation_task, self._emoji_rotation_task):
-            if t and not t.done():
-                t.cancel()
-        for t in self._bg_tasks:
-            if not t.done():
-                t.cancel()
-        self._bg_tasks.clear()
-
-    # ── presence interceptor ──
-
-    async def _start_presence_interceptor(self):
-        if self._interceptor_active and self.bot.ws is self._interceptor_ws:
-            return
-
-        for _ in range(30):
-            if self.bot.ws and hasattr(self.bot.ws, 'send'):
-                break
-            await asyncio.sleep(0.5)
-        if not self.bot.ws:
-            print("[RPC] Could not attach interceptor - no websocket")
-            return
-
-        self._interceptor_ws = self.bot.ws
-        self._original_ws_send = self.bot.ws.send
-        original = self._original_ws_send
-        rpc_cog = self
-
-        async def patched_send(data, *args, **kwargs):
-            if isinstance(data, str) and '"op":3' in data:
-                try:
-                    payload = json.loads(data)
-                    d = payload.get("d", {})
-                    activities = d.get("activities", [])
-                    if not activities and any(s is not None for s in rpc_cog.rpc_slots):
-                        active = [s for s in rpc_cog.rpc_slots if s is not None]
-                        if active and not rpc_cog._clearing:
-                            d["activities"] = active
-                            payload["d"] = d
-                            data = json.dumps(payload)
-                except Exception:
-                    pass
-            return await original(data, *args, **kwargs)
-
-        try:
-            self.bot.ws.send = patched_send
-        except Exception as e:
-            print(f"[RPC] failed to patch ws.send: {e}")
-            return
-
-        self._interceptor_active = True
-        print("[RPC] Presence interceptor active")
-
-    async def _stop_presence_interceptor(self):
-        if not self._interceptor_active:
-            return
-        try:
-            if self.bot.ws is self._interceptor_ws and self._original_ws_send is not None:
-                self.bot.ws.send = self._original_ws_send
-        except Exception:
-            pass
-        self._interceptor_active = False
-        self._interceptor_ws = None
-        self._original_ws_send = None
-        print("[RPC] Presence interceptor removed")
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        try:
-            if self.bot.ws is not self._interceptor_ws:
-                self._interceptor_active = False
-            await self._start_presence_interceptor()
-            if any(a is not None for a in self.rpc_slots):
-                await self._push()
-        except Exception as e:
-            print(f"[RPC] on_ready re-attach failed: {e}")
-
-    # ── persistence ──
+            print(f"[RPC] push failed: {e}")
 
     def _get_user_file(self, filename):
         if not self.bot.user:
@@ -646,8 +526,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 "assets": {}, "instance": True
             }
 
-    # ── CDN asset refresh ──
-
     async def _refresh_cdn_url(self, url: str) -> str:
         if not url or not url.startswith("mp:"):
             return url
@@ -678,52 +556,9 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                     if assets.get("small_image", "").startswith("mp:"):
                         assets["small_image"] = await self._refresh_cdn_url(assets["small_image"])
             if any(a is not None for a in self.rpc_slots):
-                await self._push()
+                await self.apply_activities()
         except Exception as e:
             print(f"[RPC] refresh_all_assets error: {e}")
-
-    async def auto_refresh_cdn_assets(self):
-        try:
-            await self.bot.wait_until_ready()
-        except Exception:
-            pass
-        while not self.bot.is_closed():
-            await asyncio.sleep(1500)
-            await self._refresh_all_assets()
-
-    # ── presence push ──
-
-    async def _push(self):
-        active = [a for a in self.rpc_slots if a is not None]
-        if not active:
-            return
-        if not self.bot.ws:
-            print("[RPC] push skipped — no websocket")
-            return
-        current_status = str(self.bot.status) if hasattr(self.bot, 'status') else "online"
-        payload = {"op": 3, "d": {"since": 0, "activities": active,
-                                   "status": current_status, "afk": False}}
-        try:
-            await self.bot.ws.send(json.dumps(payload))
-            self._save_rpc_slots()
-        except Exception as e:
-            print(f"[RPC] push failed: {e}")
-
-    async def auto_refresh_presence(self):
-        try:
-            await self.bot.wait_until_ready()
-        except Exception:
-            pass
-        while not self.bot.is_closed():
-            await asyncio.sleep(1800)
-            if any(a is not None for a in self.rpc_slots):
-                await self._push()
-
-    async def apply_activities(self):
-        if any(a is not None for a in self.rpc_slots):
-            await self._push()
-
-    # ── parsing helpers ──
 
     def _parse_timestamp_value(self, value: str) -> float:
         value = value.strip()
@@ -890,22 +725,22 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 file=discord.File(io.BytesIO(image_bytes), filename=name))
 
             if message.attachments:
-                new_url = message.attachments[0].url
-                new_match = re.search(discord_cdn_pattern, new_url)
-                if new_match:
-                    cid, aid, fname = new_match.groups()
-                    key = f"mp:attachments/{cid}/{aid}/{fname}"
-                    self._asset_cache[image_url] = key
-                    self._asset_urls[key] = image_url
-                    self._save_asset_urls()
-                    return key
+                att = message.attachments[0]
+                new_url = att.get("url") if isinstance(att, dict) else getattr(att, "url", None)
+                if new_url:
+                    new_match = re.search(discord_cdn_pattern, new_url)
+                    if new_match:
+                        cid, aid, fname = new_match.groups()
+                        key = f"mp:attachments/{cid}/{aid}/{fname}"
+                        self._asset_cache[image_url] = key
+                        self._asset_urls[key] = image_url
+                        self._save_asset_urls()
+                        return key
         except Exception as e:
             import traceback
             print(f"[RPC] upload_asset failed: {type(e).__name__}: {e}")
             traceback.print_exc()
         return None
-
-    # ── presence builders ──
 
     async def build_spotify(self, parts: list):
         if len(parts) < 2:
@@ -1015,13 +850,12 @@ class RPCCog(commands.Cog, name="Rich Presence"):
         }
 
     async def build_roblox(self, parts: list):
-        """Roblox presence — game name, optional details/state, elapsed timer."""
         game = (parts[0] if parts else "Roblox")[:128]
         now = int(time.time() * 1000)
         activity = {
             "type": 0,
             "name": "Roblox",
-            "application_id": str(ROBLOX_APP_ID),
+            "application_id": "1552026905023356938",
             "details": game,
             "timestamps": {"start": now},
             "assets": {"large_image": "roblox", "large_text": game[:128]},
@@ -1034,8 +868,6 @@ class RPCCog(commands.Cog, name="Rich Presence"):
             activity["assets"]["small_text"] = parts[2][:128]
         return activity
 
-    # ── status rotation helper ──
-
     async def _patch_custom_status(self):
         json_data = {'custom_status': {'text': self.current_status,
                                         'emoji_name': self.current_emoji}}
@@ -1045,7 +877,3 @@ class RPCCog(commands.Cog, name="Rich Presence"):
                 headers={'Authorization': self.bot.http.token,
                          'Content-Type': 'application/json'},
                 json=json_data)
-
-
-async def setup(bot):
-    await bot.add_cog(RPCCog(bot))

@@ -1,6 +1,7 @@
 # cogs/utility.py | text transforms, AFK, translate, typing, ghostping, pins, autodelete, firstmessage
 import asyncio
 import random
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -58,38 +59,31 @@ class UtilityCog:
         client = S.CLIENT
 
         if cmd == "uwuify":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: uwuify <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: uwuify <text>"))
             await message.edit(content=_uwuify(" ".join(args[1:])))
 
         elif cmd == "owoify":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: owoify <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: owoify <text>"))
             await message.edit(content=_owoify(" ".join(args[1:])))
 
         elif cmd == "mock":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: mock <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: mock <text>"))
             await message.edit(content=_mock(" ".join(args[1:])))
 
         elif cmd == "reverse":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: reverse <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: reverse <text>"))
             await message.edit(content=" ".join(args[1:])[::-1])
 
         elif cmd == "aesthetic":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: aesthetic <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: aesthetic <text>"))
             await message.edit(content=_aesthetic(" ".join(args[1:])))
 
         elif cmd == "clap":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: clap <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: clap <text>"))
             await message.edit(content=_clap(" ".join(args[1:])))
 
         elif cmd == "animatetype":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: animatetype <text>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: animatetype <text>"))
             text = " ".join(args[1:]); built = ""
             for ch in text:
                 built += ch
@@ -124,14 +118,12 @@ class UtilityCog:
             await message.edit(content=S.ui_ok("AFK disabled"))
 
         elif cmd == "translate":
-            if len(args) < 3:
-                return await message.edit(content=S.ui_err("usage: translate <lang> <text>"))
+            if len(args) < 3: return await message.edit(content=S.ui_err("usage: translate <lang> <text>"))
             translated = await S.translate_text(" ".join(args[2:]), args[1]) if S.translate_text else ""
             await message.edit(content=f"```\n{translated}\n```")
 
         elif cmd == "ghostping":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: ghostping <user_id>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: ghostping <user_id>"))
             try: await message.delete()
             except Exception: pass
             m = await message.channel.send(f"<@{args[1]}>")
@@ -139,8 +131,7 @@ class UtilityCog:
             await m.delete()
 
         elif cmd == "pin":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: pin <msg_id>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: pin <msg_id>"))
             try:
                 msg = await message.channel.fetch_message(int(args[1]))
                 await msg.pin()
@@ -149,8 +140,7 @@ class UtilityCog:
                 await message.edit(content=S.ui_err(str(e)))
 
         elif cmd == "unpin":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_err("usage: unpin <msg_id>"))
+            if len(args) < 2: return await message.edit(content=S.ui_err("usage: unpin <msg_id>"))
             try:
                 msg = await message.channel.fetch_message(int(args[1]))
                 await msg.unpin()
@@ -185,9 +175,8 @@ class UtilityCog:
             async for msg in message.channel.history(limit=1, oldest_first=True):
                 await message.channel.send(S.ui_box("first message", [
                     f"  {S.DIM}author{S.RESET}  {msg.author}",
-                    f"  {S.DIM}date{S.RESET}    {msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
                     f"  {S.DIM}content{S.RESET} {msg.content[:200] or '(empty)'}",
-                    f"  {S.DIM}url{S.RESET}     {msg.jump_url}",
+                    f"  {S.DIM}url{S.RESET}     {msg.jump_url if hasattr(msg, 'jump_url') else '(n/a)'}",
                 ]))
 
         elif cmd == "autodelete":

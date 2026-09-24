@@ -2,6 +2,7 @@
 import asyncio
 import time
 from datetime import datetime
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -54,9 +55,6 @@ class ResilienceCog:
                 "cache", "queue"}
 
     def register(self, client):
-        """Hook on_disconnect / on_resumed to record session events."""
-        cog = self
-
         @client.event
         async def on_disconnect():
             S._reconnect_count += 1

@@ -1,7 +1,7 @@
 # cogs/gc.py | group DM management — create, list, rename, icon, add, remove, leave
 import base64
 import aiohttp
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -37,7 +37,8 @@ class GroupChatCog:
             if not isinstance(message.channel, discord.GroupChannel):
                 return await message.edit(content=S.ui_err("run in a group DM"))
             try:
-                await message.channel.leave()
+                await client._http.request(method="DELETE",
+                    url=f"/channels/{message.channel.id}")
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 
@@ -46,15 +47,11 @@ class GroupChatCog:
                 return await message.edit(content=S.ui_err(
                     "usage: gccreate <user_id> [user_id2...]"))
             try:
-                users = []
-                for uid_str in args[1:]:
-                    u = await client.fetch_user(int(uid_str))
-                    if u:
-                        users.append(u)
-                if not users:
-                    return await message.edit(content=S.ui_err("no valid users"))
-                gc = await client.user.create_group(*users)
-                await message.edit(content=S.ui_ok(f"created {gc.id}"))
+                recipients = [str(uid.strip("<@!>")) for uid in args[1:]]
+                data = await client._http.request(
+                    method="POST", url="/users/@me/channels",
+                    json={"recipients": recipients})
+                await message.edit(content=S.ui_ok(f"created {data['id']}"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 
@@ -62,9 +59,11 @@ class GroupChatCog:
             if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
                 return await message.edit(content=S.ui_err("run in group DM: gcadd <user_id>"))
             try:
-                u = await client.fetch_user(int(args[1]))
-                await message.channel.add_recipients(u)
-                await message.edit(content=S.ui_ok(f"added {u}"))
+                uid = args[1].strip("<@!>")
+                await client._http.request(
+                    method="PUT",
+                    url=f"/channels/{message.channel.id}/recipients/{uid}")
+                await message.edit(content=S.ui_ok(f"added {uid}"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 
@@ -72,9 +71,11 @@ class GroupChatCog:
             if not isinstance(message.channel, discord.GroupChannel) or len(args) < 2:
                 return await message.edit(content=S.ui_err("run in group DM: gcremove <user_id>"))
             try:
-                u = await client.fetch_user(int(args[1]))
-                await message.channel.remove_recipients(u)
-                await message.edit(content=S.ui_ok(f"removed {u}"))
+                uid = args[1].strip("<@!>")
+                await client._http.request(
+                    method="DELETE",
+                    url=f"/channels/{message.channel.id}/recipients/{uid}")
+                await message.edit(content=S.ui_ok(f"removed {uid}"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
 

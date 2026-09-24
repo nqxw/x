@@ -1,6 +1,7 @@
 # cogs/db.py | notes, history, command stats, db info/vacuum
 import os
 from datetime import datetime
+import modifyself_shim as discord
 from . import state as S
 
 

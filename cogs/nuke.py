@@ -1,32 +1,34 @@
 # cogs/nuke.py | destructive server ops + backup/restore bridge
 import os
 import time
+import json
+import modifyself_shim as discord
 from . import state as S
+
+
+def json_dump(path, data):
+    with open(path, "w") as f: json.dump(data, f, indent=2)
 
 
 async def _backup_server(guild):
     data = {"id": str(guild.id), "name": guild.name,
             "icon": str(guild.icon) if guild.icon else None,
-            "roles": [{"id": str(r.id), "name": r.name, "color": r.color.value, "perms": r.permissions.value,
-                       "position": r.position, "hoist": r.hoist, "mentionable": r.mentionable}
+            "roles": [{"id": str(r.id), "name": r.name, "color": r.color.value,
+                       "perms": int(r.permissions), "position": r.position,
+                       "hoist": r.hoist, "mentionable": r.mentionable}
                       for r in guild.roles],
-            "categories": [{"id": str(c.id), "name": c.name, "position": c.position} for c in guild.categories],
+            "categories": [{"id": str(c.id), "name": c.name, "position": c.position}
+                           for c in guild.channels if str(c.type) == "guild_category"],
             "channels": [{"id": str(ch.id), "name": ch.name, "type": str(ch.type),
                           "position": ch.position,
-                          "category": str(ch.category_id) if getattr(ch, "category_id", None) else None}
+                          "category": str(getattr(ch, "parent_id", None)) if getattr(ch, "parent_id", None) else None}
                          for ch in guild.channels]}
     p = f"backups/server_{guild.id}_{int(time.time())}.json"
-    with open(p, "w") as f: json_dump(p, data)
+    json_dump(p, data)
     return p
 
 
-def json_dump(path, data):
-    import json
-    with open(path, "w") as f: json.dump(data, f, indent=2)
-
-
 async def _restore_server(guild, path):
-    import json, discord
     with open(path) as f: data = json.load(f)
     for r in data.get("roles", []):
         if r["name"] == "@everyone": continue
@@ -58,7 +60,6 @@ class NukeCog:
             p = await _backup_server(message.guild)
             return await message.channel.send(S.ui_ok(f"backup saved: {p}"))
 
-        # nuke
         if not message.guild:
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
         sub = args[1].lower() if len(args) > 1 else ""
@@ -66,7 +67,7 @@ class NukeCog:
 
         if sub == "status":
             await message.channel.send(S.ui_info(
-                f"nuke ready — ch:{len(g.channels)} r:{len(g.roles)} e:{len(g.emojis)}"))
+                f"nuke ready — ch:{len(g.channels)} r:{len(g.roles)}"))
 
         elif sub == "channels":
             for ch in list(g.channels):
@@ -76,16 +77,20 @@ class NukeCog:
         elif sub == "roles":
             for r in list(g.roles):
                 if r.is_default(): continue
-                try: await r.delete()
+                try:
+                    await S.CLIENT._http.request(method="DELETE",
+                        url=f"/guilds/{g.id}/roles/{r.id}")
                 except Exception: pass
 
         elif sub == "emojis":
             for e in list(g.emojis):
-                try: await e.delete()
+                try:
+                    await S.CLIENT._http.request(method="DELETE",
+                        url=f"/guilds/{g.id}/emojis/{e.id}")
                 except Exception: pass
 
         elif sub == "webhooks":
-            for ch in list(g.text_channels):
+            for ch in list(g.channels):
                 try:
                     for wh in await ch.webhooks():
                         try: await wh.delete()
@@ -98,10 +103,9 @@ class NukeCog:
                 except Exception: pass
             for r in list(g.roles):
                 if r.is_default(): continue
-                try: await r.delete()
-                except Exception: pass
-            for e in list(g.emojis):
-                try: await e.delete()
+                try:
+                    await S.CLIENT._http.request(method="DELETE",
+                        url=f"/guilds/{g.id}/roles/{r.id}")
                 except Exception: pass
 
         elif sub == "restore":

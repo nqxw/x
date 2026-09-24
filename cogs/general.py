@@ -5,7 +5,7 @@ import time
 import random
 import string
 import re
-import discord
+import modifyself_shim as discord
 from . import state as S
 
 
@@ -36,7 +36,6 @@ class GeneralCog:
             await message.edit(content=S.ui_box("account", [
                 f"  {S.DIM}user{S.RESET}     {S.WHITE}{u}{S.RESET}",
                 f"  {S.DIM}id{S.RESET}       {u.id}",
-                f"  {S.DIM}created{S.RESET}  {u.created_at.strftime('%Y-%m-%d')}",
                 f"  {S.DIM}servers{S.RESET}  {len(client.guilds)}",
                 f"  {S.DIM}prefix{S.RESET}   {S.PREFIX}",
                 f"  {S.DIM}platform{S.RESET} {S._current_platform}",
@@ -166,7 +165,7 @@ class GeneralCog:
             try: await message.delete()
             except Exception: pass
             def check(m):
-                return m.author.id == uid and m.channel.id == message.channel.id
+                return m.author.id == uid and m.channel_id == message.channel.id
             for _ in range(10):
                 try:
                     m = await client.wait_for("message", check=check, timeout=60)
@@ -193,9 +192,9 @@ class GeneralCog:
             S._current_platform = plat
             await message.edit(content=S.ui_ok(f"platform → {plat}"))
             try:
-                ws = getattr(client, "ws", None)
-                if ws:
-                    await ws.close(code=4000)
+                gw = getattr(client, "_gateway", None)
+                if gw:
+                    await gw.close()
             except Exception: pass
 
         elif cmd == "hypesquad":

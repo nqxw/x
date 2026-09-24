@@ -1,4 +1,5 @@
 # cogs/monitor.py | joins/leaves/roles/nicks/invites/keywords + log channel
+import modifyself_shim as discord
 from . import state as S
 
 
