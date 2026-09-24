@@ -1,7 +1,11 @@
 # cogs/spoofer.py | platform / device spoofing — patches modifyself's
 # GatewayWebSocket.send_json at the CLASS level. every ws object (initial +
-# every reconnect) is covered automatically. no aiohttp patching, no frame
-# matching — the IDENTIFY payload is a dict and we rewrite d.properties.
+# every reconnect) is covered automatically.
+#
+# v2 — reconnect is handled by modifyself's own `_handle_disconnect` path.
+# we do NOT call gw.connect() ourselves — that races with the library's
+# reconnect task and leaves the gateway dead. we just clear session state
+# so the next attempt sends IDENTIFY instead of RESUME.
 import asyncio
 import json
 import re
@@ -49,10 +53,33 @@ def _rewrite_identify_dict(data: dict, preset) -> bool:
     props["os"] = preset["os"]
     props["browser"] = preset["browser"]
     props["device"] = preset["device"]
-    # some builds also read these user-facing fields
-    props["browser_user_agent"] = props.get("browser_user_agent") or (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+
+    # align user agent to the chosen os/browser combo, else the spoof is obvious
+    ua_map = {
+        ("Android", "Discord Android"): (
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"),
+        ("Android", "Discord VR"): (
+            "Mozilla/5.0 (Linux; Android 12; Quest 3) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) OculusBrowser/37.0.0.0.43 "
+            "SamsungBrowser/4.0 Chrome/122.0.6261.140 VR Safari/537.36"),
+        ("iOS", "Discord iOS"): (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"),
+        ("Windows", "Chrome"): (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+        ("Mac OS X", "Chrome"): (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+        ("Linux", "Chrome"): (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+    }
+    key = (preset["os"], preset["browser"])
+    if key in ua_map:
+        props["browser_user_agent"] = ua_map[key]
+
     cog = _LIVE_COG[0]
     if cog is not None:
         cog._last_props = dict(props)
@@ -101,6 +128,7 @@ class SpooferCog:
         self._identify_count = 0
         self._reconnect_count = 0
         self._watchdog_task = None
+        self._reconnect_grace_until = 0.0
         _LIVE_COG[0] = self
         _install_patches()
         self._start_watchdog()
@@ -112,23 +140,39 @@ class SpooferCog:
         self._watchdog_task = loop.create_task(self._watchdog())
 
     async def _watchdog(self):
-        """If ws is dead for >10s and client thinks it's open, nudge."""
+        """
+        Detect a stalled gateway. give modifyself a 30s grace window after a
+        manual reconnect before nudging it, so we don't fight the library.
+        """
         dead_since = 0.0
         while True:
             try:
                 client = S.CLIENT
                 if client is not None:
                     gw = getattr(client, "_gateway", None)
-                    if gw is not None and not gw.is_connected and not gw.is_closed:
-                        if dead_since == 0.0:
-                            dead_since = time.time()
-                        elif time.time() - dead_since > 10:
-                            print("[spoofer] watchdog: gateway stalled >10s, forcing reconnect")
-                            try: await gw._reconnect()
-                            except Exception as e: print(f"[spoofer] watchdog err: {e}")
-                            dead_since = time.time()
-                    else:
-                        dead_since = 0.0
+                    now = time.time()
+                    if gw is not None and now >= self._reconnect_grace_until:
+                        is_connected = getattr(gw, "is_connected", False)
+                        is_closed = getattr(gw, "is_closed", False)
+                        if not is_connected and not is_closed:
+                            if dead_since == 0.0:
+                                dead_since = now
+                            elif now - dead_since > 15:
+                                print("[spoofer] watchdog: gateway stalled >15s, "
+                                      "clearing session state for a fresh IDENTIFY")
+                                # clear session so the next reconnect sends IDENTIFY
+                                try: gw._session_id = None
+                                except Exception: pass
+                                try: gw._sequence = None
+                                except Exception: pass
+                                # close so modifyself's own _handle_disconnect runs
+                                try: await gw.close()
+                                except Exception as e:
+                                    print(f"[spoofer] watchdog close failed: {e}")
+                                self._reconnect_grace_until = time.time() + 30
+                                dead_since = 0.0
+                        else:
+                            dead_since = 0.0
             except Exception as e:
                 print(f"[spoofer] watchdog error: {e}")
             await asyncio.sleep(5)
@@ -143,10 +187,12 @@ class SpooferCog:
             lines.append(f"import failed: {e}")
         lines.append(f"preset held: {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
         lines.append(f"identify count: {self._identify_count}")
+        lines.append(f"reconnect grace until: "
+                     f"{max(0, int(self._reconnect_grace_until - time.time()))}s")
         client = S.CLIENT
         gw = getattr(client, "_gateway", None) if client else None
         if gw is not None:
-            try: lines.append(f"gateway state: {gw.get_state()}")
+            try: lines.append(f"gateway: {gw.get_state()}")
             except Exception as e: lines.append(f"gateway state err: {e}")
         return lines
 
@@ -166,30 +212,34 @@ class SpooferCog:
         return True
 
     async def _safe_reconnect(self):
-        """Force a fresh IDENTIFY by closing the gateway and letting
-        modifyself reconnect. its `_reconnect()` clears session id and closes."""
+        """
+        Force a fresh IDENTIFY by clearing session state and closing the ws.
+        modifyself's own `_handle_disconnect` → `_reconnect` task picks up
+        from there. we do NOT call gw.connect() ourselves — that's the race
+        that leaves the gateway dead.
+        """
         client = S.CLIENT
         if client is None: return
-        self._reconnect_count += 1
         gw = getattr(client, "_gateway", None)
         if gw is None: return
-        try:
-            # clear session id so the next connection sends IDENTIFY, not RESUME
-            try: gw._session_id = None
-            except Exception: pass
-            try: gw._sequence = None
-            except Exception: pass
-            try: await gw.close()
-            except Exception as e: print(f"[spoofer] close failed: {e}")
-            # modifyself doesn't auto-reconnect after a clean close; kick it
-            asyncio.create_task(self._kick_reconnect(gw))
-        except Exception as e:
-            print(f"[spoofer] reconnect error: {e}")
 
-    async def _kick_reconnect(self, gw):
-        await asyncio.sleep(0.5)
-        try: await gw.connect()
-        except Exception as e: print(f"[spoofer] kick reconnect failed: {e}")
+        self._reconnect_count += 1
+        print(f"[spoofer] reconnect #{self._reconnect_count} requested")
+
+        # clear session so the next attempt IDENTIFYs instead of RESUMEs
+        try: gw._session_id = None
+        except Exception: pass
+        try: gw._sequence = None
+        except Exception: pass
+
+        # close with a resumable code so modifyself kicks its own reconnect
+        try:
+            await gw.close()
+        except Exception as e:
+            print(f"[spoofer] close failed: {e}")
+
+        # give the library 30s to reconnect before the watchdog steps in
+        self._reconnect_grace_until = time.time() + 30
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
@@ -252,12 +302,21 @@ class SpooferCog:
     async def _send_status(self, message):
         p = self._last_props or {}
         active = _PRESET_HOLDER[0]
+        gw = getattr(S.CLIENT, "_gateway", None) if S.CLIENT else None
+        state_str = "—"
+        if gw is not None:
+            try:
+                st = gw.get_state()
+                state_str = f"{st.get('state')} / conn={st.get('is_connected')}"
+            except Exception:
+                pass
         lines = [
             f"  tracked:      {getattr(S, '_current_platform', '?')}",
             f"  preset held:  {active['label'] if active else '—'}",
             f"  patched:      {self._patched_preset['label'] if self._patched_preset else '—'}",
             f"  identify #:   {self._identify_count}",
             f"  reconnects:   {self._reconnect_count}",
+            f"  gateway:      {state_str}",
             f"  $os:          {p.get('os', '?')}",
             f"  $browser:     {p.get('browser', '?')}",
             f"  $device:      {p.get('device', '?')}",
