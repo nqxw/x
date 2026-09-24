@@ -71,7 +71,7 @@ class StatusCog:
                         await message.edit(content=S.ui_ok(f"status set: {emoji_name or ''} {text}".strip()))
                     elif r.status == 429:
                         retry = (await r.json()).get("retry_after", 1)
-                        await message.edit(content=S.ui_warn(f"rate limited — retry in {retry}s"))
+                        await message.edit(content=S.ui_warn(f"rate limited â€” retry in {retry}s"))
                     else:
                         await message.edit(content=S.ui_err(f"failed {r.status}"))
         except Exception as e:
