@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# lunar — v2.3.0-modifyself
+# lunar — v2.3.1-modifyself
 
 import modifyself_shim as discord   # ← CHANGED (was: import discord)
 
@@ -158,7 +158,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.3.0-modifyself"   # ← CHANGED
+VERSION = "2.3.1-modifyself"   # ← CHANGED
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -502,12 +502,24 @@ HELP_DATA = {
         ("giveaway on/off","auto-enter giveaways"),("nitrosniper on/off","auto-redeem nitro gift codes"),
         ("autoreact <emoji>","auto-react to your own messages"),
         ("autoreactstop","stop auto-react"),
+        ("superreact <emoji> [n]","react to the last n messages concurrently"),
         ("multireact add <emoji>","add emoji to multi-react pool"),
         ("multireact remove <emoji>","remove emoji from pool"),
         ("multireact list","list pool"),("multireact on/off","toggle multi-react"),
         ("autoaddback on/off","auto-accept friend requests"),
         ("vsniper add <code> <gid>","add vanity url to watch list"),
         ("vsniper start/stop/list","vanity sniper control"),
+    ],
+    "spoofer": [
+        ("platform [name]","show or set spoofed platform"),
+        ("spoof <platform>","rewrite IDENTIFY payload + reconnect"),
+        ("spoofer <platform>","alias for spoof"),
+        ("spoof status","show spoofer state"),
+        ("spoof reset","reset to desktop"),
+        ("spoofstatus","show spoofer state"),
+        ("spoofreset","reset to desktop"),
+        ("vr","spoof as VR headset"),("console","spoof as console"),
+        ("spooferdiag","spoofer diagnostics dump"),
     ],
     "profile": [
         ("setpfp <url>","set profile picture from url"),("setbio <text>","set profile bio"),
@@ -644,7 +656,8 @@ def build_help_root(page=1):
         "developer":"dev tools, plugins, proxy, sessions","server":"server management",
         "information":"user & server lookup","groupchat":"group dm & anti-gc",
         "utility":"text, afk, translate","tracking":"message & profile tracking",
-        "downloads":"media downloader","social":"friends & social","auto":"automation & snipers",
+        "downloads":"media downloader","social":"friends & social","auto":"automation, snipers, superreact",
+        "spoofer":"platform / device spoofing",
         "profile":"account profile","status":"custom status",
         "mass":"mass action tools","nuke":"destructive ops + backup","scrape":"scrape & export",
         "webhooks":"webhooks & emoji tools","automod":"automod, raid, quarantine, tickets, verify",
@@ -652,7 +665,6 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    # ── CHANGED: sy's selfbot → lunar, sy | ver → lunar | ver ──
     lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
@@ -677,7 +689,6 @@ def build_help_section(cat, page=1):
 # STATE
 # ─────────────────────────────────────────────
 
-# ── CHANGED: modifyself Client init (token kwarg, no discord.py-self kwargs) ──
 client = discord.Client(token=TOKEN)
 _MAIN_CLIENT = client
 
@@ -1228,7 +1239,6 @@ async def on_ready():
 
     is_main = True
     idx = "main"
-    # ── CHANGED: modifyself exposes guilds via state._guilds ──
     n_guilds = len(getattr(client._state, "_guilds", {}) or {})
     print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {n_guilds}")
 
@@ -1455,15 +1465,18 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
+    # ── AUTO-REACT (concurrent — ~20x faster than the serial 0.15s/emoji loop) ──
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
-        if _autoreact_emoji:
-            try: await message.add_reaction(_autoreact_emoji)
-            except Exception: pass
-        if _multireact_enabled and _multireact_pool:
-            for emoji in _multireact_pool:
-                try: await message.add_reaction(emoji)
-                except Exception: pass
-                await asyncio.sleep(0.15)
+        try:
+            react_tasks = []
+            if _autoreact_emoji:
+                react_tasks.append(message.add_reaction(_autoreact_emoji))
+            if _multireact_enabled and _multireact_pool:
+                react_tasks.extend(message.add_reaction(e) for e in _multireact_pool)
+            if react_tasks:
+                await asyncio.gather(*react_tasks, return_exceptions=True)
+        except Exception:
+            pass
 
     # ── COMMAND GATE ──
 
@@ -1553,8 +1566,6 @@ async def on_message_delete(message):
 
 @client.event
 async def on_message_edit(before, after):
-    # NOTE: modifyself passes the same object for before/after; the shim
-    # wraps two-arg handlers so this won't crash. the diff is disabled.
     if before.author.id == client.user.id: return
     if before.content == after.content: return
     cid = before.channel_id
@@ -1600,7 +1611,7 @@ _install_signal_handlers()
 
 print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
-    client.run()   # ← CHANGED — modifyself takes token at init, not at run()
+    client.run()   # ← modifyself takes token at init, not at run()
 except Exception as e:
     print(f"[FATAL] run failed: {type(e).__name__}: {e}")
     sys.exit(1)
