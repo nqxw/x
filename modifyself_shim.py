@@ -1,11 +1,8 @@
-# modifyself_shim.py | exposes a `discord`-shaped namespace on top of modifyself.
-# every cog does `import modifyself_shim as discord` and keeps its logic unchanged.
-#
-# v3 — patches after live boot:
-#   - _ChannelStub fallback for messages from uncached channels
-#   - _ch_send passes content positionally to match modifyself's HTTPClient
-#   - _MSMessage.reply falls back to stub channel when cache misses
-
+# modifyself_shim.py | discord-shaped namespace over modifyself.
+# v4 — patches:
+#   - Client.event upgrades dict payloads to model objects before dispatch
+#   - arity-aware wrapper: matches the handler's declared parameter count
+#   - handles 0/1/2/3-arg handlers cleanly
 import asyncio
 import inspect
 import json as _json
@@ -67,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  NAMESPACE — pure Python objects cogs import from `discord`
+#  NAMESPACE
 # ═══════════════════════════════════════════════════════════════════
 
 class Status:
@@ -268,19 +265,79 @@ InvalidToken     = DiscordException
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  EVENT PAYLOAD UPGRADE — turn raw dicts into model objects
+# ═══════════════════════════════════════════════════════════════════
+# modifyself's dispatcher passes dicts to handlers when there's no parser,
+# or passes a model when the parser exists. cogs expect discord.py-shaped
+# objects, so this normalizes everything before dispatch.
+
+def _upgrade(state, event_name, payload):
+    """Upgrade a raw payload for the named event into the right model object."""
+    if payload is None or not isinstance(payload, dict):
+        return payload
+
+    try:
+        if event_name == "MESSAGE_CREATE":
+            return state._store_message(payload)
+        if event_name == "MESSAGE_UPDATE":
+            return state._store_message(payload)
+        if event_name in ("MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE"):
+            msg = state._messages.get(int(payload.get("message_id", 0)))
+            if msg is None:
+                ch = state._channels.get(int(payload.get("channel_id", 0)))
+                if ch is None:
+                    ch = _ChannelStub(payload.get("channel_id", 0), state,
+                                       payload.get("guild_id"))
+                class _StubMsg:
+                    def __init__(self, mid, channel, data):
+                        self.id = mid
+                        self.channel = channel
+                        self.channel_id = channel.id
+                        self.guild_id = payload.get("guild_id")
+                        self._data = data
+                        self.author = _MSUser(state=state, data=data.get("author", data.get("user", {"id": "0"})))
+                    @property
+                    def content(self): return self._data.get("content", "")
+                    async def reply(self, content=None, **kw):
+                        return await self.channel.send(content, **kw)
+                msg = _StubMsg(int(payload.get("message_id", 0)), ch, payload)
+            # attach the emoji to the payload for the reaction handler
+            class _StubReaction:
+                def __init__(self, emoji, message):
+                    self.emoji = emoji
+                    self.message = message
+                    self.count = payload.get("count", 1)
+            emoji_data = payload.get("emoji", {})
+            emoji_str = (
+                emoji_data.get("name") if not emoji_data.get("id")
+                else f"<{'a' if emoji_data.get('animated') else ''}:"
+                     f"{emoji_data.get('name')}:{emoji_data.get('id')}>"
+            )
+            return _StubReaction(emoji_str, msg)
+        if event_name in ("GUILD_MEMBER_ADD", "GUILD_MEMBER_REMOVE", "GUILD_MEMBER_UPDATE"):
+            gid = int(payload.get("guild_id", 0))
+            return _MSMember(state=state, data=payload, guild_id=gid)
+        if event_name == "TYPING_START":
+            return payload
+        if event_name == "GUILD_CREATE":
+            return state._add_guild(payload)
+        if event_name == "CHANNEL_CREATE":
+            return state._add_channel(payload)
+        if event_name == "INTERACTION_CREATE":
+            return payload
+    except Exception as e:
+        logger.debug(f"[shim] _upgrade {event_name} failed: {e}")
+    return payload
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MODEL PATCHES
 # ═══════════════════════════════════════════════════════════════════
 
 def _http(state): return state.http
 
 
-# ── Channel stub — fallback for messages from uncached channels ──
 class _ChannelStub:
-    """
-    Minimal channel object used when a message arrives from a channel the
-    client hasn't cached yet. Provides just enough surface for the dispatcher
-    and cogs to send / delete / read history. Everything routes to REST.
-    """
     def __init__(self, channel_id, state, guild_id=None):
         self.id = int(channel_id)
         self._state = state
@@ -301,12 +358,11 @@ class _ChannelStub:
 
     async def send(self, content=None, **kw):
         payload = {}
-        if content is not None: payload["content"] = content
         for k in ("embeds", "components", "tts", "allowed_mentions",
                   "message_reference", "files"):
             if k in kw and kw[k] is not None:
                 payload[k] = kw[k]
-        data = await _http(self._state).send_message(self.id, payload.pop("content", None), **payload)
+        data = await _http(self._state).send_message(self.id, content, **payload)
         return self._state._store_message(data)
 
     async def delete(self):
@@ -359,7 +415,6 @@ class _ChannelStub:
         return f"<ChannelStub id={self.id}>"
 
 
-# ── Message ──
 def _msg_channel(self):
     ch = self._state._channels.get(self.channel_id)
     if ch is not None:
@@ -375,6 +430,19 @@ def _msg_guild(self):
 
 _MSMessage.channel = property(_msg_channel)
 _MSMessage.guild   = property(_msg_guild)
+
+
+# ── Message.reply fallback for stub channels ──
+async def _msg_reply(self, content=None, **kw):
+    ch = _msg_channel(self)
+    ref = {"message_id": str(self.id), "channel_id": str(self.channel_id)}
+    if self.guild_id:
+        ref["guild_id"] = str(self.guild_id)
+    kw["message_reference"] = ref
+    return await ch.send(content, **kw)
+
+
+_MSMessage.reply = _msg_reply
 
 
 # ── Channel ──
@@ -422,10 +490,8 @@ async def _ch_send(self, content=None, *, embeds=None, components=None,
         for f in files:
             attach.append(f.payload if hasattr(f, "payload") else f)
     if attach: payload["files"] = attach
-
     payload.update(kwargs)
 
-    # modifyself's HTTPClient signature: send_message(channel_id, content, **kwargs)
     msg_data = await _http(self._state).send_message(self.id, content, **payload)
     msg = self._state._store_message(msg_data)
 
@@ -804,7 +870,6 @@ class _HTTPShim:
 
 
 class _WSShim:
-    """Thin adapter — the real method is GatewayWebSocket.send_json(dict)."""
     def __init__(self, client):
         self._client = client
 
@@ -838,8 +903,6 @@ class _WSShim:
 
 
 class Client(_MSClient):
-    """discord.py-self-shaped Client over modifyself."""
-
     def __init__(self, *, token: str = None, **kwargs):
         for k in ("chunk_guilds_at_startup", "request_guilds", "intents",
                   "command_prefix", "status", "activity", "help_command",
@@ -867,19 +930,38 @@ class Client(_MSClient):
         raw = coro.__name__.replace("on_", "", 1).upper()
         name = _EVENT_MAP.get(raw, raw)
 
+        # find the handler's arity (positional-only + positional-or-keyword, no defaults)
         sig = inspect.signature(coro)
-        required = [p for p in sig.parameters.values()
-                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                    and p.default is p.empty]
-        if len(required) >= 2:
-            async def _wrapped(payload, _coro=coro):
-                await _coro(payload, payload)
-            _wrapped.__name__ = coro.__name__
-            self._dispatcher.on(name, _wrapped)
-            self._event_handlers.setdefault(name, []).append(_wrapped)
-        else:
-            self._dispatcher.on(name, coro)
-            self._event_handlers.setdefault(name, []).append(coro)
+        pos_params = [
+            p for p in sig.parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            and p.default is p.empty
+        ]
+        arity = len(pos_params)
+        state = self._state
+
+        async def _wrapped(payload, _coro=coro, _name=name, _arity=arity, _state=state):
+            try:
+                obj = _upgrade(_state, _name, payload)
+                if _arity == 0:
+                    await _coro()
+                elif _arity == 1:
+                    await _coro(obj)
+                elif _arity == 2:
+                    # two-arg handlers — pass same object twice (modifyself
+                    # doesn't expose before-state)
+                    await _coro(obj, obj)
+                elif _arity == 3:
+                    # three-arg handlers (voice state update before/after)
+                    await _coro(obj, obj, obj)
+                else:
+                    await _coro(*([obj] * _arity))
+            except Exception as e:
+                logger.exception(f"[shim] handler {_name} failed: {e}")
+
+        _wrapped.__name__ = coro.__name__
+        self._dispatcher.on(name, _wrapped)
+        self._event_handlers.setdefault(name, []).append(_wrapped)
         return coro
 
     async def change_presence(self, *, activity=None, status=None, **_):
@@ -911,14 +993,15 @@ class Client(_MSClient):
     async def wait_for(self, event: str, *, check=None, timeout=None):
         ev = _EVENT_MAP.get(event.upper(), event.upper())
         fut = asyncio.get_event_loop().create_future()
+        state = self._state
 
-        async def _handler(*args, **kwargs):
-            target = args[0] if args else kwargs
+        async def _handler(payload):
+            obj = _upgrade(state, ev, payload)
             try:
-                ok = (check is None) or (callable(check) and check(target))
+                ok = (check is None) or (callable(check) and check(obj))
             except Exception:
                 ok = False
-            if ok and not fut.done(): fut.set_result(target)
+            if ok and not fut.done(): fut.set_result(obj)
 
         self._dispatcher.on(ev, _handler)
         try: return await asyncio.wait_for(fut, timeout=timeout)
