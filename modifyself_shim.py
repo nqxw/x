@@ -1,12 +1,11 @@
 # modifyself_shim.py | discord-shaped namespace over modifyself.
-# v5.1 — patches:
-#   - Client.reconnect_gateway() always runs (no early-return on is_connected)
-#   - class-level lock prevents reconnect races
-#   - _upgrade() upgrades dict payloads to model objects before dispatch
-#   - arity-aware event wrapper (0/1/2/3-arg handlers all work)
-#   - _ChannelStub fallback for uncached channels
-#   - _ch_send passes content positionally to match modifyself's HTTPClient
-#   - _MSMessage.reply fallback through stub channels
+# v6 — patches:
+#   - reconnect_gateway closes the raw ws with code 4000 and clears
+#     _closed_event so modifyself's own _handle_disconnect → _reconnect
+#     chain drives the reconnect. never awaits gw.connect() (which blocks).
+#   - _upgrade returns tuples for multi-arg events (reactions, voice
+#     state, member updates) so handlers receive proper arg positions.
+#   - wrapper unpacks tuples cleanly.
 import asyncio
 import inspect
 import json as _json
@@ -269,11 +268,69 @@ InvalidToken     = DiscordException
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  EVENT STUBS — for payloads that have no model class
+# ═══════════════════════════════════════════════════════════════════
+
+class _StubUser:
+    """Minimal user object for reaction / typing payloads."""
+    def __init__(self, data):
+        self.id = int(data.get("id", 0))
+        self.name = data.get("username", "")
+        self.discriminator = data.get("discriminator", "0")
+        self.bot = data.get("bot", False)
+        self.display_name = data.get("global_name") or self.name
+    def __str__(self): return self.name
+    def __repr__(self): return f"<StubUser id={self.id} name={self.name!r}>"
+
+
+class _StubReaction:
+    """Minimal reaction object."""
+    def __init__(self, emoji, message, count=1, user_id=None):
+        self.emoji = emoji
+        self.message = message
+        self.count = count
+        self.user_id = user_id
+    def __repr__(self): return f"<StubReaction emoji={self.emoji!r}>"
+
+
+class _VoiceStateStub:
+    """Voice state — used for before/after in on_voice_state_update."""
+    def __init__(self, payload, guild_id, user_id):
+        self.id = user_id
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.channel_id = int(payload.get("channel_id", 0)) if payload.get("channel_id") else None
+        self.session_id = payload.get("session_id")
+        self.mute = payload.get("mute", False)
+        self.deaf = payload.get("deaf", False)
+        self.self_mute = payload.get("self_mute", False)
+        self.self_deaf = payload.get("self_deaf", False)
+        self.self_stream = payload.get("self_stream", False)
+        self.self_video = payload.get("self_video", False)
+        # resolve channel lazily via state
+        self._state = None
+        self._guild = None
+    @property
+    def channel(self):
+        if self.channel_id is None or self._guild is None:
+            return None
+        return self._guild.get_channel(self.channel_id)
+    @property
+    def guild(self):
+        return self._guild
+    def __repr__(self):
+        return f"<VoiceState user_id={self.user_id} channel_id={self.channel_id}>"
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  EVENT PAYLOAD UPGRADE
 # ═══════════════════════════════════════════════════════════════════
 
 def _upgrade(state, event_name, payload):
-    """Upgrade a raw payload for the named event into the right model object."""
+    """
+    Upgrade a raw dict payload for the named event.
+    Returns either a single object or a TUPLE for multi-arg handlers.
+    """
     if payload is None or not isinstance(payload, dict):
         return payload
 
@@ -282,33 +339,28 @@ def _upgrade(state, event_name, payload):
             return state._store_message(payload)
 
         if event_name in ("MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE"):
-            msg = state._messages.get(int(payload.get("message_id", 0)))
-            if msg is None:
-                ch = state._channels.get(int(payload.get("channel_id", 0)))
-                if ch is None:
-                    ch = _ChannelStub(payload.get("channel_id", 0), state,
-                                       payload.get("guild_id"))
-                class _StubMsg:
-                    def __init__(self, mid, channel, data):
-                        self.id = mid
-                        self.channel = channel
-                        self.channel_id = channel.id
-                        self.guild_id = data.get("guild_id")
-                        self._data = data
-                        self.author = _MSUser(
-                            state=state,
-                            data=data.get("author", data.get("user", {"id": "0"})))
-                    @property
-                    def content(self): return self._data.get("content", "")
-                    async def reply(self, content=None, **kw):
-                        return await self.channel.send(content, **kw)
-                msg = _StubMsg(int(payload.get("message_id", 0)), ch, payload)
+            # user
+            user_data = payload.get("member", {}).get("user") if payload.get("member") else payload.get("user")
+            if not user_data:
+                user_data = {"id": str(payload.get("user_id", "0"))}
+            user_obj = _StubUser(user_data)
 
-            class _StubReaction:
-                def __init__(self, emoji, message):
-                    self.emoji = emoji
-                    self.message = message
-                    self.count = payload.get("count", 1)
+            # message
+            msg_id = int(payload.get("message_id", 0))
+            msg = state._messages.get(msg_id)
+            if msg is None:
+                ch_id = int(payload.get("channel_id", 0))
+                ch = state._channels.get(ch_id)
+                if ch is None:
+                    ch = _ChannelStub(ch_id, state, payload.get("guild_id"))
+                _msg_data = {
+                    "id": str(msg_id),
+                    "channel_id": str(ch_id),
+                    "author": {"id": "0", "username": "unknown", "discriminator": "0"},
+                    "content": "",
+                    "timestamp": payload.get("event_ts") or "1970-01-01T00:00:00+00:00",
+                }
+                msg = _MSMessage(state=state, data=_msg_data)
 
             emoji_data = payload.get("emoji", {}) or {}
             emoji_str = (
@@ -316,12 +368,24 @@ def _upgrade(state, event_name, payload):
                 else f"<{'a' if emoji_data.get('animated') else ''}:"
                      f"{emoji_data.get('name')}:{emoji_data.get('id')}>"
             )
-            return _StubReaction(emoji_str, msg)
+            reaction = _StubReaction(emoji_str, msg,
+                                     count=payload.get("count", 1),
+                                     user_id=user_obj.id)
+            return (reaction, user_obj)
 
         if event_name in ("GUILD_MEMBER_ADD", "GUILD_MEMBER_REMOVE",
                           "GUILD_MEMBER_UPDATE"):
             gid = int(payload.get("guild_id", 0))
-            return _MSMember(state=state, data=payload, guild_id=gid)
+            member = _MSMember(state=state, data=payload, guild_id=gid)
+            return (member, member)
+
+        if event_name == "VOICE_STATE_UPDATE":
+            gid = int(payload.get("guild_id", 0))
+            user_id = int(payload.get("user_id", 0))
+            state_obj = _VoiceStateStub(payload, gid, user_id)
+            state_obj._state = state
+            state_obj._guild = state._guilds.get(gid)
+            return (state_obj, state_obj, state_obj)
 
         if event_name == "GUILD_CREATE":
             return state._add_guild(payload)
@@ -329,7 +393,15 @@ def _upgrade(state, event_name, payload):
         if event_name in ("CHANNEL_CREATE", "CHANNEL_UPDATE"):
             return state._add_channel(payload)
 
-        if event_name in ("VOICE_STATE_UPDATE", "TYPING_START", "INTERACTION_CREATE"):
+        if event_name == "TYPING_START":
+            ch_id = int(payload.get("channel_id", 0))
+            ch = state._channels.get(ch_id) or _ChannelStub(ch_id, state, payload.get("guild_id"))
+            user_data = payload.get("member", {}).get("user") if payload.get("member") else payload.get("user")
+            if not user_data:
+                user_data = {"id": str(payload.get("user_id", "0"))}
+            return (ch, _StubUser(user_data))
+
+        if event_name == "INTERACTION_CREATE":
             return payload
     except Exception as e:
         logger.debug(f"[shim] _upgrade {event_name} failed: {e}")
@@ -939,12 +1011,14 @@ class Client(_MSClient):
 
     async def reconnect_gateway(self):
         """
-        Force a fresh IDENTIFY on the gateway. Always runs — no shortcut
-        on is_connected, because a spoofed IDENTIFY is exactly what
-        callers want even while the current session is live.
+        Force a fresh IDENTIFY.
 
-        Serializes on a class-level lock so modifyself's own reconnect
-        task and this method never open the socket at the same time.
+        Approach: close the RAW websocket with a RESUME code (4000), and
+        make sure `_closed_event` is clear so modifyself's own
+        `_handle_disconnect` → `_reconnect` chain drives the reconnect
+        in its own task. Do NOT call `gw.close()` (it sets `_closed_event`
+        and suppresses auto-reconnect) and do NOT `await gw.connect()` (it
+        blocks on the message loop and never returns).
         """
         gw = getattr(self, "_gateway", None)
         if gw is None:
@@ -953,30 +1027,46 @@ class Client(_MSClient):
 
         lock = self._get_reconnect_lock()
         async with lock:
-            # clear session so the next IDENTIFY is fresh, not RESUME
-            try: gw._session_id = None
-            except Exception: pass
-            try: gw._sequence = None
-            except Exception: pass
-            try: gw._resume_gateway_url = None
+            # clear session state so the fresh IDENTIFY fires (not RESUME)
+            for attr in ("_session_id", "_sequence", "_resume_gateway_url"):
+                try: setattr(gw, attr, None)
+                except Exception: pass
+
+            # ensure the auto-reconnect guard is clear
+            try: gw._closed_event.clear()
             except Exception: pass
 
-            # close the socket if it's still up
+            # close the raw socket with a resumable code
+            ws = getattr(gw, "_ws", None)
+            if ws is not None:
+                try:
+                    await ws.close(4000, "spoofer reconnect")
+                    logger.debug("[shim] reconnect_gateway: raw ws closed 4000")
+                except Exception as e:
+                    logger.debug(f"[shim] raw close err: {e}")
+            else:
+                # no live socket — kick _connect_with_retry directly
+                try:
+                    asyncio.create_task(gw._connect_with_retry())
+                    logger.info("[shim] reconnect_gateway: kicked connect (no ws)")
+                except Exception as e:
+                    logger.warning(f"[shim] reconnect kick failed: {e}")
+                    return False
+
+            # poll for the library's own reconnect to complete
+            for _ in range(20):
+                await asyncio.sleep(0.5)
+                try:
+                    if gw.is_connected:
+                        logger.info("[shim] reconnect_gateway: connected")
+                        return True
+                except Exception:
+                    pass
+
+            # the library stalled — drive it ourselves in the background
             try:
-                if getattr(gw, "_ws", None) is not None:
-                    await gw.close()
-                    logger.debug("[shim] reconnect_gateway: closed old ws")
-            except Exception as e:
-                logger.debug(f"[shim] reconnect close err: {e}")
-
-            # wait for modifyself's own _message_loop to unwind
-            await asyncio.sleep(1.0)
-
-            # drive the reconnect — HELLO arrives, we IDENTIFY with the
-            # spoofed properties, the ws.send_json patch fires
-            try:
-                await gw.connect()
-                logger.info("[shim] reconnect_gateway: connected")
+                asyncio.create_task(gw._connect_with_retry())
+                logger.info("[shim] reconnect_gateway: kicked _connect_with_retry")
                 return True
             except Exception as e:
                 logger.warning(f"[shim] reconnect_gateway failed: {e}")
@@ -1003,16 +1093,16 @@ class Client(_MSClient):
         async def _wrapped(payload, _coro=coro, _name=name, _arity=arity, _state=state):
             try:
                 obj = _upgrade(_state, _name, payload)
-                if _arity == 0:
-                    await _coro()
-                elif _arity == 1:
-                    await _coro(obj)
-                elif _arity == 2:
-                    await _coro(obj, obj)
-                elif _arity == 3:
-                    await _coro(obj, obj, obj)
+                if isinstance(obj, tuple):
+                    args = list(obj)[:_arity]
+                    while len(args) < _arity:
+                        args.append(args[-1] if args else None)
+                    await _coro(*args)
                 else:
-                    await _coro(*([obj] * _arity))
+                    if _arity == 0:
+                        await _coro()
+                    else:
+                        await _coro(*([obj] * _arity))
             except Exception as e:
                 logger.exception(f"[shim] handler {_name} failed: {e}")
 
@@ -1058,11 +1148,12 @@ class Client(_MSClient):
 
         async def _handler(payload):
             obj = _upgrade(state, ev, payload)
+            target = obj if not isinstance(obj, tuple) else obj[0]
             try:
-                ok = (check is None) or (callable(check) and check(obj))
+                ok = (check is None) or (callable(check) and check(target))
             except Exception:
                 ok = False
-            if ok and not fut.done(): fut.set_result(obj)
+            if ok and not fut.done(): fut.set_result(target)
 
         self._dispatcher.on(ev, _handler)
         try: return await asyncio.wait_for(fut, timeout=timeout)
