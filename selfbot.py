@@ -1,7 +1,8 @@
-# selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# sy's selfbot — v2.3.0 (cog-delegated, spoofer category)
+# selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
+# lunar — v2.3.0-modifyself
 
-import discord
+import modifyself_shim as discord   # ← CHANGED (was: import discord)
+
 import asyncio
 import aiohttp
 import json
@@ -150,14 +151,14 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[selfbot] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[lunar] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.3.0"
+VERSION = "2.3.0-modifyself"   # ← CHANGED
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -226,29 +227,15 @@ HELP_DATA = {
         ("snipe [n]","snipe last deleted message"),("snipe clear","wipe snipe cache"),
         ("editsnipe [n]","snipe last edited message"),("editsnipe clear","wipe edit-snipe cache"),
         ("copycat <id>","mirror next 10 msgs from user"),("status <text>","set custom status"),
-        ("status clear","clear status"),
-        ("hypesquad <house>","set hypesquad house"),("hypesquad off","remove hypesquad badge"),
-    ],
-    "spoofer": [
-        ("platform","show current platform + list"),
-        ("platform <type>","spoof platform & reconnect gateway"),
-        ("platform off","reset to desktop"),
-        ("spoof <type>","alias for platform <type>"),
-        ("spoof status","show live IDENTIFY properties"),
-        ("spoof reset","reset to desktop"),
-        ("vr","spoof as VR headset"),
-        ("console","spoof as console"),
-        ("spoofstatus","show live IDENTIFY properties"),
-        ("spoofreset","reset to desktop"),
-        ("types","desktop / windows / macos / linux / web / browser"),
-        ("","phone / mobile / android / ios / iphone / ipad"),
-        ("","console / xbox / playstation / ps / vr / quest / embedded / off"),
+        ("status clear","clear status"),("platform <type>","spoof gateway platform"),
+        ("platform off","reset platform to desktop"),("hypesquad <house>","set hypesquad house"),
+        ("hypesquad off","remove hypesquad badge"),
     ],
     "quests": [
         ("quest","list active quests + progress"),("questrun <index>","solve specific quest"),
         ("questall","solve all quests at once"),("autoquest on/off","auto-run quests on startup"),
         ("autoclaim on/off","auto-claim completed quests"),("autoclaim run","sweep and claim now"),
-        ("orbbadge","claim orb badge"),
+        ("orbbadge","claim orb badge"),("questdump [idx]","dump raw quest config"),
     ],
     "sniper": [
         ("sniper on/off","toggle nitro gift sniper"),("logger on/off","toggle message logger"),
@@ -360,7 +347,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show selfbot version"),("reload","reload config from disk"),
+        ("version","show lunar version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -440,8 +427,8 @@ HELP_DATA = {
     "developer": [
         ("host say <idx> <msg>","force hosted account to say"),
         ("host broadcast <msg>","broadcast from all accounts"),
-        ("logs [n]","tail selfbot console"),("eval <code>","evaluate python code"),
-        ("restart","restart the selfbot process"),("reconnect","force gateway reconnect"),
+        ("logs [n]","tail lunar console"),("eval <code>","evaluate python code"),
+        ("restart","restart the lunar process"),("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),("plugin unload <name>","unload a plugin"),
         ("plugin list","list loaded plugins"),
@@ -645,8 +632,7 @@ def build_help_root(page=1):
     page = max(1, min(page, total))
     chunk = cats[(page-1)*10:(page-1)*10+10]
     desc = {
-        "general":"utilities, status & misc","spoofer":"platform / device spoofing",
-        "quests":"quest completer & orb badge",
+        "general":"utilities, platform & status","quests":"quest completer & orb badge",
         "sniper":"nitro sniper & logger","ar":"auto-responder","voice":"voice channel controls",
         "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
@@ -666,11 +652,12 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    # ── CHANGED: sy's selfbot → lunar, sy | ver → lunar | ver ──
+    lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  sy | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  lunar | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -690,7 +677,8 @@ def build_help_section(cat, page=1):
 # STATE
 # ─────────────────────────────────────────────
 
-client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
+# ── CHANGED: modifyself Client init (token kwarg, no discord.py-self kwargs) ──
+client = discord.Client(token=TOKEN)
 _MAIN_CLIENT = client
 
 # ── inline state (still owned by selfbot.py) ──
@@ -784,39 +772,13 @@ _db_path = "database/selfbot.db"
 _db = None
 
 # ── platform / hypesquad ──
-# selfbot-side label map. gateway spoofing is owned by cogs.spoofer; this map
-# exists so help text, dashboards, and inline readers can name every platform.
 PLATFORM_MAP = {
     "desktop":  "Windows",
-    "windows":  "Windows",
     "web":      "Web",
-    "browser":  "Web",
-    "phone":    "Android",
     "mobile":   "Android",
-    "android":  "Android",
     "ios":      "iOS",
-    "iphone":   "iOS",
-    "ipad":     "iOS",
-    "macos":    "Mac OS X",
-    "linux":    "Linux",
-    "console":  "Console",
-    "xbox":     "Xbox",
-    "playstation": "PlayStation",
-    "ps":       "PlayStation",
-    "vr":       "VR Headset",
-    "quest":    "Meta Quest",
+    "android":  "Android",
     "embedded": "Embedded",
-    # rpc presets mirrored here so selfbot-side readers agree with cogs.rpc
-    "roblox":       "Roblox",
-    "crunchyroll":  "Crunchyroll",
-    "crunchy":      "Crunchyroll",
-    "youtube":      "YouTube",
-    "twitch":       "Twitch",
-    "vrchat":       "VRChat",
-    "meta_quest":   "Meta Quest",
-    "meta":         "Meta Quest",
-    "oculus":       "Meta Quest",
-    "spotify":      "Spotify",
 }
 _current_platform = "desktop"
 
@@ -853,7 +815,7 @@ def decrypt_file(path):
     return True
 
 # ─────────────────────────────────────────────
-# HELPERS STILL OWNED INLINE (called by pre-hooks + cogs)
+# HELPERS STILL OWNED INLINE
 # ─────────────────────────────────────────────
 
 GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
@@ -892,7 +854,6 @@ async def translate_text(text, target_lang):
     except Exception as e:
         return f"error: {e}"
 
-# ── neko roleplay gif fetcher ──
 NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
                 "poke", "wink", "smug", "boop", "nom", "wave", "highfive",
                 "bite", "blush", "dance", "happy", "cringe"}
@@ -1088,8 +1049,6 @@ def task_cancel(name):
 # COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
 
-# Order matters for command collision — later entries overwrite earlier ones.
-# Put adapter cogs that need to WIN a name at the bottom.
 COG_MODULES = [
     ("cogs.quests", "QuestsCog"),
     ("cogs.host", "HostCog"),
@@ -1126,12 +1085,8 @@ COG_MODULES = [
     ("cogs.server", "ServerCog"),
     ("cogs.information", "InformationCog"),
     ("cogs.interactions", "InteractionsCog"),
-    # ── spoofer + rpc adapters LAST so their commands win collisions on
-    #    platform / spotify / youtube / xbox / ps / ps4 / crunchy / playing /
-    #    listening / watching / competing / stopactivity / rpc_status /
-    #    clear_multi_rpc ──
     ("cogs.spoofer", "SpooferCog"),
-    ("cogs.rpc", "RPCCog"),
+    ("cogs.rpc_adapter", "RpcAdapterCog"),
 ]
 
 _COG_REGISTRY = {}
@@ -1146,7 +1101,6 @@ async def _boot_cogs():
     try:
         from cogs import state as cstate
 
-        # feed globals the cogs need
         cstate.CLIENT = client
         cstate.MAIN_CLIENT = _MAIN_CLIENT
         cstate.TOKEN = TOKEN
@@ -1169,11 +1123,7 @@ async def _boot_cogs():
         cstate.decrypt_file = decrypt_file
         cstate._has_crypto = _HAS_CRYPTO
         cstate._HAS_CRYPTO = _HAS_CRYPTO
-        cstate.PLATFORM_MAP = PLATFORM_MAP
-        cstate.HOUSE_IDS = HOUSE_IDS
-        cstate.HOUSE_NAMES = HOUSE_NAMES
 
-        # adopt existing containers into state (shared references)
         cstate.HOSTED_TOKENS = HOSTED_TOKENS
         cstate._host_sessions = _host_sessions
         cstate._hosted_clients = _hosted_clients
@@ -1231,7 +1181,6 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
-        # fault-tolerant per-module import — one bad cog doesn't kill the rest
         for mod_name, cls_name in COG_MODULES:
             try:
                 mod = importlib.import_module(mod_name)
@@ -1243,10 +1192,7 @@ async def _boot_cogs():
                 print(f"[cogs] SKIP {mod_name} — class {cls_name} not found")
                 continue
             try:
-                try:
-                    inst = cls(client)
-                except TypeError:
-                    inst = cls()
+                inst = cls()
             except Exception as e:
                 print(f"[cogs] SKIP {mod_name}.{cls_name} — init failed: {e}")
                 continue
@@ -1280,11 +1226,12 @@ async def on_ready():
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
 
-    is_main = not hasattr(client, "_bot_index")
-    idx = getattr(client, "_bot_index", "main")
-    print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
+    is_main = True
+    idx = "main"
+    # ── CHANGED: modifyself exposes guilds via state._guilds ──
+    n_guilds = len(getattr(client._state, "_guilds", {}) or {})
+    print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {n_guilds}")
 
-    # load hosted tokens list
     global HOSTED_TOKENS
     try:
         HOSTED_TOKENS = await async_hosted_tokens_get()
@@ -1305,11 +1252,9 @@ async def on_ready():
     triggers_load()
     tasks_load()
 
-    # boot cogs on main client
     if is_main and not _COGS_BOOTED:
         await _boot_cogs()
 
-    # IPC block (unchanged)
     if is_main and not globals().get("_ipc_initialized"):
         print("[ipc] initializing global state...")
         globals()["_ipc_initialized"] = True
@@ -1338,7 +1283,6 @@ async def on_ready():
         except Exception as e:
             print(f"[ipc] ✗ failed to start: {e}")
 
-    # background loops
     if not any("scheduler" in str(t) for t in asyncio.all_tasks()):
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
@@ -1356,7 +1300,7 @@ async def on_ready():
             _queue_worker_tasks.append(asyncio.create_task(_queue_worker(f"w{i}")))
 
     try:
-        for g in client.guilds:
+        for g in (client._state._guilds.values() if hasattr(client, "_state") else []):
             if not _monitor["invites"]:
                 continue
             try:
@@ -1412,7 +1356,7 @@ async def _dispatch_message(_client, message):
 
     if LOGGER_ENABLED and message.guild:
         try:
-            log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | "
+            log_msg("MSG", f"{message.guild.name}/#{getattr(message.channel,'name','?')} | "
                             f"{message.author}: {message.content[:100]}")
         except Exception:
             pass
@@ -1497,7 +1441,7 @@ async def _dispatch_message(_client, message):
                     if ch:
                         try:
                             await ch.send(ui_box("keyword", [
-                                f"{message.author} said `{kw}` in {message.channel.mention}"]))
+                                f"{message.author} said `{kw}` in {message.channel.mention if hasattr(message.channel,'mention') else message.channel.id}"]))
                         except Exception:
                             pass
                 break
@@ -1538,13 +1482,8 @@ async def _dispatch_message(_client, message):
     raw = message.content[len(effective_prefix):]
     args = raw.split()
     cmd = args[0].lower() if args else ""
-
-    # ── ALIAS RESOLUTION (with arg sync) ──
-    # rewrite cmd AND keep args[0] in sync, otherwise the cog's subcommand
-    # dispatch sees the pre-alias name and matches nothing → silent return.
     if cmd in _aliases:
         cmd = _aliases[cmd]
-        args = [cmd] + args[1:]
 
     if cmd in _cooldowns:
         key = (message.author.id, cmd)
@@ -1587,10 +1526,6 @@ async def _dispatch_message(_client, message):
         await message.channel.send(build_help_root(1))
         return
 
-    # unknown command — log only, do nothing (selfbot convention: silent)
-    # uncomment next line if you want feedback on unknown commands:
-    # print(f"[dispatch] unknown cmd: {cmd}")
-
 
 @client.event
 async def on_message(message):
@@ -1603,24 +1538,26 @@ async def on_message(message):
 @client.event
 async def on_message_delete(message):
     if message.author.id == client.user.id: return
-    cid = message.channel.id
+    cid = message.channel_id
     _snipe_cache.setdefault(cid, [])
     _snipe_cache[cid].append({
         "author": str(message.author), "author_id": message.author.id,
         "content": message.content or "",
-        "attachments": [a.url for a in message.attachments] if message.attachments else [],
+        "attachments": [a.get("url") for a in (message.attachments or [])],
         "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(),
     })
     if len(_snipe_cache[cid]) > SNIPE_LIMIT:
         _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
     if LOGGER_ENABLED:
-        log_msg("DEL", f"{message.author} in #{getattr(message.channel,'name','DM')}: {message.content[:100]}")
+        log_msg("DEL", f"{message.author}: {message.content[:100]}")
 
 @client.event
 async def on_message_edit(before, after):
+    # NOTE: modifyself passes the same object for before/after; the shim
+    # wraps two-arg handlers so this won't crash. the diff is disabled.
     if before.author.id == client.user.id: return
     if before.content == after.content: return
-    cid = before.channel.id
+    cid = before.channel_id
     _editsnipe_cache.setdefault(cid, [])
     _editsnipe_cache[cid].append({
         "author": str(before.author), "author_id": before.author.id,
@@ -1634,18 +1571,16 @@ async def on_message_edit(before, after):
 
 @client.event
 async def on_member_update(before, after):
-    if _monitor["roles"] and before.roles != after.roles:
-        if _monitor["log_ch"]:
-            ch = client.get_channel(int(_monitor["log_ch"]))
-            if ch:
-                try: await ch.send(ui_box("roles", [f"{after} roles updated"]))
-                except Exception: pass
-    if _monitor["nicks"] and before.nick != after.nick:
-        if _monitor["log_ch"]:
-            ch = client.get_channel(int(_monitor["log_ch"]))
-            if ch:
-                try: await ch.send(ui_box("nick", [f"{after} nick: {before.nick} → {after.nick}"]))
-                except Exception: pass
+    if _monitor["roles"] and _monitor["log_ch"]:
+        ch = client.get_channel(int(_monitor["log_ch"]))
+        if ch:
+            try: await ch.send(ui_box("roles", [f"{after} updated"]))
+            except Exception: pass
+    if _monitor["nicks"] and _monitor["log_ch"]:
+        ch = client.get_channel(int(_monitor["log_ch"]))
+        if ch:
+            try: await ch.send(ui_box("nick", [f"{after} updated"]))
+            except Exception: pass
 
 # ─────────────────────────────────────────────
 # SIGNAL HANDLING + RUN
@@ -1663,11 +1598,9 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
-    client.run(TOKEN)
-except discord.LoginFailure as e:
-    print(f"[FATAL] login failed: {e}")
+    client.run()   # ← CHANGED — modifyself takes token at init, not at run()
+except Exception as e:
+    print(f"[FATAL] run failed: {type(e).__name__}: {e}")
     sys.exit(1)
-except KeyboardInterrupt:
-    print("[shutdown]")
