@@ -3,5 +3,11 @@ cryptography
 aiohttp
 PyNaCl
 supabase
-hcaptcha-challenger>=0.6.0
 patchright>=1.40.0
+websockets
+hcaptcha-challenger
+playwright
+cryptography
+yt-dlp
+beautifulsoup4
+lxml
