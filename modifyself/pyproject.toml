@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modifyself"
+version = "0.4.1"
+description = "A clean, pythonic Discord self-bot library"
+readme = "README.md"
+license = "MIT"
+authors = [
+    {name = "modifyself", email = "modifyself@example.com"}
+]
+requires-python = ">=3.9"
+dependencies = [
+    "websockets>=10.0",
+    "wreq>=0.1.0",
+    "aiohttp>=3.8.0",
+    "plyer>=0.9",
+    "pillow>=10.0",
+    "PyNaCl>=1.5.0",
+    "opuslib>=3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kzfq/modifyself-lite"
+Bug-Reports = "https://github.com/kzfq/modifyself-lite/issues"
+Source = "https://github.com/kzfq/modifyself-lite"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["modifyself*"]
+exclude = ["tests*", "examples*", "docs*"]
