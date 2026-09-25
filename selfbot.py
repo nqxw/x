@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# lunar — v2.5.0-superreact
+# lunar — v2.6.0-turbo
 
 import modifyself_shim as discord
 
@@ -18,6 +18,7 @@ import sqlite3
 import traceback
 import signal
 import importlib
+import socket
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from collections import defaultdict
@@ -158,13 +159,68 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.5.0:3"
+VERSION = "2.6.0-turbo"
 OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
               "Electron/28.2.10 Safari/537.36")
+
+# ─────────────────────────────────────────────
+# LATENCY TUNING — global aiohttp session
+# one shared connection pool, keepalive, no Nagle, no DNS re-resolution
+# ─────────────────────────────────────────────
+
+_LATENCY_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Authorization": TOKEN,
+}
+
+def _build_connector():
+    try:
+        return aiohttp.TCPConnector(
+            limit=32,
+            limit_per_host=16,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            force_close=False,
+            use_dns_cache=True,
+        )
+    except TypeError:
+        return aiohttp.TCPConnector(limit=32, limit_per_host=16)
+
+_aio_timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=20)
+_GLOBAL_SESSION = None
+
+def _get_session():
+    """Return the shared ClientSession. Created lazily because the loop
+    must exist first."""
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None or _GLOBAL_SESSION.closed:
+        _GLOBAL_SESSION = aiohttp.ClientSession(
+            headers=_LATENCY_HEADERS,
+            timeout=_aio_timeout,
+            connector=_build_connector(),
+        )
+    return _GLOBAL_SESSION
+
+async def _close_session():
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION and not _GLOBAL_SESSION.closed:
+        try:
+            await _GLOBAL_SESSION.close()
+        except Exception:
+            pass
+        _GLOBAL_SESSION = None
+
+def _tcp_nodelay(sock):
+    """Turn off Nagle on a raw socket. Small gateway frames go out
+    immediately instead of coalescing for 40-200ms."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 # ACCESS CONTROL
@@ -240,24 +296,17 @@ def access_load():
         print(f"[access] load error: {e}")
 
 def _access_level(uid: int) -> str:
-    if uid == _current_owner():
-        return "owner"
-    if uid in _admins:
-        return "admin"
-    if uid in _devs:
-        return "dev"
+    if uid == _current_owner(): return "owner"
+    if uid in _admins: return "admin"
+    if uid in _devs: return "dev"
     return "user"
 
 def _access_ok(uid: int, cmd: str) -> bool:
     lvl = _access_level(uid)
-    if lvl == "owner":
-        return True
-    if cmd in OWNER_COMMANDS:
-        return False
-    if cmd in ADMIN_COMMANDS and lvl != "admin":
-        return False
-    if cmd in DEVELOPER_COMMANDS and lvl != "dev":
-        return False
+    if lvl == "owner": return True
+    if cmd in OWNER_COMMANDS: return False
+    if cmd in ADMIN_COMMANDS and lvl != "admin": return False
+    if cmd in DEVELOPER_COMMANDS and lvl != "dev": return False
     return True
 
 access_load()
@@ -501,6 +550,10 @@ HELP_DATA = {
         ("queue on/off","toggle command queue mode"),
         ("queue workers <n>","set the number of queue workers"),
         ("queue status","show queue state"),
+        ("health","one-line alive + latency check"),
+        ("uptime","bot uptime summary"),
+        ("latency [history [n]]","heartbeat latency samples"),
+        ("incidents","disconnect / reconnect log"),
     ],
     "tasks": [
         ("task list","list background tasks"),
@@ -804,7 +857,8 @@ def build_help_section(cat, page=1):
 # STATE
 # ─────────────────────────────────────────────
 
-client = discord.Client(token=TOKEN)
+# latency-optimised client — no guild chunking, socket-level tweaks
+client = discord.Client(token=TOKEN, chunk_guilds_at_startup=False)
 _MAIN_CLIENT = client
 
 # ── inline state ──
@@ -871,6 +925,9 @@ _TASK_STORE = "database/tasks.json"
 _TRIGGER_STORE = "database/triggers.json"
 _triggers = {"message": [], "reaction": [], "voice": [], "member": []}
 _trigger_fired_counts = defaultdict(int)
+
+# latency samples
+_latency_history = []
 
 # ── host state ──
 _host_sessions: list = []
@@ -949,14 +1006,13 @@ GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
 
 async def snipe_nitro(code, channel_id):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem",
-                headers={"Authorization": TOKEN, "Content-Type": "application/json",
-                         "User-Agent": USER_AGENT},
-                json={"channel_id": str(channel_id)},
-            ) as r:
-                log_msg("SNIPER", f"{'✓ SNIPED' if r.status == 200 else '✗ miss'} {code} [{r.status}]")
+        s = _get_session()
+        async with s.post(
+            f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem",
+            headers={"Content-Type": "application/json"},
+            json={"channel_id": str(channel_id)},
+        ) as r:
+            log_msg("SNIPER", f"{'✓ SNIPED' if r.status == 200 else '✗ miss'} {code} [{r.status}]")
     except Exception as e:
         log_msg("SNIPER", f"error: {e}")
 
@@ -974,10 +1030,10 @@ async def translate_text(text, target_lang):
     try:
         url = "https://translate.googleapis.com/translate_a/single"
         params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                d = await r.json()
-                return "".join(p[0] for p in d[0] if p[0])
+        s = _get_session()
+        async with s.get(url, params=params) as r:
+            d = await r.json()
+            return "".join(p[0] for p in d[0] if p[0])
     except Exception as e:
         return f"error: {e}"
 
@@ -988,31 +1044,29 @@ NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
 async def neko_gif(action):
     endpoint = action if action in NEKO_ACTIONS else "hug"
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://nekos.life/api/v2/img/{endpoint}",
-                             timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status == 200:
-                    return (await r.json()).get("url")
+        s = _get_session()
+        async with s.get(f"https://nekos.life/api/v2/img/{endpoint}") as r:
+            if r.status == 200:
+                return (await r.json()).get("url")
     except Exception:
         pass
     return None
 
 async def set_hypesquad(house_id: int):
-    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post("https://discord.com/api/v9/hypesquad/online",
-                              headers=h, json={"house_id": house_id}) as r:
-                return r.status in (200, 204), await r.text()
+        s = _get_session()
+        async with s.post("https://discord.com/api/v9/hypesquad/online",
+                          headers={"Content-Type": "application/json"},
+                          json={"house_id": house_id}) as r:
+            return r.status in (200, 204), await r.text()
     except Exception as e:
         return False, str(e)
 
 async def clear_hypesquad():
-    h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.delete("https://discord.com/api/v9/hypesquad/online", headers=h) as r:
-                return r.status in (200, 204)
+        s = _get_session()
+        async with s.delete("https://discord.com/api/v9/hypesquad/online") as r:
+            return r.status in (200, 204)
     except Exception:
         return False
 
@@ -1136,10 +1190,24 @@ async def _cache_cleanup_loop():
                     if len(_tracking[uid]) > 200: _tracking[uid] = _tracking[uid][-200:]
                 if len(_session_events) > 200: del _session_events[:-200]
                 if len(_rate_limit_events) > 200: del _rate_limit_events[:-200]
+                if len(_latency_history) > 500: del _latency_history[:-500]
             await asyncio.sleep(600)
         except Exception as e:
             print(f"[cache] {e}")
             await asyncio.sleep(60)
+
+async def _heartbeat_probe_loop():
+    """Sample client.latency every 60s so $latency history has data even when idle."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            lat = getattr(client, "latency", None)
+            if lat is not None:
+                _latency_history.append({"ts": time.time(), "ms": round(lat * 1000, 1)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[heartbeat probe] {e}")
 
 async def _queue_worker(name):
     while True:
@@ -1251,6 +1319,10 @@ async def _boot_cogs():
         cstate._has_crypto = _HAS_CRYPTO
         cstate._HAS_CRYPTO = _HAS_CRYPTO
 
+        # NEW — expose the shared session builder so cogs stop opening
+        # fresh ClientSessions on every request
+        cstate._get_session = _get_session
+
         cstate.HOSTED_TOKENS = HOSTED_TOKENS
         cstate._host_sessions = _host_sessions
         cstate._hosted_clients = _hosted_clients
@@ -1308,6 +1380,8 @@ async def _boot_cogs():
         cstate.SNIPER_ENABLED = SNIPER_ENABLED
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
+        cstate._latency_history = _latency_history
+        cstate._last_ready_ts = _last_ready_ts
 
         # access control (shared by reference)
         cstate.OWNER_ID           = OWNER_ID
@@ -1366,6 +1440,23 @@ async def on_ready():
         _host_lock = asyncio.Lock()
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
+
+    # NEW — shared session + TCP_NODELAY on the gateway socket
+    try:
+        _get_session()
+        print("[turbo] shared aiohttp session warm")
+    except Exception as e:
+        print(f"[turbo] session init failed: {e}")
+
+    try:
+        gw = getattr(client, "_gateway", None)
+        ws = getattr(gw, "_ws", None) if gw else None
+        sock = getattr(ws, "_sock", None) or getattr(ws, "sock", None)
+        if sock is not None:
+            _tcp_nodelay(sock)
+            print("[turbo] TCP_NODELAY applied to gateway socket")
+    except Exception as e:
+        print(f"[turbo] tcp_nodelay skipped: {e}")
 
     is_main = True
     idx = "main"
@@ -1427,6 +1518,8 @@ async def on_ready():
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
         task_register("cache_cleanup", _cache_cleanup_loop())
+    if not any("heartbeat_probe" in str(t) for t in asyncio.all_tasks()):
+        task_register("heartbeat_probe", _heartbeat_probe_loop())
     if cfg.get("autoclaim_enabled") and not any("autoclaim" in str(t) for t in asyncio.all_tasks()):
         try:
             from cogs.quests import autoclaim_loop
@@ -1491,6 +1584,7 @@ async def _dispatch_message(_client, message):
     global _server_prefixes, _cmd_blacklist_server, _cmd_blacklist_channel
     global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
     global _managed_tasks
+    global _latency_history
 
     # ── PRE-HOOKS ──
 
@@ -1550,6 +1644,7 @@ async def _dispatch_message(_client, message):
             "time": datetime.now().strftime("%H:%M:%S"),
             "content": message.content,
             "channel": getattr(message.channel, "name", str(message.channel.id)),
+            "ts": time.time(),
         })
         if len(_tracking[message.author.id]) > 200:
             _tracking[message.author.id] = _tracking[message.author.id][-200:]
@@ -1608,7 +1703,7 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
-    # ── SUPERREACT (continuous, own messages) ──
+    # ── SUPERREACT (own messages) ──
     if (_superreact_emoji
             and message.author.id == client.user.id
             and message.content
@@ -1645,6 +1740,15 @@ async def _dispatch_message(_client, message):
             return
         _cooldown_last[key] = time.time()
 
+    # sample latency on every command
+    try:
+        lat = getattr(client, "latency", None)
+        if lat is not None:
+            _latency_history.append({"ts": time.time(), "ms": round(lat * 1000, 1)})
+            if len(_latency_history) > 500: del _latency_history[:-500]
+    except Exception:
+        pass
+
     if not _perm_check(cmd, message):
         return
 
@@ -1662,6 +1766,66 @@ async def _dispatch_message(_client, message):
         return
 
     db_stats_inc(cmd)
+
+    # ── INLINE LATENCY / HEALTH / UPTIME — no cog hop, fastest reply ──
+    if cmd == "health":
+        cogs_n = len(_COG_INSTANCES)
+        live_tasks = sum(1 for t in asyncio.all_tasks() if not t.done())
+        gw = getattr(client, "_gateway", None)
+        gw_ok = bool(getattr(gw, "is_connected", False)) if gw else False
+        lat = getattr(client, "latency", 0) or 0
+        await message.edit(content=ui_box("health", [
+            f"  {DIM}user{S.RESET}      {client.user}",
+            f"  {DIM}gateway{S.RESET}   {'ok' if gw_ok else 'DOWN'}",
+            f"  {DIM}latency{S.RESET}   {round(lat*1000,1)}ms",
+            f"  {DIM}cogs{S.RESET}      {cogs_n}",
+            f"  {DIM}tasks{S.RESET}     {live_tasks}",
+            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
+            f"  {DIM}uptime{S.RESET}    {int(time.time() - _last_ready_ts)}s",
+        ]))
+        return
+
+    if cmd == "uptime":
+        up = int(time.time() - _last_ready_ts)
+        h, rem = divmod(up, 3600); m, s = divmod(rem, 60)
+        await message.edit(content=ui_box("uptime", [
+            f"  {DIM}up{S.RESET}          {h}h {m}m {s}s",
+            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
+            f"  {DIM}since ready{S.RESET} {datetime.fromtimestamp(_last_ready_ts).strftime('%Y-%m-%d %H:%M:%S')}",
+        ]))
+        return
+
+    if cmd == "latency":
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "history":
+            n = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+            samples = _latency_history[-n:]
+            if not samples:
+                return await message.edit(content=ui_info("no samples yet"))
+            vals = [s["ms"] for s in samples]
+            avg = sum(vals) / len(vals)
+            lo, hi = min(vals), max(vals)
+            await message.edit(content=ui_box("latency history", [
+                f"  {DIM}samples{S.RESET}  {len(samples)}",
+                f"  {DIM}avg{S.RESET}      {avg:.1f}ms",
+                f"  {DIM}min{S.RESET}      {lo:.1f}ms",
+                f"  {DIM}max{S.RESET}      {hi:.1f}ms",
+                f"  {DIM}current{S.RESET}  {round(getattr(client, 'latency', 0)*1000, 1)}ms",
+            ]))
+            return
+        cur = round(getattr(client, "latency", 0) * 1000, 1)
+        return await message.edit(content=ui_ok(f"latency: {cur}ms"))
+
+    if cmd == "incidents":
+        rows = []
+        for e in _session_events[-40:]:
+            if e.get("event") in ("disconnect", "resumed", "ready"):
+                ts = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+                extra = f" #{e.get('count')}" if "count" in e else ""
+                rows.append(f"  {GREY}{ts}{RESET}  {e['event']}{extra}")
+        await message.edit(content=_paginate("incidents", "session events", rows)
+                           if rows else ui_info("none"))
+        return
 
     # ── COG ROUTE ──
     if cmd in _COG_REGISTRY:
