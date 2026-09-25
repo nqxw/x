@@ -1,5 +1,4 @@
 modifyself
-discord.py-self
 aiohttp
 websockets
 hcaptcha-challenger
