@@ -1,5 +1,5 @@
 # cogs/rpc.py
-import modifyself_shim as discord   # ← CHANGED (was: import discord)
+import modifyself_shim as discord
 import asyncio
 import time
 import re
@@ -74,6 +74,12 @@ SPOTIFY_FIELDS_TO_KEEP = {
     "timestamps", "instance",
 }
 
+# watchdog tuning
+_WATCH_INTERVAL = 45         # seconds between checks
+_MIN_REPUSH_GAP = 30         # don't re-push more often than this
+_CDN_REFRESH_EVERY = 20      # refresh mp: assets every N watchdog cycles (~15min)
+_BOOT_SETTLE = 4.0           # grace period after register before first push
+
 
 class RPCCog:
     COMMANDS = {
@@ -84,6 +90,7 @@ class RPCCog:
         "stopactivity", "setpresencestatus", "aoff",
         "clear_multi_rpc", "rpc_status",
         "rstatus", "remoji", "stopstatus", "stopemoji",
+        "rpcwatchdog",
     }
 
     def __init__(self, bot=None):
@@ -100,6 +107,144 @@ class RPCCog:
         self.current_emoji = ""
         self._clearing = False
         self._save_tasks = []
+
+        # watchdog state
+        self._watchdog_task = None
+        self._last_push_ts = 0.0
+        self._last_gateway_state = None
+        self._watchdog_cycles = 0
+        self._loaded_persisted = False
+
+        # auto-start if a client was provided and the loop is already up
+        if bot is not None:
+            try:
+                asyncio.get_running_loop()
+                self.register(bot)
+            except RuntimeError:
+                # no loop yet — adapter will call register() later
+                pass
+
+    # ═════════════════════════════════════════════════════════
+    # WATCHDOG + REGISTRATION
+    # ═════════════════════════════════════════════════════════
+
+    def register(self, client):
+        """
+        Called either from __init__ (if loop is up) or from the adapter's
+        register(). Idempotent — safe to call twice.
+        """
+        if client is not None:
+            self.bot = client
+
+        # hook on_ready so we re-apply after every fresh session
+        if client is not None:
+            try:
+                @client.event
+                async def on_ready():
+                    try:
+                        await asyncio.sleep(_BOOT_SETTLE)
+                        if any(s is not None for s in self.rpc_slots):
+                            print("[rpc] on_ready — reapplying presence")
+                            await self.apply_activities()
+                    except Exception as e:
+                        print(f"[rpc] on_ready reapply failed: {e}")
+            except Exception as e:
+                print(f"[rpc] on_ready hook failed: {e}")
+
+        # start watchdog once
+        if self._watchdog_task is not None and not self._watchdog_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            print("[rpc] register: no running loop — watchdog not started")
+            return
+        self._watchdog_task = loop.create_task(self._watchdog_boot())
+        print("[rpc] watchdog started")
+
+    async def _watchdog_boot(self):
+        # load persisted state once
+        if not self._loaded_persisted:
+            try:
+                self._load_rpc_slots()
+                self._load_asset_urls()
+                self._loaded_persisted = True
+            except Exception as e:
+                print(f"[rpc] persisted load failed: {e}")
+
+        # let the gateway settle before first push
+        await asyncio.sleep(_BOOT_SETTLE)
+
+        # initial push if we restored anything
+        if any(s is not None for s in self.rpc_slots):
+            try:
+                await self.apply_activities()
+                print("[rpc] restored saved presence")
+            except Exception as e:
+                print(f"[rpc] initial restore push failed: {e}")
+
+        # main watchdog loop
+        await self._watchdog()
+
+    async def _watchdog(self):
+        while True:
+            try:
+                await asyncio.sleep(_WATCH_INTERVAL)
+                self._watchdog_cycles += 1
+                await self._maybe_repush()
+                if self._watchdog_cycles % _CDN_REFRESH_EVERY == 0:
+                    try:
+                        await self._refresh_all_assets()
+                    except Exception as e:
+                        print(f"[rpc] cdn refresh failed: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[rpc] watchdog loop error: {e}")
+                await asyncio.sleep(10)
+
+    def _gateway_snapshot(self):
+        client = self.bot
+        if client is None:
+            return None
+        gw = getattr(client, "_gateway", None)
+        if gw is None:
+            return None
+        try:
+            return (
+                bool(getattr(gw, "is_connected", False)),
+                bool(getattr(gw, "is_closed", False)),
+            )
+        except Exception:
+            return None
+
+    async def _maybe_repush(self):
+        active = any(s is not None for s in self.rpc_slots)
+        if not active:
+            self._last_gateway_state = self._gateway_snapshot()
+            return
+
+        snap = self._gateway_snapshot()
+        reconnected = (
+            self._last_gateway_state is not None
+            and snap is not None
+            and self._last_gateway_state[0] is False
+            and snap[0] is True
+        )
+        self._last_gateway_state = snap
+
+        if reconnected:
+            print("[rpc] gateway reconnected — reapplying presence")
+            await self.apply_activities()
+            return
+
+        now = time.time()
+        if now - self._last_push_ts > _MIN_REPUSH_GAP:
+            await self.apply_activities()
+
+    # ═════════════════════════════════════════════════════════
+    # COMMAND DISPATCH
+    # ═════════════════════════════════════════════════════════
 
     async def handle(self, message, cmd, args):
         try:
@@ -143,9 +288,7 @@ class RPCCog:
                 try:
                     self.rpc_slots = [None] * 6
                     try:
-                        await self.bot.ws.send_json({
-                            "op": 3, "d": {"since": 0, "activities": [],
-                                            "status": "online", "afk": False}})
+                        await self._send_presence_payload([], "online")
                     except Exception:
                         pass
                     self._save_rpc_slots()
@@ -167,6 +310,34 @@ class RPCCog:
                             f"RPC{i+1} [{label}] {act.get('name', '—')} | "
                             f"{act.get('details', '—')} | {act.get('state', '—')}")
                 await message.channel.send(ascii.multiline(lines))
+                return
+            if cmd == "rpcwatchdog":
+                # manual status / kick of the watchdog
+                sub = rest[0].lower() if rest else ""
+                if sub in ("stop", "off"):
+                    if self._watchdog_task and not self._watchdog_task.done():
+                        self._watchdog_task.cancel()
+                        self._watchdog_task = None
+                        await message.channel.send(ascii.info("rpc watchdog stopped"))
+                    else:
+                        await message.channel.send(ascii.info("rpc watchdog not running"))
+                    return
+                if sub in ("start", "on"):
+                    self.register(self.bot)
+                    await message.channel.send(ascii.info("rpc watchdog started"))
+                    return
+                # status
+                running = self._watchdog_task is not None and not self._watchdog_task.done()
+                since = int(time.time() - self._last_push_ts) if self._last_push_ts else -1
+                snap = self._gateway_snapshot()
+                await message.channel.send(ascii.multiline([
+                    f"rpc watchdog: {'running' if running else 'stopped'}",
+                    f"cycles:       {self._watchdog_cycles}",
+                    f"last push:    {since}s ago" if since >= 0 else "last push:    never",
+                    f"gw snapshot:  {snap}",
+                    f"slots active: {sum(1 for s in self.rpc_slots if s is not None)}",
+                    f"persisted:    {'yes' if self._loaded_persisted else 'no'}",
+                ]))
                 return
             if cmd == "rstatus":
                 if not rest:
@@ -426,12 +597,15 @@ class RPCCog:
             if not parts: parts = ["Exploring VRChat", "VRChat"]
             self.rpc_slots[slot] = await self.build_vrchat(parts)
         elif cmd == "meta":
+            # extract a URL if present, without mutating during iteration
             image_url = None
-            for i, w in enumerate(words):
-                if w.startswith(("http://", "https://")):
+            kept = []
+            for w in words:
+                if image_url is None and w.startswith(("http://", "https://")):
                     image_url = w
-                    words = words[:i] + words[i+1:]
-                    break
+                    continue
+                kept.append(w)
+            words = kept
             if words and words[-1] in ("1", "2", "3", "4", "5", "6"):
                 slot = int(words[-1]) - 1
                 words = words[:-1]
@@ -443,21 +617,72 @@ class RPCCog:
         shown = parts[0] if parts else "ok"
         await ch.send(ascii.success(f"{cmd} → slot {slot+1}: {shown}"))
 
+    # ═════════════════════════════════════════════════════════
+    # PRESENCE PUSH
+    # ═════════════════════════════════════════════════════════
+
+    async def _send_presence_payload(self, activities, status="online"):
+        """
+        Single choke point for pushing op:3. Prefers the raw gateway,
+        falls back to the shim's ws wrapper. Returns True on success.
+        """
+        client = self.bot
+        if client is None:
+            return False
+
+        payload = {
+            "op": 3,
+            "d": {
+                "since": 0,
+                "activities": activities,
+                "status": status,
+                "afk": False,
+            },
+        }
+
+        # prefer direct gateway
+        gw = getattr(client, "_gateway", None)
+        if gw is not None and hasattr(gw, "send_json"):
+            try:
+                await gw.send_json(payload)
+                return True
+            except Exception as e:
+                print(f"[RPC] gateway send_json failed: {e}")
+
+        # fallback to shim ws wrapper
+        ws = getattr(client, "ws", None)
+        if ws is not None and hasattr(ws, "send_json"):
+            try:
+                result = await ws.send_json(payload)
+                # _WSShim returns None if gw is missing — treat as failure
+                return result is not None or gw is not None
+            except Exception as e:
+                print(f"[RPC] ws.send_json failed: {e}")
+        return False
+
     async def apply_activities(self):
         active = [a for a in self.rpc_slots if a is not None]
+
+        # always allow a clear
         if not active:
+            ok = await self._send_presence_payload([], "online")
+            if ok:
+                self._last_push_ts = time.time()
             return
-        try:
-            payload = {"op": 3, "d": {
-                "since": 0, "activities": active,
-                "status": "online", "afk": False}}
-            await self.bot.ws.send_json(payload)
+
+        ok = await self._send_presence_payload(active, "online")
+        if ok:
+            self._last_push_ts = time.time()
             self._save_rpc_slots()
-        except Exception as e:
-            print(f"[RPC] push failed: {e}")
+        else:
+            print("[RPC] push returned False — will retry on next watchdog tick")
+
+    # ═════════════════════════════════════════════════════════
+    # PERSISTENCE
+    # ═════════════════════════════════════════════════════════
 
     def _get_user_file(self, filename):
-        if not self.bot.user:
+        if not self.bot or not getattr(self.bot, "user", None):
             return Path(f"data/_unready_{filename}")
         uid = str(self.bot.user.id)
         return Path(f"data/{uid}_{filename}")
@@ -495,9 +720,9 @@ class RPCCog:
                     self.rpc_slots[i] = slot
             count = sum(1 for s in self.rpc_slots if s)
             if count:
-                print(f"[RPC] Loaded {count} saved RPC slots for {self.bot.user}")
+                print(f"[RPC] loaded {count} saved RPC slots")
         except Exception as e:
-            print(f"[RPC] Failed to load saved RPCs: {e}")
+            print(f"[RPC] failed to load saved RPCs: {e}")
 
     def _save_asset_urls(self):
         path = self._get_user_file("asset_urls.json")
@@ -517,6 +742,10 @@ class RPCCog:
                 self._asset_urls = json.load(f)
         except Exception:
             self._asset_urls = {}
+
+    # ═════════════════════════════════════════════════════════
+    # SLOT HELPERS
+    # ═════════════════════════════════════════════════════════
 
     def _ensure_slot(self, index: int):
         if self.rpc_slots[index] is None:
@@ -548,15 +777,23 @@ class RPCCog:
 
     async def _refresh_all_assets(self):
         try:
+            changed = False
             for slot in self.rpc_slots:
                 if slot and "assets" in slot:
                     assets = slot["assets"]
                     if assets.get("large_image", "").startswith("mp:"):
-                        assets["large_image"] = await self._refresh_cdn_url(assets["large_image"])
+                        new = await self._refresh_cdn_url(assets["large_image"])
+                        if new != assets["large_image"]:
+                            assets["large_image"] = new
+                            changed = True
                     if assets.get("small_image", "").startswith("mp:"):
-                        assets["small_image"] = await self._refresh_cdn_url(assets["small_image"])
-            if any(a is not None for a in self.rpc_slots):
+                        new = await self._refresh_cdn_url(assets["small_image"])
+                        if new != assets["small_image"]:
+                            assets["small_image"] = new
+                            changed = True
+            if changed and any(a is not None for a in self.rpc_slots):
                 await self.apply_activities()
+                print("[rpc] refreshed cdn attachment urls")
         except Exception as e:
             print(f"[RPC] refresh_all_assets error: {e}")
 
@@ -672,6 +909,10 @@ class RPCCog:
                 btns[1] = {"label": " ".join(parts[:-1]), "url": parts[-1]}
                 act["buttons"] = [b for b in btns if b]
 
+    # ═════════════════════════════════════════════════════════
+    # ASSET UPLOAD
+    # ═════════════════════════════════════════════════════════
+
     async def upload_asset(self, image_url: str):
         if not image_url:
             return None
@@ -688,7 +929,7 @@ class RPCCog:
             self._asset_urls[key] = image_url
             return key
 
-        if not self.bot.user:
+        if not self.bot or not getattr(self.bot, "user", None):
             print("[RPC] upload_asset: bot.user not ready")
             return None
 
@@ -741,6 +982,10 @@ class RPCCog:
             print(f"[RPC] upload_asset failed: {type(e).__name__}: {e}")
             traceback.print_exc()
         return None
+
+    # ═════════════════════════════════════════════════════════
+    # ACTIVITY BUILDERS
+    # ═════════════════════════════════════════════════════════
 
     async def build_spotify(self, parts: list):
         if len(parts) < 2:
