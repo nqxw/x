@@ -4,3 +4,5 @@ hcaptcha-challenger
 playwright
 cryptography
 yt-dlp
+wreq
+audioop-lts ; python_version >= "3.13"
