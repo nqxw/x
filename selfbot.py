@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# lunar — v2.6.0-turbo
+# mist — v2.6.0-turbo
 
 import modifyself_shim as discord
 
@@ -152,7 +152,7 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[lunar] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[mist] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
@@ -498,7 +498,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show lunar version"),("reload","reload config from disk"),
+        ("version","show mist version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -581,7 +581,7 @@ HELP_DATA = {
     ],
     "developer": [
         ("eval <code>","owner+dev only — evaluate python code"),
-        ("restart","restart the lunar process"),
+        ("restart","restart the mist process"),
         ("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),
@@ -833,11 +833,11 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> mist{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  lunar | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  mist | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -1926,7 +1926,7 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[Mist] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
     client.run()
 except Exception as e:
