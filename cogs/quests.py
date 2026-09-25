@@ -1,18 +1,23 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
 #
-# v2 fixes:
-#   - _video timestamp now advances monotonically by real wall-time delta,
-#     and no longer exits early when Discord's progress_value lags behind
-#   - heartbeat payloads now prefer application_id and, for STREAM_ON_DESKTOP,
-#     a real voice channel id (read from the voice cog or shim state)
-#   - x-super-properties client_build_number refreshed; headers extended
-#   - _mission no longer spams video-progress with fake timestamps
-#   - stall detection: give up cleanly if no progress moves for 2 minutes
-#   - fetch no longer swallows 401/403 silently
+# v3 fixes:
+#   - split hcaptcha init lock from solve lock (was: single lock, deadlocks
+#     when two claims overlap)
+#   - _video: 429s and 400s now feed the stall counter, cap on budget spent
+#   - _video: poll interval raised to 5s after the first tick (matches client)
+#   - _heartbeat_task: 429 on one payload sleeps the whole task, not just that
+#     payload — prevents hammering the endpoint with the fallback cascade
+#   - autoclaim loop is now a named singleton, $autoclaim on is idempotent
+#   - _current_voice_channel_id: cross-checks against cached guild state, so a
+#     stale channel id from a former guild can't sneak into a heartbeat
+#   - _mission: 400s are logged (they carry useful body), not swallowed
+#   - _claim_quest / claim_orb reuse the shared aiohttp session when available
+#   - quest UA realigned: plain Chrome UA + matching client build number
 import asyncio
 import base64
 import json
 import os
+import re
 import time
 import traceback
 import aiohttp
@@ -52,10 +57,40 @@ DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
 ORB_SKU = "1342211853484429445"
 
 # refresh this when quest endpoints start rejecting with 400
-CLIENT_BUILD_NUMBER = 358560  # mid-2026 stable
+CLIENT_BUILD_NUMBER = 358560
+
+# UA realigned — plain Chrome, no discord/<build> segment that would
+# disagree with the client_build_number in x-super-properties
+QUEST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 _hcaptcha_agent = None
-_hcaptcha_lock = asyncio.Lock()
+_agent_init_lock = asyncio.Lock()
+_solve_lock = asyncio.Lock()
+
+# singleton task handle so $autoclaim on is idempotent
+_autoclaim_task = None
+
+
+# ─────────────────────────────────────────────────────────────
+# SHARED SESSION
+# ─────────────────────────────────────────────────────────────
+
+def _get_shared_session():
+    """Prefer the module-level session from selfbot.py (turbo). Fall back
+    to a local one-off session when the shim isn't wired up yet."""
+    try:
+        from __main__ import _get_session as _main_get
+        return _main_get(), False
+    except Exception:
+        pass
+    try:
+        s = getattr(S, "_get_session", None)
+        if callable(s):
+            return s(), False
+    except Exception:
+        pass
+    return aiohttp.ClientSession(), True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -64,13 +99,11 @@ _hcaptcha_lock = asyncio.Lock()
 
 def _quest_headers(token):
     token = token.strip().strip('"').strip("'")
-    ua = S.USER_AGENT
-    # extract chrome version from the modifyself UA if present
-    browser_version = "142.0.0.0"
+    browser_version = "131.0.0.0"
     try:
-        import re as _re
-        m = _re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", ua)
-        if m: browser_version = m.group(1)
+        m = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", QUEST_UA)
+        if m:
+            browser_version = m.group(1)
     except Exception:
         pass
     sp = base64.b64encode(json.dumps({
@@ -80,7 +113,7 @@ def _quest_headers(token):
         "system_locale": "en-US",
         "has_client_mods": False,
         "client_version": "1.0.0",
-        "browser_user_agent": ua,
+        "browser_user_agent": QUEST_UA,
         "browser_version": browser_version,
         "os_version": "10",
         "referrer": "",
@@ -97,7 +130,7 @@ def _quest_headers(token):
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json",
-        "user-agent": ua,
+        "user-agent": QUEST_UA,
         "x-super-properties": sp,
         "x-discord-locale": "en-US",
         "x-discord-timezone": "America/New_York",
@@ -108,31 +141,39 @@ def _quest_headers(token):
 
 
 # ─────────────────────────────────────────────────────────────
-# VOICE CHANNEL RESOLUTION — for STREAM_ON_DESKTOP heartbeat
+# VOICE CHANNEL RESOLUTION — cross-checked against live guild state
 # ─────────────────────────────────────────────────────────────
 
 def _current_voice_channel_id():
-    """read the current voice channel id from voice cog or shim state."""
     client = S.CLIENT
     if client is None:
         return None
-    # try the voice cog's tracker first
     try:
         from . import voice as _v
-        ch = getattr(_v, "_self_vc", {}).get("channel_id")
-        if ch:
-            return int(ch)
+        svc = getattr(_v, "_self_vc", {}) or {}
+        ch = svc.get("channel_id")
+        gid = svc.get("guild_id")
+        if ch and gid:
+            guilds = getattr(client._state, "_guilds", None) or {}
+            g = guilds.get(int(gid))
+            if g is not None:
+                try:
+                    if g.get_channel(int(ch)) is not None:
+                        return int(ch)
+                except Exception:
+                    pass
     except Exception:
         pass
-    # shim live state
     for attr in ("_voice_state", "_current_voice", "_voice"):
         vs = getattr(client, attr, None)
         if vs is None:
             continue
         cid = getattr(vs, "channel_id", None)
         if cid:
-            try: return int(cid)
-            except Exception: pass
+            try:
+                return int(cid)
+            except Exception:
+                pass
     return None
 
 
@@ -172,13 +213,17 @@ async def _api(session, method, url, headers=None, json_body=None, retries=3):
     return {}
 
 
+# ─────────────────────────────────────────────────────────────
+# HCAPTCHA — init lock and solve lock are separate
+# ─────────────────────────────────────────────────────────────
+
 async def _get_hcaptcha_agent():
     global _hcaptcha_agent
     if _hcaptcha_agent is not None:
         return _hcaptcha_agent
     if not HAS_HCAPTCHA:
         return None
-    async with _hcaptcha_lock:
+    async with _agent_init_lock:
         if _hcaptcha_agent is not None:
             return _hcaptcha_agent
         try:
@@ -202,7 +247,7 @@ async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None):
         return None
     try:
         payload = {"sitekey": sitekey, "url": url, "rqdata": rqdata or "", "type": "hsl"}
-        async with _hcaptcha_lock:
+        async with _solve_lock:
             resp = await agent.solve(payload)
         token = None
         if resp is not None:
@@ -373,7 +418,6 @@ class QuestService:
                 return await self._heartbeat_task(session, quest, task)
             if task in MISSION_TASKS:
                 return await self._mission(session, quest)
-            # unknown fallthrough — try heartbeat with app_id
             return await self._heartbeat_task(session, quest, "PLAY_ON_DESKTOP")
         except asyncio.CancelledError:
             raise
@@ -388,14 +432,7 @@ class QuestService:
     # ── VIDEO ────────────────────────────────────────────────
 
     async def _video(self, session, quest):
-        """
-        Discord credits video progress based on real wall-time elapsed since
-        enrollment. send timestamp values that grow monotonically; do NOT
-        exit the loop just because user_status.progress_value lags — Discord
-        updates that field a beat behind the response body.
-        """
         target = quest.target or 1.0
-        # get the highest known timestamp — the response body returns it
         last_sent = 0.0
         try:
             ustatus = quest.user_status
@@ -407,13 +444,16 @@ class QuestService:
         wall_start = time.time()
         stall = 0
         last_seen = last_sent
+        # deadline: real wall-time budget. allow target*1.5 minimum 60s.
         deadline = wall_start + max(60.0, target * 1.5)
+        # first few ticks are fast to establish progress, then slow down to
+        # match the real client (one update roughly every 5-10s)
+        tick_count = 0
 
         while time.time() < deadline:
+            tick_count += 1
             elapsed = time.time() - wall_start
-            # wall-time-backed timestamp: monotonic, bounded by target
             ts = min(target, last_sent + elapsed)
-            # enforce a small positive step so it's never flat
             if ts <= last_sent:
                 ts = last_sent + 0.5
             try:
@@ -425,9 +465,17 @@ class QuestService:
             except APIError as e:
                 if e.status == 429:
                     await asyncio.sleep(float(e.body.get("retry_after", 2.0)))
+                    stall += 1
+                    if stall >= 20:
+                        print(f"[video] {quest.name} rate-limit stalled — bailing")
+                        break
                     continue
                 if e.status == 400:
                     await asyncio.sleep(1.5)
+                    stall += 1
+                    if stall >= 20:
+                        print(f"[video] {quest.name} 400 stalled — bailing")
+                        break
                     continue
                 print(f"[video] {quest.name} {e.status}: {e.body}")
                 break
@@ -438,10 +486,8 @@ class QuestService:
             if d:
                 quest.data["user_status"] = d
                 last_sent = float(ts)
-                # check for completed_at in the response
                 if d.get("completed_at") or quest.is_completed():
                     return "completed"
-                # if Discord's progress moved, reset stall
                 cur = quest.progress_value()
                 if cur > last_seen + 0.5:
                     last_seen = cur
@@ -451,32 +497,25 @@ class QuestService:
             if stall >= 20:
                 print(f"[video] {quest.name} stalling — bailing")
                 break
-            await asyncio.sleep(2.0)
+            # first three ticks at 2s, then 5s
+            await asyncio.sleep(2.0 if tick_count < 3 else 5.0)
 
-        # final re-fetch to be sure
         fresh = await self.re_fetch_one(session, quest.id)
         if fresh:
             quest.data = fresh
         return "completed" if quest.is_completed() else "recovering"
 
-    # ── HEARTBEAT (PLAY_ON_DESKTOP, PLAY_ACTIVITY, STREAM_ON_DESKTOP) ──
+    # ── HEARTBEAT ────────────────────────────────────────────
 
     def _build_heartbeat_payloads(self, quest, task):
-        """
-        Discord credits desktop-play quests when the heartbeat carries either
-        a valid application_id matching the quest's app, or a valid stream_key
-        resolving to a voice channel you're currently connected to.
-        """
         payloads = []
         app_id = quest.app_id
 
-        # STREAM_ON_DESKTOP requires a real channel id
         if task == "STREAM_ON_DESKTOP":
             ch = _current_voice_channel_id()
             if ch:
                 payloads.append({"stream_key": f"call:{ch}:1", "terminal": False})
 
-        # PLAY_* prefer application_id with the standard stream_key placeholder
         if task in ("PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2", "PLAY_ACTIVITY"):
             if app_id:
                 payloads.append({
@@ -485,16 +524,13 @@ class QuestService:
                     "stream_key": "call:0:0",
                 })
 
-        # generic application_id fallback (no stream_key)
         if app_id:
             payloads.append({"application_id": str(app_id), "terminal": False})
 
-        # real channel id if we're in a voice channel — helps a lot on some quests
         ch = _current_voice_channel_id()
         if ch and task != "STREAM_ON_DESKTOP":
             payloads.append({"stream_key": f"call:{ch}:1", "terminal": False})
 
-        # last resort — the older heuristic. may not credit.
         payloads.append({"stream_key": f"call:{quest.id}:1", "terminal": False})
         return payloads
 
@@ -504,27 +540,38 @@ class QuestService:
         active = payloads[0]
         last_seen = quest.progress_value()
         stall = 0
-        # cap runtime: allow up to 2x target seconds or 10 minutes
         max_runtime = min(600, max(120, (quest.target or 60) * 2))
         start = time.time()
 
         while time.time() - start < max_runtime:
             d = None
+            # 429 on ANY payload sleeps the whole task — this prevents the
+            # fallback cascade from hammering the endpoint on the same bucket
+            rate_limited = False
             for p in payloads:
                 try:
                     d = await _api(session, "POST",
                                    f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
                                    headers=self.headers,
                                    json_body=p,
-                                   retries=2)
+                                   retries=1)
                     active = p
                     break
                 except APIError as e:
                     if e.status == 429:
-                        await asyncio.sleep(float(e.body.get("retry_after", 2.0)))
+                        await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
+                        rate_limited = True
+                        break
                     continue
                 except Exception:
                     continue
+            if rate_limited:
+                stall += 1
+                if stall >= 8:
+                    print(f"[heartbeat] {quest.name} rate-limit stalled — bailing")
+                    break
+                await asyncio.sleep(interval)
+                continue
 
             if d:
                 quest.data["user_status"] = d
@@ -543,7 +590,6 @@ class QuestService:
                 break
             await asyncio.sleep(interval)
 
-        # terminal heartbeat on whatever payload was working
         try:
             t = dict(active)
             t["terminal"] = True
@@ -563,7 +609,6 @@ class QuestService:
     # ── ACHIEVEMENTS ─────────────────────────────────────────
 
     async def _achievements(self, session, quest):
-        task = quest.selected_task
         target = quest.target or 1.0
         payloads = []
         if quest.app_id:
@@ -588,6 +633,7 @@ class QuestService:
         while attempts < max_attempts and not quest.is_completed():
             attempts += 1
             d = None
+            rate_limited = False
             for p in payloads:
                 try:
                     d = await _api(session, "POST",
@@ -597,10 +643,19 @@ class QuestService:
                                    retries=1)
                     active = p
                     break
-                except APIError:
+                except APIError as e:
+                    if e.status == 429:
+                        await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
+                        rate_limited = True
+                        break
                     continue
                 except Exception:
                     continue
+            if rate_limited:
+                stall += 1
+                if stall >= 12:
+                    break
+                continue
             if d:
                 quest.data["user_status"] = d
                 if quest.is_completed() or quest.progress_value() >= target:
@@ -623,29 +678,27 @@ class QuestService:
     # ── MISSION ──────────────────────────────────────────────
 
     async def _mission(self, session, quest):
-        """
-        Missions usually credit only through real Discord actions (launching
-        the app, collecting the item in-game, etc). we attempt the documented
-        progress endpoint and a short heartbeat, then bail.
-        """
         task = quest.selected_task
+        target = quest.target or 0
 
-        # try the external-task-progress endpoint with the full target
-        try:
-            d = await _api(session, "POST",
-                           f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
-                           headers=self.headers,
-                           json_body={"task_id": task, "progress": {"value": quest.target or 1}},
-                           retries=1)
-            if d:
-                quest.data["user_status"] = d
-            if quest.is_completed():
-                return "completed"
-        except APIError as e:
-            if e.status not in (400, 404):
-                print(f"[mission] external-task-progress {e.status}: {e.body}")
+        # external-task-progress only accepts value <= target; skip when target=0
+        if target > 0:
+            try:
+                d = await _api(session, "POST",
+                               f"https://discord.com/api/v9/quests/{quest.id}/external-task-progress",
+                               headers=self.headers,
+                               json_body={"task_id": task, "progress": {"value": target}},
+                               retries=1)
+                if d:
+                    quest.data["user_status"] = d
+                if quest.is_completed():
+                    return "completed"
+            except APIError as e:
+                if e.status == 400:
+                    print(f"[mission] progress rejected (target={target}): {e.body}")
+                elif e.status != 404:
+                    print(f"[mission] external-task-progress {e.status}: {e.body}")
 
-        # short heartbeat attempt with proper payloads
         payloads = []
         if quest.app_id:
             payloads.append({
@@ -672,7 +725,10 @@ class QuestService:
                             quest.data["user_status"] = d
                         if quest.is_completed():
                             break
-                    except APIError:
+                    except APIError as e:
+                        if e.status == 429:
+                            await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
+                            break
                         continue
                     except Exception:
                         continue
@@ -696,7 +752,8 @@ class QuestService:
 async def _claim_quest(token: str, quest_id: str):
     url = f"https://discord.com/api/v9/quests/{quest_id}/claim"
     h = _quest_headers(token)
-    async with aiohttp.ClientSession() as session:
+    session, own = _get_shared_session()
+    try:
         try:
             async with session.post(url, headers=h, json={}) as r:
                 text = await r.text()
@@ -725,17 +782,24 @@ async def _claim_quest(token: str, quest_id: str):
                 return r2.status in (200, 201, 204), text2[:200]
         except Exception as e:
             return False, f"retry failed: {e}"
+    finally:
+        if own:
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 async def claim_orb(token):
     h = {
         "authorization": token,
         "content-type": "application/json",
-        "user-agent": S.USER_AGENT,
+        "user-agent": QUEST_UA,
         "origin": "https://discord.com",
         "referer": "https://discord.com/shop?tab=orbs",
     }
-    async with aiohttp.ClientSession() as session:
+    session, own = _get_shared_session()
+    try:
         try:
             async with session.post(
                 f"https://discord.com/api/v9/virtual-currency/skus/{ORB_SKU}/redeem",
@@ -767,11 +831,26 @@ async def claim_orb(token):
                 return r2.status in (200, 201, 204), await r2.text()
         except Exception as e:
             return False, str(e)
+    finally:
+        if own:
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────
 # BACKGROUND LOOPS
 # ─────────────────────────────────────────────────────────────
+
+async def _ensure_autoclaim():
+    """Idempotent spawn — returns True when a fresh task was started."""
+    global _autoclaim_task
+    if _autoclaim_task is not None and not _autoclaim_task.done():
+        return False
+    _autoclaim_task = asyncio.create_task(autoclaim_loop())
+    return True
+
 
 async def autoclaim_loop():
     await asyncio.sleep(60)
@@ -782,11 +861,18 @@ async def autoclaim_loop():
                 await asyncio.sleep(300)
                 continue
             svc = QuestService(S.TOKEN)
-            async with aiohttp.ClientSession() as session:
+            session, own = _get_shared_session()
+            try:
                 try:
                     quests = await svc.fetch(session)
                 except APIError:
                     quests = []
+            finally:
+                if own:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
             pending = [q for q in quests if q.is_completed() and not q.is_claimed()]
             for q in pending:
                 print(f"[autoclaim] claiming {q.name}")
@@ -804,7 +890,8 @@ async def autoclaim_loop():
 
 async def autoquest_run(token):
     svc = QuestService(token)
-    async with aiohttp.ClientSession() as session:
+    session, own = _get_shared_session()
+    try:
         try:
             quests = await svc.fetch(session)
         except APIError as e:
@@ -815,6 +902,12 @@ async def autoquest_run(token):
             print(f"[AutoQuest] running {q.name} ({q.selected_task})")
             res = await svc.run(session, q)
             print(f"[AutoQuest] {q.name} → {res}")
+    finally:
+        if own:
+            try:
+                await session.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────
@@ -826,39 +919,44 @@ class QuestsCog:
                 "orbbadge", "questdump", "questdiag"}
 
     async def handle(self, message, cmd, args):
-        client = S.CLIENT
-
         if cmd == "quest":
             try:
                 await message.delete()
             except Exception:
                 pass
             svc = QuestService(S.TOKEN)
+            session, own = _get_shared_session()
             try:
-                async with aiohttp.ClientSession() as session:
+                try:
                     quests = await svc.fetch(session)
-            except APIError as e:
-                return await message.channel.send(
-                    S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
-            if not quests:
-                return await message.channel.send(S.ui_err("no quests"), delete_after=8)
-            rows = []
-            for i, q in enumerate(quests):
-                if q.is_claimed():
-                    tag = f"{S.GREEN}claimed{S.RESET}"
-                elif q.is_completed():
-                    tag = f"{S.GREEN}done{S.RESET}"
-                elif q.selected_task in ACHIEVEMENT_TASKS:
-                    tag = f"{S.MAGENTA}achievement{S.RESET}"
-                elif q.selected_task in MISSION_TASKS:
-                    tag = f"{S.YELLOW}mission{S.RESET}"
-                elif q.is_supported():
-                    tag = f"{S.CYAN}ok{S.RESET}"
-                else:
-                    tag = f"{S.RED}unsupported{S.RESET}"
-                rows.append(f"  {S.GREY}[{i}]{S.RESET} {S.WHITE}{q.name}{S.RESET}  {tag}")
-                rows.append(f"       {S.ui_progress(q.reward, q.progress_pct())}")
-            await message.channel.send(S._paginate("quests", "active", rows))
+                except APIError as e:
+                    return await message.channel.send(
+                        S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+                if not quests:
+                    return await message.channel.send(S.ui_err("no quests"), delete_after=8)
+                rows = []
+                for i, q in enumerate(quests):
+                    if q.is_claimed():
+                        tag = f"{S.GREEN}claimed{S.RESET}"
+                    elif q.is_completed():
+                        tag = f"{S.GREEN}done{S.RESET}"
+                    elif q.selected_task in ACHIEVEMENT_TASKS:
+                        tag = f"{S.MAGENTA}achievement{S.RESET}"
+                    elif q.selected_task in MISSION_TASKS:
+                        tag = f"{S.YELLOW}mission{S.RESET}"
+                    elif q.is_supported():
+                        tag = f"{S.CYAN}ok{S.RESET}"
+                    else:
+                        tag = f"{S.RED}unsupported{S.RESET}"
+                    rows.append(f"  {S.GREY}[{i}]{S.RESET} {S.WHITE}{q.name}{S.RESET}  {tag}")
+                    rows.append(f"       {S.ui_progress(q.reward, q.progress_pct())}")
+                await message.channel.send(S._paginate("quests", "active", rows))
+            finally:
+                if own:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
 
         elif cmd == "questrun":
             try:
@@ -867,8 +965,9 @@ class QuestsCog:
                 pass
             idx = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
             svc = QuestService(S.TOKEN)
+            session, own = _get_shared_session()
             try:
-                async with aiohttp.ClientSession() as session:
+                try:
                     quests = await svc.fetch(session)
                     if not quests or idx >= len(quests):
                         return await message.channel.send(
@@ -887,9 +986,15 @@ class QuestsCog:
                     else:
                         await message.channel.send(
                             S.ui_err(f"{q.name} → {res}"), delete_after=10)
-            except APIError as e:
-                await message.channel.send(
-                    S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+                except APIError as e:
+                    await message.channel.send(
+                        S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+            finally:
+                if own:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
 
         elif cmd == "questall":
             try:
@@ -897,8 +1002,9 @@ class QuestsCog:
             except Exception:
                 pass
             svc = QuestService(S.TOKEN)
+            session, own = _get_shared_session()
             try:
-                async with aiohttp.ClientSession() as session:
+                try:
                     quests = await svc.fetch(session)
                     active = [q for q in quests if not q.is_completed() and q.is_supported()]
                     if not active:
@@ -917,9 +1023,15 @@ class QuestsCog:
                                 pass
 
                     await asyncio.gather(*[_run(q) for q in active])
-            except APIError as e:
-                await message.channel.send(
-                    S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+                except APIError as e:
+                    await message.channel.send(
+                        S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+            finally:
+                if own:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
 
         elif cmd == "autoquest":
             try:
@@ -947,8 +1059,9 @@ class QuestsCog:
                     delete_after=6)
                 svc = QuestService(S.TOKEN)
                 claimed, failed = [], []
+                session, own = _get_shared_session()
                 try:
-                    async with aiohttp.ClientSession() as session:
+                    try:
                         quests = await svc.fetch(session)
                         for q in quests:
                             if not q.is_completed() or q.is_claimed():
@@ -959,9 +1072,15 @@ class QuestsCog:
                             else:
                                 failed.append((q.name, detail[:80]))
                             await asyncio.sleep(1.5)
-                except APIError as e:
-                    return await message.channel.send(
-                        S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+                    except APIError as e:
+                        return await message.channel.send(
+                            S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+                finally:
+                    if own:
+                        try:
+                            await session.close()
+                        except Exception:
+                            pass
                 if claimed:
                     await message.channel.send(S.ui_ok(
                         f"claimed {len(claimed)}: {', '.join(claimed[:5])}"
@@ -978,9 +1097,12 @@ class QuestsCog:
             cfg["autoclaim_enabled"] = on
             S.save_config(cfg)
             if on:
-                asyncio.create_task(autoclaim_loop())
+                started = await _ensure_autoclaim()
+                suffix = "" if started else " (already running)"
+            else:
+                suffix = ""
             await message.edit(content=S.ui_ok(
-                f"autoclaim → {'on' if on else 'off'}"))
+                f"autoclaim → {'on' if on else 'off'}{suffix}"))
 
         elif cmd == "orbbadge":
             try:
@@ -998,11 +1120,14 @@ class QuestsCog:
             except Exception:
                 pass
             ch = _current_voice_channel_id()
+            autoclaim_running = _autoclaim_task is not None and not _autoclaim_task.done()
             lines = [
                 f"  voice channel:  {ch if ch else '—'}",
                 f"  build number:   {CLIENT_BUILD_NUMBER}",
                 f"  token uid:      {QuestService(S.TOKEN).uid}",
-                f"  ua:             {S.USER_AGENT[:60]}...",
+                f"  ua:             {QUEST_UA[:60]}...",
+                f"  autoclaim:      {'running' if autoclaim_running else 'idle'}",
+                f"  hcaptcha:       {'loaded' if HAS_HCAPTCHA else 'unavailable'}",
             ]
             await message.channel.send(S._ansi_block(lines))
 
@@ -1013,47 +1138,54 @@ class QuestsCog:
                 pass
             idx = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
             svc = QuestService(S.TOKEN)
+            session, own = _get_shared_session()
             try:
-                async with aiohttp.ClientSession() as session:
-                    quests = await svc.fetch(session)
-            except APIError as e:
-                return await message.channel.send(
-                    S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
-            if not quests or idx >= len(quests):
-                return await message.channel.send(
-                    S.ui_err("index out of range"), delete_after=6)
-            q = quests[idx]
-
-            def _dump(obj, label, max_len=1900):
                 try:
-                    text = json.dumps(obj, indent=2)
-                except Exception:
-                    text = str(obj)
-                if len(text) > max_len:
-                    text = text[:max_len - 20] + "\n... (truncated)"
-                return f"**{label}**\n```json\n{text}\n```"
+                    quests = await svc.fetch(session)
+                except APIError as e:
+                    return await message.channel.send(
+                        S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+                if not quests or idx >= len(quests):
+                    return await message.channel.send(
+                        S.ui_err("index out of range"), delete_after=6)
+                q = quests[idx]
 
-            task_names = list(q.tasks.keys())
-            info_lines = [
-                f"  name:          {q.name}",
-                f"  id:            {q.id}",
-                f"  app_id:        {q.app_id}",
-                f"  selected_task: {q.selected_task}",
-                f"  target:        {q.target}",
-                f"  progress:      {q.progress_value()} / {q.target}",
-                f"  completed:     {q.is_completed()}",
-                f"  claimed:       {q.is_claimed()}",
-                f"  task types:    {', '.join(task_names) if task_names else '—'}",
-            ]
-            await message.channel.send(S.ui_box("quest info", info_lines))
+                def _dump(obj, label, max_len=1900):
+                    try:
+                        text = json.dumps(obj, indent=2)
+                    except Exception:
+                        text = str(obj)
+                    if len(text) > max_len:
+                        text = text[:max_len - 20] + "\n... (truncated)"
+                    return f"**{label}**\n```json\n{text}\n```"
 
-            ach_block = q.tasks.get(q.selected_task) or {}
-            if ach_block:
-                await message.channel.send(_dump(ach_block, f"task_config: {q.selected_task}"))
-            if q.tasks:
-                await message.channel.send(_dump(q.tasks, "all task configs"))
-            if q.user_status:
-                await message.channel.send(_dump(q.user_status, "user_status"))
-            else:
-                await message.channel.send(S.ui_info(
-                    "no user_status — quest not enrolled yet"))
+                task_names = list(q.tasks.keys())
+                info_lines = [
+                    f"  name:          {q.name}",
+                    f"  id:            {q.id}",
+                    f"  app_id:        {q.app_id}",
+                    f"  selected_task: {q.selected_task}",
+                    f"  target:        {q.target}",
+                    f"  progress:      {q.progress_value()} / {q.target}",
+                    f"  completed:     {q.is_completed()}",
+                    f"  claimed:       {q.is_claimed()}",
+                    f"  task types:    {', '.join(task_names) if task_names else '—'}",
+                ]
+                await message.channel.send(S.ui_box("quest info", info_lines))
+
+                ach_block = q.tasks.get(q.selected_task) or {}
+                if ach_block:
+                    await message.channel.send(_dump(ach_block, f"task_config: {q.selected_task}"))
+                if q.tasks:
+                    await message.channel.send(_dump(q.tasks, "all task configs"))
+                if q.user_status:
+                    await message.channel.send(_dump(q.user_status, "user_status"))
+                else:
+                    await message.channel.send(S.ui_info(
+                        "no user_status — quest not enrolled yet"))
+            finally:
+                if own:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
