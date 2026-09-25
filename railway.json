@@ -1,0 +1,38 @@
+{
+  "phases": {
+    "setup": {
+      "aptPkgs": [
+        "libxcb1",
+        "libxcb-dri3-0",
+        "libx11-xcb1",
+        "libxcomposite1",
+        "libxdamage1",
+        "libxrandr2",
+        "libgbm1",
+        "libasound2",
+        "libatk1.0-0",
+        "libatk-bridge2.0-0",
+        "libcups2",
+        "libdrm2",
+        "libgtk-3-0",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "libxfixes3",
+        "libpango-1.0-0",
+        "libcairo2",
+        "libxkbcommon0",
+        "ffmpeg"
+      ]
+    },
+    "install": {
+      "cmds": [
+        "pip install -r requirements.txt",
+        "python -m playwright install chromium"
+      ]
+    }
+  },
+  "deploy": {
+    "startCommand": "python selfbot.py"
+  }
+}
