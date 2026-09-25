@@ -1,6 +1,7 @@
 # cogs/settings.py | prefix, aliases, cooldowns, profiles, config import/export, encrypt, enable/disable
 import os
 import json
+import sys
 import time
 import modifyself_shim as discord
 from . import state as S
@@ -39,7 +40,6 @@ class SettingsCog:
         if len(args) < 2: return await message.edit(content=S.ui_info(f"current prefix: {S.PREFIX}"))
         S.PREFIX = args[1]
         cfg = S.load_config() or {}; cfg["prefix"] = S.PREFIX; S.save_config(cfg)
-        import sys
         main = sys.modules.get("__main__")
         if main and hasattr(main, "PREFIX"): main.PREFIX = S.PREFIX
         await message.edit(content=S.ui_ok(f"prefix changed to `{S.PREFIX}`"))

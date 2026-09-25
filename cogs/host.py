@@ -1,41 +1,24 @@
 # cogs/host.py | admin access management + host (add/list/start/stop/say/broadcast)
-#
-# admin tier:  subcommands gated by the dispatcher (ADMIN_COMMANDS = {"admin"})
-#              in-file owner checks guard access mutations
-# host tier:   independent — manages the hosted multi-account pool
 import asyncio
 import time
 import traceback
 import aiohttp
 import modifyself_shim as discord
-
 from . import state as S
 
 
-# ─────────────────────────────────────────────────────────────
-# helpers — state.py exposes OWNER_ID / _admins / _devs / access_save
-# but not a uid parser, so inline one here
-# ─────────────────────────────────────────────────────────────
-
 def _parse_uid(s):
-    """accept <@123>, <@!123>, or plain numeric string"""
-    if not s:
-        return None
+    if not s: return None
     s = s.strip()
     if s.startswith("<@") and s.endswith(">"):
         s = s[2:-1]
-        if s.startswith("!"):
-            s = s[1:]
-    if not s.isdigit():
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        return None
+        if s.startswith("!"): s = s[1:]
+    if not s.isdigit(): return None
+    try: return int(s)
+    except ValueError: return None
 
 
-def _owner_id():
-    return getattr(S, "OWNER_ID", None)
+def _owner_id(): return getattr(S, "OWNER_ID", None)
 
 
 def _is_owner(uid: int) -> bool:
@@ -68,10 +51,6 @@ def _save():
         except Exception as e:
             print(f"[host] access_save error: {e}")
 
-
-# ─────────────────────────────────────────────────────────────
-# hosted client lifecycle (unchanged from v1)
-# ─────────────────────────────────────────────────────────────
 
 async def _run_hosted_client(hc, tok):
     try:
@@ -120,12 +99,6 @@ class HostCog:
             await self._admin(message, args)
         elif cmd == "host":
             await self._host(message, args)
-
-    # ═════════════════════════════════════════════════════════
-    # ADMIN — access management
-    # dispatcher already restricts `admin` to owner+admin tier
-    # access mutations below add a second owner check
-    # ═════════════════════════════════════════════════════════
 
     async def _admin(self, message, args):
         try:
@@ -197,7 +170,6 @@ class HostCog:
                 S.ui_ok(f"removed admin {uid}"), delete_after=6)
 
         elif sub == "devadd":
-            # parallel dev access via admin command — convenience alias
             if len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: admin devadd <uid>"), delete_after=6)
@@ -258,10 +230,6 @@ class HostCog:
             await message.channel.send(
                 S.ui_info("usage: admin add/remove/devadd/devremove/list/setowner"),
                 delete_after=8)
-
-    # ═════════════════════════════════════════════════════════
-    # HOST — hosted account pool (independent of access tiers)
-    # ═════════════════════════════════════════════════════════
 
     async def _host(self, message, args):
         try:

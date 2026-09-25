@@ -1,4 +1,4 @@
-# cogs/agc.py | anti gc-trap — auto-detect, rename, icon, message, block, delete, webhook
+# cogs/agc.py | anti gc-trap
 import asyncio
 import base64
 import json

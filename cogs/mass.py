@@ -8,7 +8,6 @@ from . import state as S
 
 
 async def _open_dm_channel(uid):
-    """raw REST: POST /users/@me/channels → channel id"""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(

@@ -1,4 +1,4 @@
-# cogs/tasks.py | background task manager — register, cancel, list, save, load, clear
+# cogs/tasks.py | background task manager
 import asyncio
 import json
 import os

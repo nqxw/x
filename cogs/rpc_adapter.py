@@ -14,7 +14,6 @@ class RpcAdapterCog:
                 "stopstatus", "stopemoji", "setpresencestatus", "roblox",
                 "rpcwatchdog"}
 
-    # aliases the inner cog doesn't know — rewritten before dispatch
     _ALIASES = {
         "listen": "listening",
         "watch":  "watching",
@@ -39,8 +38,6 @@ class RpcAdapterCog:
             self._inner = None
             return
 
-        # explicit register — idempotent, ensures on_ready hook + watchdog
-        # land even if the auto-start inside __init__ couldn't reach the loop
         try:
             self._inner.register(client)
         except Exception as e:
@@ -57,12 +54,10 @@ class RpcAdapterCog:
                 pass
             return
 
-        # bare `.rpc` — show the usage map instead of routing
         if cmd == "rpc":
             await self._usage(message)
             return
 
-        # alias rewrite
         cmd = self._ALIASES.get(cmd, cmd)
 
         try:

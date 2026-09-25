@@ -1,6 +1,4 @@
 # cogs/state.py | shared state for all cogs
-# every mutable the cogs touch lives here so imports stay clean and one source of truth
-
 import os
 import re
 import json
@@ -16,27 +14,22 @@ from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from collections import defaultdict
 
-# ── framework ──
 import modifyself_shim as discord
 
-# ── filled in at boot by selfbot.py ──
 CLIENT = None
 MAIN_CLIENT = None
 TOKEN: str = ""
 PREFIX: str = "."
 USER_AGENT: str = ""
-VERSION: str = "2.4.0-access"
+VERSION: str = "2.6.1-pack"
 HAS_HCAPTCHA: bool = False
 
-# ── access tier ──
-# hardcoded fallback; overwritten by access_load() from database/access.json
 OWNER_ID: int = 1551632054574121051
 _admins: set = set()
 _devs: set = set()
 
 ADMIN_COMMANDS = frozenset({
-    "admin",
-    "setadmin", "adminremove", "adminlist",
+    "admin", "setadmin", "adminremove", "adminlist",
     "blacklist", "whitelist",
     "serverblacklist", "channelblacklist", "rolerestrict",
     "guards", "perms", "perm",
@@ -44,15 +37,11 @@ ADMIN_COMMANDS = frozenset({
 })
 
 DEVELOPER_COMMANDS = frozenset({
-    "eval", "restart", "reconnect", "proxy", "plugin", "session",
-    "logs",
-    "setdev", "devremove", "devlist",
-    "accesslist",
+    "eval", "restart", "reconnect", "proxy", "plugin", "session", "logs",
+    "setdev", "devremove", "devlist", "accesslist",
 })
 
-OWNER_COMMANDS = frozenset({
-    "setowner",
-})
+OWNER_COMMANDS = frozenset({"setowner"})
 
 _ACCESS_FILE = "database/access.json"
 
@@ -61,7 +50,7 @@ def access_save():
         os.makedirs(os.path.dirname(_ACCESS_FILE), exist_ok=True)
         with open(_ACCESS_FILE, "w") as f:
             json.dump({
-                "owner":  OWNER_ID,
+                "owner":  _current_owner(),
                 "admins": sorted(_admins),
                 "devs":   sorted(_devs),
             }, f, indent=2)
@@ -84,39 +73,22 @@ def access_load():
         print(f"[access] load error: {e}")
 
 def _current_owner():
-    try:
-        from cogs import state as cstate
-        v = getattr(cstate, "OWNER_ID", None)
-        if isinstance(v, int):
-            return v
-    except Exception:
-        pass
     return OWNER_ID
 
 def _access_level(uid: int) -> str:
-    if uid == _current_owner():
-        return "owner"
-    if uid in _admins:
-        return "admin"
-    if uid in _devs:
-        return "dev"
+    if uid == _current_owner(): return "owner"
+    if uid in _admins: return "admin"
+    if uid in _devs: return "dev"
     return "user"
 
 def _access_ok(uid: int, cmd: str) -> bool:
     lvl = _access_level(uid)
-    if lvl == "owner":
-        return True
-    if cmd in OWNER_COMMANDS:
-        return False
-    if cmd in ADMIN_COMMANDS and lvl != "admin":
-        return False
-    if cmd in DEVELOPER_COMMANDS and lvl != "dev":
-        return False
+    if lvl == "owner": return True
+    if cmd in OWNER_COMMANDS: return False
+    if cmd in ADMIN_COMMANDS and lvl != "admin": return False
+    if cmd in DEVELOPER_COMMANDS and lvl != "dev": return False
     return True
 
-access_load()
-
-# ── UI palette ──
 ESC = "\x1b"
 RESET   = f"{ESC}[0m"
 GREY    = f"{ESC}[2;37m"
@@ -163,14 +135,12 @@ def _paginate(title, subtitle, rows, page=1):
     ]
     return _ansi_block(lines)
 
-# ── config hooks (set by selfbot.py at boot to avoid circular import) ──
 load_config = None
 save_config = None
 log_msg = None
 db_inc_stat = None
 log_enabled = None
 
-# ── cog-owned function pointers (set by selfbot.py at boot) ──
 HOSTED_DISPATCH = None
 async_hosted_token_add = None
 async_hosted_token_remove = None
@@ -181,9 +151,9 @@ set_hypesquad = None
 clear_hypesquad = None
 encrypt_file = None
 decrypt_file = None
+_get_session = None
 _perm_check_ref = None
 
-# ── permission + guard state ──
 _user_blacklist: set = set()
 _user_whitelist: set = set()
 _cmd_blacklist_server: dict = {}
@@ -214,17 +184,14 @@ def _perm_check(cmd, message) -> bool:
         return message.author.id in _perm_allow[cmd]
     return True
 
-# ── hosted accounts ──
 HOSTED_TOKENS: list = []
 _host_sessions: list = []
 _hosted_clients: list = []
 _hosted_spawned: bool = False
 _host_lock = None
 
-# ── quest state ──
 _hcaptcha_agent = None
 
-# ── automod / monitor ──
 _monitor = {"joins": False, "leaves": False, "roles": False, "nicks": False,
             "invites": False, "log_ch": None, "keywords": []}
 _invite_cache: dict = {}
@@ -237,24 +204,19 @@ _buttons_enabled = True
 _modals_enabled = True
 _pending_interactions: list = []
 
-# ── backup / nuke ──
 _server_backups: dict = {}
 _nuke_backups: dict = {}
 
-# ── scheduler ──
 _scheduler: list = []
 _scheduler_task = None
 
-# ── tasks ──
 _managed_tasks: dict = {}
 _TASK_STORE = "database/tasks.json"
 _TRIGGER_STORE = "database/triggers.json"
 
-# ── triggers ──
 _triggers = {"message": [], "reaction": [], "voice": [], "member": []}
 _trigger_fired_counts: dict = {}
 
-# ── db ──
 _db_path = "database/selfbot.db"
 _db = None
 
@@ -295,7 +257,6 @@ def db_stats_all():
 def db_stats_clear():
     _db.execute("DELETE FROM stats"); _db.commit()
 
-# ── lastfm ──
 LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 _lfm: dict = {}
 _PERIOD = {"w":"7day","week":"7day","m":"1month","month":"1month",
@@ -303,13 +264,9 @@ _PERIOD = {"w":"7day","week":"7day","m":"1month","month":"1month",
 _PLABEL = {"7day":"this week","1month":"this month","3month":"3 months",
            "6month":"6 months","12month":"this year","overall":"all time"}
 
-# ── social ──
 _autoaddback = False
-
-# ── status ──
 _speak_lang = None
 
-# ── agc ──
 _agc_state = {"enabled": False, "block": False, "leave_msg": "lol nice try",
               "gc_name": "trap detected", "gc_icon_url": None, "webhook_url": None}
 _agc_whitelist: set = set()
@@ -327,7 +284,6 @@ def agc_save_wl():
     with open("config/agc_whitelist.json", "w") as f:
         json.dump(list(_agc_whitelist), f)
 
-# ── admin helpers (legacy — preserved for cogs that still call them) ──
 def _load_admins() -> list:
     return [str(x) for x in sorted(_admins)]
 
@@ -420,7 +376,6 @@ async def hosted_send(token, channel_id, content):
                 return r.status in (200,201)
     except Exception: return False
 
-# ── scheduler helpers ──
 def sched_save():
     try:
         os.makedirs("database", exist_ok=True)
@@ -435,7 +390,6 @@ def sched_load():
             with open("database/scheduler.json") as f: _scheduler = json.load(f)
         except Exception: _scheduler = []
 
-# ── settings ──
 _server_prefixes: dict = {}
 _aliases: dict = {}
 _cooldowns: dict = {}
@@ -446,7 +400,6 @@ _has_crypto = False
 _HAS_CRYPTO = False
 _key_path = "config/.key"
 
-# ── resilience ──
 _reconnect_count = 0
 _last_ready_ts = 0
 _session_events: list = []
@@ -468,8 +421,8 @@ _typing_tasks: dict = {}
 _tracking: dict = {}
 _cache_auto = True
 _tracked_users: set = set()
+_latency_history: list = []
 
-# ── general ──
 SNIPE_LIMIT = 20
 LOG_FILE = "message_log.txt"
 SNIPER_ENABLED = True
@@ -491,8 +444,8 @@ _spam_tasks: dict = {}
 AUTO_RESPONSES: dict = {}
 _mimic_dict: dict = {}
 
-# ── fun / auto / utility ──
 _autoreact_emoji = None
+_superreact_emoji = None
 _multireact_pool: list = []
 _multireact_enabled = False
 _giveaway_enabled = False
@@ -503,7 +456,6 @@ _afk_enabled = False
 _afk_msg = None
 _autodelete_secs = 0
 
-# ── developer ──
 _proxy = None
 _plugins: dict = {}
 _sessions: list = []

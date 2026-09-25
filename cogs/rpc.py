@@ -74,11 +74,10 @@ SPOTIFY_FIELDS_TO_KEEP = {
     "timestamps", "instance",
 }
 
-# watchdog tuning
-_WATCH_INTERVAL = 45         # seconds between checks
-_MIN_REPUSH_GAP = 30         # don't re-push more often than this
-_CDN_REFRESH_EVERY = 20      # refresh mp: assets every N watchdog cycles (~15min)
-_BOOT_SETTLE = 4.0           # grace period after register before first push
+_WATCH_INTERVAL = 45
+_MIN_REPUSH_GAP = 30
+_CDN_REFRESH_EVERY = 20
+_BOOT_SETTLE = 4.0
 
 
 class RPCCog:
@@ -108,35 +107,23 @@ class RPCCog:
         self._clearing = False
         self._save_tasks = []
 
-        # watchdog state
         self._watchdog_task = None
         self._last_push_ts = 0.0
         self._last_gateway_state = None
         self._watchdog_cycles = 0
         self._loaded_persisted = False
 
-        # auto-start if a client was provided and the loop is already up
         if bot is not None:
             try:
                 asyncio.get_running_loop()
                 self.register(bot)
             except RuntimeError:
-                # no loop yet — adapter will call register() later
                 pass
 
-    # ═════════════════════════════════════════════════════════
-    # WATCHDOG + REGISTRATION
-    # ═════════════════════════════════════════════════════════
-
     def register(self, client):
-        """
-        Called either from __init__ (if loop is up) or from the adapter's
-        register(). Idempotent — safe to call twice.
-        """
         if client is not None:
             self.bot = client
 
-        # hook on_ready so we re-apply after every fresh session
         if client is not None:
             try:
                 @client.event
@@ -151,7 +138,6 @@ class RPCCog:
             except Exception as e:
                 print(f"[rpc] on_ready hook failed: {e}")
 
-        # start watchdog once
         if self._watchdog_task is not None and not self._watchdog_task.done():
             return
         try:
@@ -163,7 +149,6 @@ class RPCCog:
         print("[rpc] watchdog started")
 
     async def _watchdog_boot(self):
-        # load persisted state once
         if not self._loaded_persisted:
             try:
                 self._load_rpc_slots()
@@ -172,10 +157,8 @@ class RPCCog:
             except Exception as e:
                 print(f"[rpc] persisted load failed: {e}")
 
-        # let the gateway settle before first push
         await asyncio.sleep(_BOOT_SETTLE)
 
-        # initial push if we restored anything
         if any(s is not None for s in self.rpc_slots):
             try:
                 await self.apply_activities()
@@ -183,7 +166,6 @@ class RPCCog:
             except Exception as e:
                 print(f"[rpc] initial restore push failed: {e}")
 
-        # main watchdog loop
         await self._watchdog()
 
     async def _watchdog(self):
@@ -241,10 +223,6 @@ class RPCCog:
         now = time.time()
         if now - self._last_push_ts > _MIN_REPUSH_GAP:
             await self.apply_activities()
-
-    # ═════════════════════════════════════════════════════════
-    # COMMAND DISPATCH
-    # ═════════════════════════════════════════════════════════
 
     async def handle(self, message, cmd, args):
         try:
@@ -312,7 +290,6 @@ class RPCCog:
                 await message.channel.send(ascii.multiline(lines))
                 return
             if cmd == "rpcwatchdog":
-                # manual status / kick of the watchdog
                 sub = rest[0].lower() if rest else ""
                 if sub in ("stop", "off"):
                     if self._watchdog_task and not self._watchdog_task.done():
@@ -326,7 +303,6 @@ class RPCCog:
                     self.register(self.bot)
                     await message.channel.send(ascii.info("rpc watchdog started"))
                     return
-                # status
                 running = self._watchdog_task is not None and not self._watchdog_task.done()
                 since = int(time.time() - self._last_push_ts) if self._last_push_ts else -1
                 snap = self._gateway_snapshot()
@@ -367,7 +343,7 @@ class RPCCog:
                 return
             if cmd == "remoji":
                 if not rest:
-                    await message.channel.send(ascii.error("Usage: .remoji 🅰️,🅱️")); return
+                    await message.channel.send(ascii.error("Usage: .remoji A,B")); return
                 emoji_list = [e.strip() for e in " ".join(rest).split(",") if e.strip()]
                 if not emoji_list:
                     await message.channel.send(ascii.error("Separate emojis by commas")); return
@@ -597,7 +573,6 @@ class RPCCog:
             if not parts: parts = ["Exploring VRChat", "VRChat"]
             self.rpc_slots[slot] = await self.build_vrchat(parts)
         elif cmd == "meta":
-            # extract a URL if present, without mutating during iteration
             image_url = None
             kept = []
             for w in words:
@@ -617,15 +592,7 @@ class RPCCog:
         shown = parts[0] if parts else "ok"
         await ch.send(ascii.success(f"{cmd} → slot {slot+1}: {shown}"))
 
-    # ═════════════════════════════════════════════════════════
-    # PRESENCE PUSH
-    # ═════════════════════════════════════════════════════════
-
     async def _send_presence_payload(self, activities, status="online"):
-        """
-        Single choke point for pushing op:3. Prefers the raw gateway,
-        falls back to the shim's ws wrapper. Returns True on success.
-        """
         client = self.bot
         if client is None:
             return False
@@ -640,7 +607,6 @@ class RPCCog:
             },
         }
 
-        # prefer direct gateway
         gw = getattr(client, "_gateway", None)
         if gw is not None and hasattr(gw, "send_json"):
             try:
@@ -649,12 +615,10 @@ class RPCCog:
             except Exception as e:
                 print(f"[RPC] gateway send_json failed: {e}")
 
-        # fallback to shim ws wrapper
         ws = getattr(client, "ws", None)
         if ws is not None and hasattr(ws, "send_json"):
             try:
                 result = await ws.send_json(payload)
-                # _WSShim returns None if gw is missing — treat as failure
                 return result is not None or gw is not None
             except Exception as e:
                 print(f"[RPC] ws.send_json failed: {e}")
@@ -663,7 +627,6 @@ class RPCCog:
     async def apply_activities(self):
         active = [a for a in self.rpc_slots if a is not None]
 
-        # always allow a clear
         if not active:
             ok = await self._send_presence_payload([], "online")
             if ok:
@@ -676,10 +639,6 @@ class RPCCog:
             self._save_rpc_slots()
         else:
             print("[RPC] push returned False — will retry on next watchdog tick")
-
-    # ═════════════════════════════════════════════════════════
-    # PERSISTENCE
-    # ═════════════════════════════════════════════════════════
 
     def _get_user_file(self, filename):
         if not self.bot or not getattr(self.bot, "user", None):
@@ -742,10 +701,6 @@ class RPCCog:
                 self._asset_urls = json.load(f)
         except Exception:
             self._asset_urls = {}
-
-    # ═════════════════════════════════════════════════════════
-    # SLOT HELPERS
-    # ═════════════════════════════════════════════════════════
 
     def _ensure_slot(self, index: int):
         if self.rpc_slots[index] is None:
@@ -909,10 +864,6 @@ class RPCCog:
                 btns[1] = {"label": " ".join(parts[:-1]), "url": parts[-1]}
                 act["buttons"] = [b for b in btns if b]
 
-    # ═════════════════════════════════════════════════════════
-    # ASSET UPLOAD
-    # ═════════════════════════════════════════════════════════
-
     async def upload_asset(self, image_url: str):
         if not image_url:
             return None
@@ -982,10 +933,6 @@ class RPCCog:
             print(f"[RPC] upload_asset failed: {type(e).__name__}: {e}")
             traceback.print_exc()
         return None
-
-    # ═════════════════════════════════════════════════════════
-    # ACTIVITY BUILDERS
-    # ═════════════════════════════════════════════════════════
 
     async def build_spotify(self, parts: list):
         if len(parts) < 2:

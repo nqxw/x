@@ -27,12 +27,6 @@ def _auth_headers():
 
 
 async def _purge_own_messages(session, channel_id, own_uid, limit):
-    """
-    Raw REST purge. Paginates GET /channels/{ch}/messages?limit=100&before=ID
-    and deletes every message whose author.id == own_uid.
-    Bypasses channel.history() entirely — that path depends on the shim's
-    HTTPClient patch landing, which isn't guaranteed on every build.
-    """
     h = _auth_headers()
     deleted = 0
     before = None
@@ -48,11 +42,9 @@ async def _purge_own_messages(session, channel_id, own_uid, limit):
                 headers=h,
             ) as r:
                 if r.status != 200:
-                    print(f"[purge] history HTTP {r.status}")
                     break
                 batch = await r.json()
-        except Exception as e:
-            print(f"[purge] fetch error: {e}")
+        except Exception:
             break
         if not batch:
             break
@@ -104,7 +96,13 @@ class GeneralCog:
         client = S.CLIENT
 
         if cmd == "ping":
-            await message.edit(content=S.ui_ok(f"pong — `{round(client.latency*1000)}ms`"))
+            lat = getattr(client, "latency", None)
+            if lat is None:
+                return await message.edit(content=S.ui_info("pong — gateway latency unavailable"))
+            try:
+                await message.edit(content=S.ui_ok(f"pong — `{round(lat*1000)}ms`"))
+            except Exception as e:
+                print(f"[ping] edit failed: {e}")
 
         elif cmd == "info":
             u = client.user
@@ -174,11 +172,6 @@ class GeneralCog:
                         pass
             except Exception as e:
                 print(f"[purge] {type(e).__name__}: {e}")
-                try:
-                    await message.channel.send(
-                        S.ui_err(f"purge: {e}"), delete_after=6)
-                except Exception:
-                    pass
 
         elif cmd == "purgeall":
             ch_id = message.channel.id

@@ -25,7 +25,7 @@ class DownloadsCog:
             proc = await asyncio.create_subprocess_exec(
                 "yt-dlp", url, "-o", fname, *flags,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=90)
             files = glob.glob("/tmp/dl_*")
             if files:
                 latest = max(files, key=os.path.getctime)

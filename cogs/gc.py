@@ -1,4 +1,4 @@
-# cogs/gc.py | group DM management — create, list, rename, icon, add, remove, leave
+# cogs/gc.py | group DM management
 import base64
 import aiohttp
 import modifyself_shim as discord

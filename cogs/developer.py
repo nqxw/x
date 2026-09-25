@@ -10,21 +10,15 @@ from . import state as S
 
 class DeveloperCog:
     COMMANDS = {
-        # developer tier
         "eval", "restart", "reconnect", "proxy", "plugin", "session",
-        # owner-only access management
         "setdev", "devremove", "devlist",
         "setadmin", "adminremove", "adminlist",
         "setowner", "accesslist",
+        "logs",
     }
 
     async def handle(self, message, cmd, args):
         client = S.CLIENT
-
-        # ═════════════════════════════════════════════════════
-        # OWNER-ONLY ACCESS MANAGEMENT
-        # every branch below checks message.author.id == S.OWNER_ID
-        # ═════════════════════════════════════════════════════
 
         if cmd == "setdev":
             if message.author.id != S.OWNER_ID:
@@ -107,11 +101,6 @@ class DeveloperCog:
             ]
             return await message.edit(content=S._ansi_block(lines))
 
-        # ═════════════════════════════════════════════════════
-        # DEVELOPER TIER
-        # dispatcher gate rejects anyone below dev before we get here
-        # ═════════════════════════════════════════════════════
-
         if cmd == "eval":
             if len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: eval <code>"))
@@ -139,6 +128,16 @@ class DeveloperCog:
                 await message.edit(content=S.ui_ok("reconnect requested"))
             except Exception as e:
                 await message.edit(content=S.ui_err(str(e)))
+
+        elif cmd == "logs":
+            n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 10
+            if not os.path.exists(S.LOG_FILE):
+                return await message.edit(content=S.ui_err("no log"))
+            with open(S.LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            tail = "".join(lines[-n:])
+            if len(tail) > 1900: tail = tail[-1900:]
+            await message.edit(content=f"```\n{tail}\n```")
 
         elif cmd == "proxy":
             sub = args[1].lower() if len(args) > 1 else ""
@@ -185,8 +184,6 @@ class DeveloperCog:
                     await message.edit(content=S.ui_err("bad index"))
             else:
                 await message.edit(content=S.ui_info("usage: session list | switch <idx>"))
-
-    # ── plugin helpers ──
 
     def _load(self, name):
         path = f"plugins/{name}.py"

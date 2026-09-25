@@ -21,6 +21,9 @@ def _sync(**kw):
 async def _queue_worker(name):
     while True:
         try:
+            if S._cmd_queue is None:
+                await asyncio.sleep(0.5)
+                continue
             item = await S._cmd_queue.get()
             if item is None:
                 await asyncio.sleep(0.05); continue
@@ -178,10 +181,11 @@ class ResilienceCog:
                 _sync(_queue_workers=S._queue_workers)
                 await message.edit(content=S.ui_ok(f"workers → {S._queue_workers}"))
             elif sub == "status":
+                qsize = S._cmd_queue.qsize() if S._cmd_queue else 0
                 await message.edit(content=S.ui_box("queue", [
                     f"  {S.DIM}enabled{S.RESET}  {S._queue_enabled}",
                     f"  {S.DIM}workers{S.RESET}  {S._queue_workers}",
-                    f"  {S.DIM}pending{S.RESET}  {S._cmd_queue.qsize() if S._cmd_queue else 0}",
+                    f"  {S.DIM}pending{S.RESET}  {qsize}",
                 ]))
             else:
                 await message.edit(content=S.ui_info("usage: queue on/off/workers/status"))

@@ -1,7 +1,4 @@
 # cogs/auto.py | giveaway, nitrosniper, autoreact, multireact, vsniper, superreact
-#
-# v6 — superreact targets your own outbound messages (same as autoreact).
-# no count arg — continuous toggle like autoreact.
 import asyncio
 import sys
 import urllib.parse
@@ -9,10 +6,6 @@ import aiohttp
 import modifyself_shim as discord
 from . import state as S
 
-
-# ─────────────────────────────────────────────────────────────
-# STATE SYNC
-# ─────────────────────────────────────────────────────────────
 
 def _sync(**kw):
     main = sys.modules.get("__main__")
@@ -24,10 +17,6 @@ def _sync(**kw):
         except Exception:
             pass
 
-
-# ─────────────────────────────────────────────────────────────
-# RAW REACTION HELPERS
-# ─────────────────────────────────────────────────────────────
 
 def _emoji_to_str(emoji):
     if isinstance(emoji, str):
@@ -44,7 +33,6 @@ def _emoji_to_str(emoji):
 
 
 async def _react_once(session, channel_id, message_id, emoji):
-    """Single PUT. Returns (status:int_or_str, retry_after:float_or_None)."""
     emoji_str = _emoji_to_str(emoji)
     emoji_enc = urllib.parse.quote(emoji_str, safe="")
     url = (f"https://discord.com/api/v9/channels/{channel_id}"
@@ -70,7 +58,6 @@ async def _react_once(session, channel_id, message_id, emoji):
 
 
 async def _react(channel_id, message_id, emoji, session=None):
-    """Fire-and-forget single reaction with built-in 429 retry."""
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession()
@@ -87,12 +74,6 @@ async def _react(channel_id, message_id, emoji, session=None):
         if own_session:
             await session.close()
 
-
-# ─────────────────────────────────────────────────────────────
-# CLASS-LEVEL PATCH — shim add_reaction → raw REST fallback.
-# covers autoreact + superreact in the dispatcher, plus any other
-# cog that reacts to a message.
-# ─────────────────────────────────────────────────────────────
 
 def _install_react_patch():
     try:
@@ -127,10 +108,6 @@ def _install_react_patch():
     print("[auto] Message.add_reaction patched (shim → raw REST fallback)")
     return True
 
-
-# ─────────────────────────────────────────────────────────────
-# VSNIPER LOOP
-# ─────────────────────────────────────────────────────────────
 
 async def _vsniper_loop():
     while True:
@@ -187,7 +164,6 @@ class AutoCog:
             _sync(_autoreact_emoji=None)
             await message.edit(content=S.ui_ok("stopped"))
 
-        # ── SUPERREACT — continuous, reacts to YOUR OWN messages ──
         elif cmd == "superreact":
             if len(args) < 2:
                 return await message.edit(

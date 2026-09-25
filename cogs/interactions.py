@@ -10,11 +10,9 @@ class InteractionsCog:
         @client.event
         async def on_interaction(interaction):
             try:
-                data = interaction.data or {}
+                data = getattr(interaction, "data", None) or {}
                 cid = data.get("custom_id", "") if isinstance(data, dict) else ""
                 if cid.startswith("verify_") and S._verify_cfg["role_id"]:
-                    # interaction handling is not fully exposed by modifyself;
-                    # store for later if a payload flow exists
                     S._pending_interactions.append(interaction)
             except Exception as e:
                 print(f"[interaction] {e}")

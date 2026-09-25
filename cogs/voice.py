@@ -19,10 +19,6 @@ _self_vc = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
-# GUILD RESOLUTION
-# ─────────────────────────────────────────────────────────────
-
 def _resolve_guild_id(message, client):
     try:
         g = message.guild
@@ -70,12 +66,6 @@ def _guild_id_for_channel(client, channel_id):
             continue
     return None
 
-
-# ─────────────────────────────────────────────────────────────
-# RAW OP:4 SEND — modifyself's send_voice_state wrapper drops the
-# frame on some builds (silent return, nothing on the wire).
-# send the raw op:4 payload through send_json. string ids, all fields.
-# ─────────────────────────────────────────────────────────────
 
 async def _send_vc(client, guild_id, channel_id,
                    self_mute=False, self_deaf=False,
