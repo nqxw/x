@@ -1,5 +1,6 @@
 # language: Python, file: cogs/spoofer.py
-# platform / device spoofing — every entry point wrapped, errors surface to channel + console
+# same logic as before, but exposes every common router method name
+# and prints what the router sees, on every command.
 import asyncio
 import importlib
 import inspect
@@ -39,9 +40,6 @@ _PRESET_HOLDER = [None]
 _GW_CACHE = {"cls": None, "path": None, "scanned": False}
 
 
-# ============================================================
-# discovery — cached so we scan once
-# ============================================================
 def _walk_modifyself():
     try:
         pkg = importlib.import_module("modifyself")
@@ -60,7 +58,6 @@ def _walk_modifyself():
 def _find_gw_class(force=False):
     if _GW_CACHE["scanned"] and not force:
         return _GW_CACHE["cls"], _GW_CACHE["path"]
-
     candidates = []
     for mod in _walk_modifyself():
         mn = getattr(mod, "__name__", "?")
@@ -83,7 +80,6 @@ def _find_gw_class(force=False):
             if "gateway" in modlow:                     score += 5
             if "ws" in modlow or "websocket" in modlow: score += 3
             candidates.append((score, cobj, f"{mn}.{cname}"))
-
     _GW_CACHE["scanned"] = True
     if not candidates:
         return None, None
@@ -106,9 +102,6 @@ def _find_client_gateway(client):
     return None, None
 
 
-# ============================================================
-# identify rewrite
-# ============================================================
 def _rewrite_identify_dict(data, preset):
     if not isinstance(data, dict) or data.get("op") != 2:
         return False
@@ -153,9 +146,6 @@ def _rewrite_identify_dict(data, preset):
     return True
 
 
-# ============================================================
-# patches
-# ============================================================
 def _install_patches():
     gw_class, found_path = _find_gw_class()
     if gw_class is None:
@@ -210,11 +200,23 @@ def _install_instance_patch(client):
 
 
 # ============================================================
-# cog
+# cog — exposes every common router method name, all delegating
 # ============================================================
 class SpooferCog:
     COMMANDS = {"platform", "spoof", "spoofer", "vr", "console",
                 "spoofreset", "spoofstatus", "spooferdiag"}
+
+    # aliases for routers that read a dict
+    commands = {
+        "platform":     "_cmd_platform",
+        "spoof":        "_cmd_spoof",
+        "spoofer":      "_cmd_spoof",
+        "vr":           "_cmd_vr",
+        "console":      "_cmd_console",
+        "spoofreset":   "_cmd_spoofreset",
+        "spoofstatus":  "_cmd_spoofstatus",
+        "spooferdiag":  "_cmd_spooferdiag",
+    }
 
     def __init__(self):
         self.bot = None
@@ -237,8 +239,21 @@ class SpooferCog:
         try:
             self._start_watchdog()
         except Exception:
-            print("[spoofer] watchdog start raised:")
+            print("[spoofer] init watchdog raised:")
             traceback.print_exc()
+
+        # dump what we expose so the router's expectations are visible
+        print("[spoofer] registering — public methods on cog:")
+        for name in dir(self):
+            if name.startswith("_") and name not in ("_cmd_platform", "_cmd_spoof",
+                                                     "_cmd_vr", "_cmd_console",
+                                                     "_cmd_spoofreset",
+                                                     "_cmd_spoofstatus",
+                                                     "_cmd_spooferdiag"):
+                continue
+            attr = getattr(self, name)
+            if callable(attr):
+                print(f"[spoofer]   cog.{name}()")
 
     # --------------------------------------------------------
     def _ensure_instance_patch(self):
@@ -279,7 +294,7 @@ class SpooferCog:
                             if dead_since == 0.0:
                                 dead_since = now
                             elif now - dead_since > 15:
-                                print("[spoofer] watchdog: gateway stalled >15s — reconnect")
+                                print("[spoofer] watchdog: gateway stalled — reconnect")
                                 await self._safe_reconnect()
                                 dead_since = 0.0
                         else:
@@ -288,7 +303,6 @@ class SpooferCog:
                 print(f"[spoofer] watchdog error: {e}")
             await asyncio.sleep(5)
 
-    # --------------------------------------------------------
     def _build_diag(self):
         lines = []
         try:
@@ -320,7 +334,6 @@ class SpooferCog:
                 lines.append(f"last device:    {(self._last_props or {}).get('device', '?')}")
         except Exception as e:
             lines.append(f"client scan err: {e}")
-
         return lines
 
     def _current_preset_label(self):
@@ -361,7 +374,7 @@ class SpooferCog:
         if gw is not None and hasattr(gw, "close"):
             try:
                 await gw.close(code=1000)
-                print(f"[spoofer] reconnect #{self._reconnect_count} via ws.close")
+                print(f"[spoofer] reconnect via ws.close")
                 return
             except Exception as e:
                 print(f"[spoofer] ws.close raised: {e}")
@@ -369,24 +382,64 @@ class SpooferCog:
         if hasattr(client, "close"):
             try:
                 await client.close()
-                print(f"[spoofer] reconnect #{self._reconnect_count} via client.close")
+                print(f"[spoofer] reconnect via client.close")
                 return
             except Exception as e:
                 print(f"[spoofer] client.close raised: {e}")
 
-        print(f"[spoofer] reconnect #{self._reconnect_count} — no usable path")
-
     # --------------------------------------------------------
-    # handle — every branch wrapped; on any throw, the actual
-    # traceback is printed AND the message is edited with the
-    # short error so we stop flying blind.
+    # every entry point routes into _dispatch, which is wrapped
     # --------------------------------------------------------
     async def handle(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    async def on_message(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    async def execute(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    async def run_command(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    async def dispatch(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    async def process(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    async def on_command(self, message, cmd=None, args=None):
+        await self._dispatch(message, cmd, args)
+
+    # per-command aliases — routers that dispatch by method name
+    async def _cmd_platform(self, message, args=None):
+        await self._dispatch(message, "platform", args)
+
+    async def _cmd_spoof(self, message, args=None):
+        await self._dispatch(message, "spoof", args)
+
+    async def _cmd_vr(self, message, args=None):
+        await self._dispatch(message, "vr", args)
+
+    async def _cmd_console(self, message, args=None):
+        await self._dispatch(message, "console", args)
+
+    async def _cmd_spoofreset(self, message, args=None):
+        await self._dispatch(message, "spoofreset", args)
+
+    async def _cmd_spoofstatus(self, message, args=None):
+        await self._dispatch(message, "spoofstatus", args)
+
+    async def _cmd_spooferdiag(self, message, args=None):
+        await self._dispatch(message, "spooferdiag", args)
+
+    # --------------------------------------------------------
+    async def _dispatch(self, message, cmd=None, args=None):
         try:
-            await self._handle_inner(message, cmd, args)
+            await self._dispatch_inner(message, cmd, args)
         except Exception as e:
             tb = traceback.format_exc()
-            print("[spoofer] HANDLE RAISED:")
+            print("[spoofer] DISPATCH RAISED:")
             print(tb)
             short = f"{type(e).__name__}: {e}"
             try:
@@ -394,7 +447,7 @@ class SpooferCog:
             except Exception:
                 pass
 
-    async def _handle_inner(self, message, cmd=None, args=None):
+    async def _dispatch_inner(self, message, cmd=None, args=None):
         if cmd is None:
             content = getattr(message, "content", "") or ""
             parts = content.split()
@@ -404,6 +457,8 @@ class SpooferCog:
             args = parts[1:]
         if args is None:
             args = []
+
+        print(f"[spoofer] dispatch cmd={cmd!r} args={args!r}")
 
         if cmd not in self.COMMANDS:
             return
@@ -415,7 +470,6 @@ class SpooferCog:
             await message.edit(content=S.ui_err("client not ready"))
             return
 
-        # --- spooferdiag ---
         if cmd == "spooferdiag":
             lines = self._build_diag()
             print("[spooferdiag] ====")
@@ -425,7 +479,6 @@ class SpooferCog:
             await message.edit(content=S._ansi_block(lines))
             return
 
-        # --- platform ---
         if cmd == "platform":
             if len(args) < 1:
                 cur = getattr(S, "_current_platform", "desktop")
@@ -446,7 +499,6 @@ class SpooferCog:
             await self._safe_reconnect()
             return
 
-        # --- spoof / spoofer ---
         if cmd in ("spoof", "spoofer"):
             if len(args) < 1:
                 await message.edit(content=S.ui_info(
@@ -469,7 +521,6 @@ class SpooferCog:
             await self._safe_reconnect()
             return
 
-        # --- vr / console ---
         if cmd in ("vr", "console"):
             if not await self._set_platform(cmd, message):
                 return
@@ -478,12 +529,10 @@ class SpooferCog:
             await self._safe_reconnect()
             return
 
-        # --- spoofstatus ---
         if cmd == "spoofstatus":
             await self._send_status(message)
             return
 
-        # --- spoofreset ---
         if cmd == "spoofreset":
             if not await self._set_platform("desktop", message):
                 return
@@ -491,7 +540,6 @@ class SpooferCog:
             await self._safe_reconnect()
             return
 
-    # --------------------------------------------------------
     async def _send_status(self, message):
         p = self._last_props or {}
         active = _PRESET_HOLDER[0]
