@@ -1,13 +1,8 @@
-modifyself==0.4.1
-cryptography
+modifyself
+discord.py-self
 aiohttp
-PyNaCl
-supabase
-patchright>=1.40.0
 websockets
 hcaptcha-challenger
 playwright
 cryptography
 yt-dlp
-beautifulsoup4
-lxml
