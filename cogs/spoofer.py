@@ -1,17 +1,15 @@
 # language: Python, file: cogs/spoofer.py
-# platform / device spoofing for modifyself — class discovery + instance fallback + shimmed handle
+# platform / device spoofing — every entry point wrapped, errors surface to channel + console
 import asyncio
 import importlib
 import inspect
 import pkgutil
 import time
+import traceback
 import modifyself_shim as discord
 from . import state as S
 
 
-# ============================================================
-# platform presets
-# ============================================================
 PLATFORM_PRESETS = {
     "desktop":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Windows Desktop"},
     "windows":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Windows Desktop"},
@@ -38,13 +36,13 @@ PLATFORM_PRESETS = {
 
 _LIVE_COG = [None]
 _PRESET_HOLDER = [None]
+_GW_CACHE = {"cls": None, "path": None, "scanned": False}
 
 
 # ============================================================
-# module / class discovery
+# discovery — cached so we scan once
 # ============================================================
 def _walk_modifyself():
-    """Yield every importable module under modifyself."""
     try:
         pkg = importlib.import_module("modifyself")
     except Exception as e:
@@ -59,44 +57,50 @@ def _walk_modifyself():
                 pass
 
 
-def _find_gw_class():
-    """
-    Discover the gateway websocket class by inspecting every class under
-    modifyself for a send_json method. Scored — class/module name hints win.
-    Returns (class, path) or (None, None).
-    """
+def _find_gw_class(force=False):
+    if _GW_CACHE["scanned"] and not force:
+        return _GW_CACHE["cls"], _GW_CACHE["path"]
+
     candidates = []
     for mod in _walk_modifyself():
         mn = getattr(mod, "__name__", "?")
-        for cname, cobj in inspect.getmembers(mod, inspect.isclass):
-            if cobj.__module__ != mn:
-                continue
-            if not hasattr(cobj, "send_json"):
+        try:
+            members = inspect.getmembers(mod, inspect.isclass)
+        except Exception:
+            continue
+        for cname, cobj in members:
+            try:
+                if cobj.__module__ != mn:
+                    continue
+                if not hasattr(cobj, "send_json"):
+                    continue
+            except Exception:
                 continue
             score = 0
-            low = cname.lower()
-            modlow = mn.lower()
-            if "websocket" in low or "gateway" in low:
-                score += 10
-            if "discord" in low:
-                score += 2
-            if "gateway" in modlow:
-                score += 5
-            if "ws" in modlow or "websocket" in modlow:
-                score += 3
+            low, modlow = cname.lower(), mn.lower()
+            if "websocket" in low or "gateway" in low: score += 10
+            if "discord" in low:                        score += 2
+            if "gateway" in modlow:                     score += 5
+            if "ws" in modlow or "websocket" in modlow: score += 3
             candidates.append((score, cobj, f"{mn}.{cname}"))
+
+    _GW_CACHE["scanned"] = True
     if not candidates:
         return None, None
     candidates.sort(key=lambda t: t[0], reverse=True)
-    return candidates[0][1], candidates[0][2]
+    _GW_CACHE["cls"]  = candidates[0][1]
+    _GW_CACHE["path"] = candidates[0][2]
+    return _GW_CACHE["cls"], _GW_CACHE["path"]
 
 
 def _find_client_gateway(client):
-    """Return (attr_name, gateway_obj) or (None, None)."""
     if client is None:
         return None, None
     for attr in ("_gateway", "gateway", "ws", "_ws", "_connection", "connection"):
-        gw = getattr(client, attr, None)
+        try:
+            gw = getattr(client, attr, None)
+        except Exception:
+            continue
         if gw is not None and hasattr(gw, "send_json"):
             return attr, gw
     return None, None
@@ -105,16 +109,16 @@ def _find_client_gateway(client):
 # ============================================================
 # identify rewrite
 # ============================================================
-def _rewrite_identify_dict(data: dict, preset) -> bool:
+def _rewrite_identify_dict(data, preset):
     if not isinstance(data, dict) or data.get("op") != 2:
         return False
     d = data.get("d")
     if not isinstance(d, dict):
         return False
     props = d.setdefault("properties", {})
-    props["os"] = preset["os"]
+    props["os"]      = preset["os"]
     props["browser"] = preset["browser"]
-    props["device"] = preset["device"]
+    props["device"]  = preset["device"]
 
     ua_map = {
         ("Android", "Discord Android"): (
@@ -155,9 +159,8 @@ def _rewrite_identify_dict(data: dict, preset) -> bool:
 def _install_patches():
     gw_class, found_path = _find_gw_class()
     if gw_class is None:
-        print("[spoofer] class patch: gateway class not discovered — instance fallback only")
+        print("[spoofer] class patch: gateway class not discovered")
         return False
-
     if getattr(gw_class, "_spoofer_patched", False):
         print(f"[spoofer] class patch already installed at {found_path}")
         return True
@@ -180,7 +183,7 @@ def _install_patches():
     return True
 
 
-def _install_instance_patch(client) -> bool:
+def _install_instance_patch(client):
     attr, gw = _find_client_gateway(client)
     if gw is None:
         return False
@@ -224,35 +227,40 @@ class SpooferCog:
         self._instance_patched_attr = None
         _LIVE_COG[0] = self
 
-        class_ok = _install_patches()
-        print(f"[spoofer] init — class patch: {'OK' if class_ok else 'FAILED'}")
-        self._start_watchdog()
+        try:
+            class_ok = _install_patches()
+            print(f"[spoofer] init — class patch: {'OK' if class_ok else 'FAILED'}")
+        except Exception:
+            print("[spoofer] init class patch raised:")
+            traceback.print_exc()
+
+        try:
+            self._start_watchdog()
+        except Exception:
+            print("[spoofer] watchdog start raised:")
+            traceback.print_exc()
 
     # --------------------------------------------------------
-    # lazy instance patch (S.CLIENT is None at __init__)
-    # --------------------------------------------------------
-    def _ensure_instance_patch(self) -> bool:
+    def _ensure_instance_patch(self):
         if self._instance_patched_attr:
             return True
-        client = S.CLIENT
-        if client is None:
-            return False
-        if _install_instance_patch(client):
-            attr, _ = _find_client_gateway(client)
-            self._instance_patched_attr = attr
-            return True
+        try:
+            client = S.CLIENT
+            if client is None:
+                return False
+            if _install_instance_patch(client):
+                attr, _ = _find_client_gateway(client)
+                self._instance_patched_attr = attr
+                return True
+        except Exception:
+            print("[spoofer] _ensure_instance_patch raised:")
+            traceback.print_exc()
         return False
 
-    # --------------------------------------------------------
-    # watchdog
-    # --------------------------------------------------------
     def _start_watchdog(self):
         if self._watchdog_task and not self._watchdog_task.done():
             return
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            return
+        loop = asyncio.get_event_loop()
         self._watchdog_task = loop.create_task(self._watchdog())
 
     async def _watchdog(self):
@@ -266,7 +274,7 @@ class SpooferCog:
                     now = time.time()
                     if gw is not None and now >= self._reconnect_grace_until:
                         is_connected = bool(getattr(gw, "is_connected", False))
-                        is_closed = bool(getattr(gw, "is_closed", False))
+                        is_closed    = bool(getattr(gw, "is_closed", False))
                         if not is_connected and not is_closed:
                             if dead_since == 0.0:
                                 dead_since = now
@@ -281,33 +289,38 @@ class SpooferCog:
             await asyncio.sleep(5)
 
     # --------------------------------------------------------
-    # diagnostics
-    # --------------------------------------------------------
     def _build_diag(self):
         lines = []
-        cls, path = _find_gw_class()
-        class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
-        lines.append(f"class found:    {path or 'NOT FOUND'}")
-        lines.append(f"class patch:    {'YES' if class_ok else 'NO'}")
+        try:
+            cls, path = _find_gw_class()
+            class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
+            lines.append(f"class found:    {path or 'NOT FOUND'}")
+            lines.append(f"class patch:    {'YES' if class_ok else 'NO'}")
+        except Exception as e:
+            lines.append(f"class scan err: {e}")
 
-        client = S.CLIENT
-        attr, gw = _find_client_gateway(client)
-        inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
-        lines.append(f"client attr:    {attr or '—'}")
-        lines.append(f"instance patch: {'YES' if inst_ok else 'NO'}")
-        lines.append(f"preset held:    {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
-        lines.append(f"identify count: {self._identify_count}")
-        lines.append(f"reconnect cnt:  {self._reconnect_count}")
-        lines.append(f"reconnect grace:{max(0, int(self._reconnect_grace_until - time.time()))}s")
-        if gw is not None:
-            try:
-                st = gw.get_state() if hasattr(gw, "get_state") else {}
-                lines.append(f"gateway state:  {st}")
-            except Exception as e:
-                lines.append(f"gateway state err: {e}")
-            lines.append(f"last props os:  {(self._last_props or {}).get('os', '?')}")
-            lines.append(f"last props br:  {(self._last_props or {}).get('browser', '?')}")
-            lines.append(f"last props dev: {(self._last_props or {}).get('device', '?')}")
+        try:
+            client = S.CLIENT
+            attr, gw = _find_client_gateway(client)
+            inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
+            lines.append(f"client attr:    {attr or '—'}")
+            lines.append(f"instance patch: {'YES' if inst_ok else 'NO'}")
+            lines.append(f"preset held:    {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
+            lines.append(f"identify count: {self._identify_count}")
+            lines.append(f"reconnect cnt:  {self._reconnect_count}")
+            lines.append(f"reconnect grace:{max(0, int(self._reconnect_grace_until - time.time()))}s")
+            if gw is not None:
+                try:
+                    st = gw.get_state() if hasattr(gw, "get_state") else {}
+                    lines.append(f"gateway state:  {st}")
+                except Exception as e:
+                    lines.append(f"gateway state err: {e}")
+                lines.append(f"last os:        {(self._last_props or {}).get('os', '?')}")
+                lines.append(f"last browser:   {(self._last_props or {}).get('browser', '?')}")
+                lines.append(f"last device:    {(self._last_props or {}).get('device', '?')}")
+        except Exception as e:
+            lines.append(f"client scan err: {e}")
+
         return lines
 
     def _current_preset_label(self):
@@ -315,8 +328,6 @@ class SpooferCog:
         preset = PLATFORM_PRESETS.get(plat)
         return preset["label"] if preset else plat
 
-    # --------------------------------------------------------
-    # platform setter + reconnect
     # --------------------------------------------------------
     async def _set_platform(self, preset_key, message):
         preset = PLATFORM_PRESETS.get(preset_key)
@@ -336,7 +347,6 @@ class SpooferCog:
         print(f"[spoofer] reconnect #{self._reconnect_count} requested")
         self._reconnect_grace_until = time.time() + 30
 
-        # path 1 — fork-specific helper
         rc = getattr(client, "reconnect_gateway", None)
         if callable(rc):
             try:
@@ -347,7 +357,6 @@ class SpooferCog:
             except Exception as e:
                 print(f"[spoofer] reconnect_gateway raised: {e}")
 
-        # path 2 — close the websocket, let the lib auto-reconnect
         _, gw = _find_client_gateway(client)
         if gw is not None and hasattr(gw, "close"):
             try:
@@ -357,7 +366,6 @@ class SpooferCog:
             except Exception as e:
                 print(f"[spoofer] ws.close raised: {e}")
 
-        # path 3 — full client close; fork must own restart logic
         if hasattr(client, "close"):
             try:
                 await client.close()
@@ -369,10 +377,24 @@ class SpooferCog:
         print(f"[spoofer] reconnect #{self._reconnect_count} — no usable path")
 
     # --------------------------------------------------------
-    # handle — dual-shape
+    # handle — every branch wrapped; on any throw, the actual
+    # traceback is printed AND the message is edited with the
+    # short error so we stop flying blind.
     # --------------------------------------------------------
     async def handle(self, message, cmd=None, args=None):
-        # shape B — router calls handle(message) and expects us to parse
+        try:
+            await self._handle_inner(message, cmd, args)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("[spoofer] HANDLE RAISED:")
+            print(tb)
+            short = f"{type(e).__name__}: {e}"
+            try:
+                await message.edit(content=S.ui_err(f"`spoofer` crash — {short}"))
+            except Exception:
+                pass
+
+    async def _handle_inner(self, message, cmd=None, args=None):
         if cmd is None:
             content = getattr(message, "content", "") or ""
             parts = content.split()
@@ -380,7 +402,6 @@ class SpooferCog:
                 return
             cmd = parts[0].lstrip("$./!").lower()
             args = parts[1:]
-
         if args is None:
             args = []
 
@@ -391,10 +412,7 @@ class SpooferCog:
 
         client = S.CLIENT
         if client is None:
-            try:
-                await message.edit(content=S.ui_err("client not ready"))
-            except Exception:
-                pass
+            await message.edit(content=S.ui_err("client not ready"))
             return
 
         # --- spooferdiag ---
@@ -404,13 +422,10 @@ class SpooferCog:
             for ln in lines:
                 print(f"[spooferdiag] {ln}")
             print("[spooferdiag] ====")
-            try:
-                await message.edit(content=S._ansi_block(lines))
-            except Exception as e:
-                print(f"[spooferdiag] edit failed: {e}")
+            await message.edit(content=S._ansi_block(lines))
             return
 
-        # --- platform list / set ---
+        # --- platform ---
         if cmd == "platform":
             if len(args) < 1:
                 cur = getattr(S, "_current_platform", "desktop")
@@ -477,8 +492,6 @@ class SpooferCog:
             return
 
     # --------------------------------------------------------
-    # status block
-    # --------------------------------------------------------
     async def _send_status(self, message):
         p = self._last_props or {}
         active = _PRESET_HOLDER[0]
@@ -495,7 +508,7 @@ class SpooferCog:
 
         cls, _ = _find_gw_class()
         class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
-        inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
+        inst_ok  = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
 
         lines = [
             f"  tracked:      {getattr(S, '_current_platform', '?')}",
