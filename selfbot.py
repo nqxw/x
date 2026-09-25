@@ -1,7 +1,7 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# lunar — v2.4.0-access
+# lunar — v2.5.0-superreact
 
-import modifyself_shim as discord   # ← CHANGED (was: import discord)
+import modifyself_shim as discord
 
 import asyncio
 import aiohttp
@@ -158,8 +158,8 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.4.0-access"
-OWNER_ID = 1551632054574121051   # ← hardcoded fallback, overwritten by access_load()
+VERSION = "2.5.0:3"
+OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
@@ -196,7 +196,6 @@ OWNER_COMMANDS = frozenset({
 _ACCESS_FILE = "database/access.json"
 
 def _current_owner():
-    # prefer cstate's OWNER_ID — that's where setowner writes
     try:
         from cogs import state as cstate
         v = getattr(cstate, "OWNER_ID", None)
@@ -211,7 +210,7 @@ def access_save():
         os.makedirs(os.path.dirname(_ACCESS_FILE), exist_ok=True)
         with open(_ACCESS_FILE, "w") as f:
             json.dump({
-                "owner":  _current_owner(),   # ← reads live owner (cstate), not stale __main__
+                "owner":  _current_owner(),
                 "admins": sorted(_admins),
                 "devs":   sorted(_devs),
             }, f, indent=2)
@@ -229,7 +228,6 @@ def access_load():
             OWNER_ID = int(d["owner"])
         _admins = set(int(x) for x in d.get("admins", []))
         _devs   = set(int(x) for x in d.get("devs", []))
-        # also seed cstate so the shared reference starts at the right value
         try:
             from cogs import state as cstate
             cstate.OWNER_ID = OWNER_ID
@@ -399,6 +397,7 @@ HELP_DATA = {
         ("remoji <a, b, c>","rotate custom status emoji"),
         ("stopstatus","stop status rotation"),
         ("stopemoji","stop emoji rotation"),
+        ("rpcwatchdog","rpc watchdog status/stop/start"),
     ],
     "fun": [
         ("gayrate [user_id]","gay percentage"),("feed <user_id>","feed a user"),
@@ -614,13 +613,15 @@ HELP_DATA = {
         ("giveaway on/off","auto-enter giveaways"),("nitrosniper on/off","auto-redeem nitro gift codes"),
         ("autoreact <emoji>","auto-react to your own messages"),
         ("autoreactstop","stop auto-react"),
-        ("superreact <emoji> [n]","react to the last n messages concurrently"),
+        ("superreact <emoji>","continuous react to your own messages"),
+        ("superreactstop","stop superreact"),
         ("multireact add <emoji>","add emoji to multi-react pool"),
         ("multireact remove <emoji>","remove emoji from pool"),
         ("multireact list","list pool"),("multireact on/off","toggle multi-react"),
         ("autoaddback on/off","auto-accept friend requests"),
         ("vsniper add <code> <gid>","add vanity url to watch list"),
         ("vsniper start/stop/list","vanity sniper control"),
+        ("reactdiag","show autoreact/superreact state"),
     ],
     "spoofer": [
         ("platform [name]","show or set spoofed platform"),
@@ -806,7 +807,7 @@ def build_help_section(cat, page=1):
 client = discord.Client(token=TOKEN)
 _MAIN_CLIENT = client
 
-# ── inline state (still owned by selfbot.py) ──
+# ── inline state ──
 AUTO_RESPONSES = {}
 SNIPER_ENABLED = True
 LOGGER_ENABLED = False
@@ -817,6 +818,7 @@ _afk_msg = None
 _afk_enabled = False
 _typing_tasks = {}
 _autoreact_emoji = None
+_superreact_emoji = None
 _multireact_pool = []
 _multireact_enabled = False
 _spam_tasks = {}
@@ -940,7 +942,7 @@ def decrypt_file(path):
     return True
 
 # ─────────────────────────────────────────────
-# HELPERS STILL OWNED INLINE
+# HELPERS
 # ─────────────────────────────────────────────
 
 GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
@@ -1171,7 +1173,7 @@ def task_cancel(name):
     return False
 
 # ─────────────────────────────────────────────
-# COG BOOT — fault-tolerant per-module loader
+# COG BOOT
 # ─────────────────────────────────────────────
 
 COG_MODULES = [
@@ -1291,6 +1293,7 @@ async def _boot_cogs():
         cstate._afk_msg = _afk_msg
         cstate._autodelete_secs = _autodelete_secs
         cstate._autoreact_emoji = _autoreact_emoji
+        cstate._superreact_emoji = _superreact_emoji
         cstate._multireact_pool = _multireact_pool
         cstate._multireact_enabled = _multireact_enabled
         cstate._giveaway_enabled = _giveaway_enabled
@@ -1306,7 +1309,7 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
-        # ── access control (shared by reference — cog mutations propagate) ──
+        # access control (shared by reference)
         cstate.OWNER_ID           = OWNER_ID
         cstate._admins            = _admins
         cstate._devs              = _devs
@@ -1465,7 +1468,7 @@ async def on_resumed():
     _session_events.append({"ts": time.time(), "event": "resumed"})
 
 # ─────────────────────────────────────────────
-# DISPATCHER — pre-hooks + cog routing + help fallthrough
+# DISPATCHER
 # ─────────────────────────────────────────────
 
 async def _dispatch_message(_client, message):
@@ -1473,7 +1476,7 @@ async def _dispatch_message(_client, message):
 
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
-    global _autoreact_emoji, _autoaddback, _current_platform
+    global _autoreact_emoji, _superreact_emoji, _autoaddback, _current_platform
     global _autoclaim_enabled, _speak_lang
     global _giveaway_enabled, _nitrosniper_enabled
     global _vsniper_task
@@ -1605,6 +1608,16 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
+    # ── SUPERREACT (continuous, own messages) ──
+    if (_superreact_emoji
+            and message.author.id == client.user.id
+            and message.content
+            and not message.content.startswith(PREFIX)):
+        try:
+            await message.add_reaction(_superreact_emoji)
+        except Exception:
+            pass
+
     # ── COMMAND GATE ──
 
     if message.author.id != client.user.id:
@@ -1635,7 +1648,7 @@ async def _dispatch_message(_client, message):
     if not _perm_check(cmd, message):
         return
 
-    # ── ACCESS GATE — tier enforcement ──
+    # ── ACCESS GATE ──
     if not _access_ok(message.author.id, cmd):
         lvl = _access_level(message.author.id)
         need = "owner"
@@ -1685,7 +1698,7 @@ async def on_message(message):
     await _dispatch_message(client, message)
 
 # ─────────────────────────────────────────────
-# OTHER EVENTS STILL OWNED INLINE
+# OTHER EVENTS
 # ─────────────────────────────────────────────
 
 @client.event
@@ -1751,7 +1764,7 @@ _install_signal_handlers()
 
 print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
-    client.run()   # ← modifyself takes token at init, not at run()
+    client.run()
 except Exception as e:
     print(f"[FATAL] run failed: {type(e).__name__}: {e}")
     sys.exit(1)
