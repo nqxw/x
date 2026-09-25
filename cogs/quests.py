@@ -1,18 +1,7 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
 #
-# v3 fixes:
-#   - split hcaptcha init lock from solve lock (was: single lock, deadlocks
-#     when two claims overlap)
-#   - _video: 429s and 400s now feed the stall counter, cap on budget spent
-#   - _video: poll interval raised to 5s after the first tick (matches client)
-#   - _heartbeat_task: 429 on one payload sleeps the whole task, not just that
-#     payload — prevents hammering the endpoint with the fallback cascade
-#   - autoclaim loop is now a named singleton, $autoclaim on is idempotent
-#   - _current_voice_channel_id: cross-checks against cached guild state, so a
-#     stale channel id from a former guild can't sneak into a heartbeat
-#   - _mission: 400s are logged (they carry useful body), not swallowed
-#   - _claim_quest / claim_orb reuse the shared aiohttp session when available
-#   - quest UA realigned: plain Chrome UA + matching client build number
+# v3.1 — extended questdiag: probes /quests/@me live and prints the raw
+# response shape so empty-fetch cases are diagnosable without a restart.
 import asyncio
 import base64
 import json
@@ -56,11 +45,8 @@ MISSION_TASKS = ("COLLECT_ITEM", "COLLECT", "MISSION_COMPLETE", "COMPLETE_QUEST"
 DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
 ORB_SKU = "1342211853484429445"
 
-# refresh this when quest endpoints start rejecting with 400
 CLIENT_BUILD_NUMBER = 358560
 
-# UA realigned — plain Chrome, no discord/<build> segment that would
-# disagree with the client_build_number in x-super-properties
 QUEST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -68,7 +54,6 @@ _hcaptcha_agent = None
 _agent_init_lock = asyncio.Lock()
 _solve_lock = asyncio.Lock()
 
-# singleton task handle so $autoclaim on is idempotent
 _autoclaim_task = None
 
 
@@ -77,8 +62,6 @@ _autoclaim_task = None
 # ─────────────────────────────────────────────────────────────
 
 def _get_shared_session():
-    """Prefer the module-level session from selfbot.py (turbo). Fall back
-    to a local one-off session when the shim isn't wired up yet."""
     try:
         from __main__ import _get_session as _main_get
         return _main_get(), False
@@ -141,7 +124,7 @@ def _quest_headers(token):
 
 
 # ─────────────────────────────────────────────────────────────
-# VOICE CHANNEL RESOLUTION — cross-checked against live guild state
+# VOICE CHANNEL RESOLUTION
 # ─────────────────────────────────────────────────────────────
 
 def _current_voice_channel_id():
@@ -214,7 +197,7 @@ async def _api(session, method, url, headers=None, json_body=None, retries=3):
 
 
 # ─────────────────────────────────────────────────────────────
-# HCAPTCHA — init lock and solve lock are separate
+# HCAPTCHA
 # ─────────────────────────────────────────────────────────────
 
 async def _get_hcaptcha_agent():
@@ -429,8 +412,6 @@ class QuestService:
             traceback.print_exc()
             return "error"
 
-    # ── VIDEO ────────────────────────────────────────────────
-
     async def _video(self, session, quest):
         target = quest.target or 1.0
         last_sent = 0.0
@@ -444,10 +425,7 @@ class QuestService:
         wall_start = time.time()
         stall = 0
         last_seen = last_sent
-        # deadline: real wall-time budget. allow target*1.5 minimum 60s.
         deadline = wall_start + max(60.0, target * 1.5)
-        # first few ticks are fast to establish progress, then slow down to
-        # match the real client (one update roughly every 5-10s)
         tick_count = 0
 
         while time.time() < deadline:
@@ -497,15 +475,12 @@ class QuestService:
             if stall >= 20:
                 print(f"[video] {quest.name} stalling — bailing")
                 break
-            # first three ticks at 2s, then 5s
             await asyncio.sleep(2.0 if tick_count < 3 else 5.0)
 
         fresh = await self.re_fetch_one(session, quest.id)
         if fresh:
             quest.data = fresh
         return "completed" if quest.is_completed() else "recovering"
-
-    # ── HEARTBEAT ────────────────────────────────────────────
 
     def _build_heartbeat_payloads(self, quest, task):
         payloads = []
@@ -545,8 +520,6 @@ class QuestService:
 
         while time.time() - start < max_runtime:
             d = None
-            # 429 on ANY payload sleeps the whole task — this prevents the
-            # fallback cascade from hammering the endpoint on the same bucket
             rate_limited = False
             for p in payloads:
                 try:
@@ -605,8 +578,6 @@ class QuestService:
         if fresh:
             quest.data = fresh
         return "completed" if quest.is_completed() else "recovering"
-
-    # ── ACHIEVEMENTS ─────────────────────────────────────────
 
     async def _achievements(self, session, quest):
         target = quest.target or 1.0
@@ -675,13 +646,10 @@ class QuestService:
             quest.data = fresh
         return "completed" if quest.is_completed() else "recovering"
 
-    # ── MISSION ──────────────────────────────────────────────
-
     async def _mission(self, session, quest):
         task = quest.selected_task
         target = quest.target or 0
 
-        # external-task-progress only accepts value <= target; skip when target=0
         if target > 0:
             try:
                 d = await _api(session, "POST",
@@ -844,7 +812,6 @@ async def claim_orb(token):
 # ─────────────────────────────────────────────────────────────
 
 async def _ensure_autoclaim():
-    """Idempotent spawn — returns True when a fresh task was started."""
     global _autoclaim_task
     if _autoclaim_task is not None and not _autoclaim_task.done():
         return False
@@ -1121,6 +1088,50 @@ class QuestsCog:
                 pass
             ch = _current_voice_channel_id()
             autoclaim_running = _autoclaim_task is not None and not _autoclaim_task.done()
+
+            # ── live probe of /quests/@me so the raw shape is visible ──
+            raw_keys = "?"
+            raw_count = "?"
+            raw_status = "?"
+            raw_first = "?"
+            session, own = _get_shared_session()
+            try:
+                svc = QuestService(S.TOKEN)
+                try:
+                    async with session.get(
+                        "https://discord.com/api/v9/quests/@me",
+                        headers=svc.headers,
+                    ) as r:
+                        raw_status = r.status
+                        try:
+                            d = await r.json()
+                            if isinstance(d, dict):
+                                raw_keys = ",".join(list(d.keys())[:5]) or "(empty)"
+                                qlist = d.get("quests")
+                                if isinstance(qlist, list):
+                                    raw_count = len(qlist)
+                                    if qlist:
+                                        q0 = qlist[0] or {}
+                                        qid = str(q0.get("id", "?"))[:12]
+                                        cfg_ok = bool(q0.get("config"))
+                                        us_ok = bool(q0.get("user_status"))
+                                        exp = (q0.get("config") or {}).get("expires_at", "none")
+                                        raw_first = f"id={qid}… cfg={cfg_ok} us={us_ok} exp={exp}"
+                                else:
+                                    raw_count = f"not-list:{type(qlist).__name__}"
+                            else:
+                                raw_keys = f"not-dict:{type(d).__name__}"
+                        except Exception as e:
+                            raw_keys = f"parse-error: {type(e).__name__}: {e}"
+                except Exception as e:
+                    raw_status = f"exception: {type(e).__name__}: {e}"
+            finally:
+                if own:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
+
             lines = [
                 f"  voice channel:  {ch if ch else '—'}",
                 f"  build number:   {CLIENT_BUILD_NUMBER}",
@@ -1128,6 +1139,10 @@ class QuestsCog:
                 f"  ua:             {QUEST_UA[:60]}...",
                 f"  autoclaim:      {'running' if autoclaim_running else 'idle'}",
                 f"  hcaptcha:       {'loaded' if HAS_HCAPTCHA else 'unavailable'}",
+                f"  /quests/@me:    HTTP {raw_status}",
+                f"  response keys:  {raw_keys}",
+                f"  quest count:    {raw_count}",
+                f"  first quest:    {raw_first}",
             ]
             await message.channel.send(S._ansi_block(lines))
 
