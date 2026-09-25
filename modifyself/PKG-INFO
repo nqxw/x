@@ -1,0 +1,52 @@
+Metadata-Version: 2.4
+Name: modifyself
+Version: 0.4.1
+Summary: A clean, pythonic Discord self-bot library
+Author-email: modifyself <modifyself@example.com>
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/kzfq/modifyself-lite
+Project-URL: Bug-Reports, https://github.com/kzfq/modifyself-lite/issues
+Project-URL: Source, https://github.com/kzfq/modifyself-lite
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: websockets>=10.0
+Requires-Dist: wreq>=0.1.0
+Requires-Dist: aiohttp>=3.8.0
+Requires-Dist: plyer>=0.9
+Requires-Dist: pillow>=10.0
+Requires-Dist: PyNaCl>=1.5.0
+Requires-Dist: opuslib>=3.0.0
+Dynamic: license-file
+
+﻿# modifyself
+
+A clean, pythonic Discord self-bot library.
+
+## Installation
+
+pip install modifyself
+
+## Quick Example
+
+rom modifyself import Client, command
+
+bot = Client(token="your_token")
+
+@bot.command()
+async def ping(ctx):
+    await ctx.reply("Pong!")
+
+bot.run()
+
+## Features
+
+- Clean, intuitive API
+- Command framework with cogs
+- Automatic rate limiting
+- Gateway event handling
+- Full API coverage
+
+## License
+
+MIT
