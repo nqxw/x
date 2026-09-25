@@ -1,4 +1,4 @@
-./modifyself
+-e ./modifyself
 aiohttp
 websockets
 hcaptcha-challenger
