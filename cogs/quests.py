@@ -1,5 +1,5 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
-# v3.1 — extended questdiag, hcaptcha lock split, stall detection on 429/400
+# v3.2 — build number bumped 358560 → 366000 for newer desktop quest visibility
 import asyncio
 import base64
 import json
@@ -42,7 +42,7 @@ MISSION_TASKS = ("COLLECT_ITEM", "COLLECT", "MISSION_COMPLETE", "COMPLETE_QUEST"
 
 DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
 ORB_SKU = "1342211853484429445"
-CLIENT_BUILD_NUMBER = 358560
+CLIENT_BUILD_NUMBER = 366000
 
 QUEST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
