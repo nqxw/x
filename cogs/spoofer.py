@@ -1,9 +1,10 @@
 # language: Python, file: cogs/spoofer.py
-# platform / device spoofing — args stripped of leading cmd token, unknown cmds rejected
+# platform pool spoofing — rotate / random / sticky across gateway reconnects
 import asyncio
 import importlib
 import inspect
 import pkgutil
+import random
 import time
 import traceback
 import modifyself_shim as discord
@@ -35,12 +36,18 @@ PLATFORM_PRESETS = {
 
 
 _LIVE_COG = [None]
-_PRESET_HOLDER = [None]
+_POOL_STATE = [{
+    "mode":   "rotate",   # rotate | random | sticky
+    "pool":   [],         # list of preset dicts
+    "keys":   [],         # parallel list of preset keys
+    "cursor": 0,
+    "last":   None,
+}]
 _GW_CACHE = {"cls": None, "path": None, "scanned": False}
 
 
 # ============================================================
-# discovery — cached so we scan once
+# discovery
 # ============================================================
 def _walk_modifyself():
     try:
@@ -105,6 +112,63 @@ def _find_client_gateway(client):
 
 
 # ============================================================
+# pool rotation
+# ============================================================
+def _pick_preset():
+    st = _POOL_STATE[0]
+    pool = st["pool"]
+    if not pool:
+        return None
+    mode = st["mode"]
+    if mode == "sticky":
+        return pool[0]
+    if mode == "random":
+        return random.choice(pool)
+    # rotate (default) — sequential, wraps
+    idx = st["cursor"] % len(pool)
+    st["cursor"] = idx + 1
+    return pool[idx]
+
+
+def _pool_keys():
+    return _POOL_STATE[0]["keys"]
+
+
+def _set_pool(keys):
+    st = _POOL_STATE[0]
+    st["pool"] = [PLATFORM_PRESETS[k] for k in keys if k in PLATFORM_PRESETS]
+    st["keys"] = [k for k in keys if k in PLATFORM_PRESETS]
+    st["cursor"] = 0
+    # keep state module in sync with a comma-joined view
+    S._current_platform = ",".join(st["keys"]) if st["keys"] else "desktop"
+
+
+def _add_key(key):
+    st = _POOL_STATE[0]
+    if key in st["keys"]:
+        return False
+    if key not in PLATFORM_PRESETS:
+        return False
+    st["keys"].append(key)
+    st["pool"].append(PLATFORM_PRESETS[key])
+    S._current_platform = ",".join(st["keys"])
+    return True
+
+
+def _remove_key(key):
+    st = _POOL_STATE[0]
+    if key not in st["keys"]:
+        return False
+    i = st["keys"].index(key)
+    st["keys"].pop(i)
+    st["pool"].pop(i)
+    if st["cursor"] > len(st["pool"]):
+        st["cursor"] = 0
+    S._current_platform = ",".join(st["keys"]) if st["keys"] else "desktop"
+    return True
+
+
+# ============================================================
 # identify rewrite
 # ============================================================
 def _rewrite_identify_dict(data, preset):
@@ -147,6 +211,7 @@ def _rewrite_identify_dict(data, preset):
     if cog is not None:
         cog._last_props = dict(props)
         cog._identify_count += 1
+    _POOL_STATE[0]["last"] = preset
     print(f"[spoofer] rewrote IDENTIFY → {preset['label']}")
     return True
 
@@ -167,9 +232,9 @@ def _install_patches():
 
     async def patched_send_json(self, data):
         try:
-            if isinstance(data, dict):
-                preset = _PRESET_HOLDER[0]
-                if preset is not None and data.get("op") == 2:
+            if isinstance(data, dict) and data.get("op") == 2:
+                preset = _pick_preset()
+                if preset is not None:
                     _rewrite_identify_dict(data, preset)
         except Exception as e:
             print(f"[spoofer] send_json patch error: {e}")
@@ -192,9 +257,9 @@ def _install_instance_patch(client):
 
     async def patched_send_json(data):
         try:
-            if isinstance(data, dict):
-                preset = _PRESET_HOLDER[0]
-                if preset is not None and data.get("op") == 2:
+            if isinstance(data, dict) and data.get("op") == 2:
+                preset = _pick_preset()
+                if preset is not None:
                     _rewrite_identify_dict(data, preset)
         except Exception as e:
             print(f"[spoofer] instance send_json patch error: {e}")
@@ -227,7 +292,6 @@ class SpooferCog:
 
     def __init__(self):
         self.bot = None
-        self._patched_preset = None
         self._last_props = None
         self._identify_count = 0
         self._reconnect_count = 0
@@ -235,6 +299,9 @@ class SpooferCog:
         self._reconnect_grace_until = 0.0
         self._instance_patched_attr = None
         _LIVE_COG[0] = self
+
+        # default pool: desktop only
+        _set_pool(["desktop"])
 
         try:
             class_ok = _install_patches()
@@ -298,6 +365,7 @@ class SpooferCog:
             await asyncio.sleep(5)
 
     def _build_diag(self):
+        st = _POOL_STATE[0]
         lines = []
         try:
             cls, path = _find_gw_class()
@@ -313,14 +381,18 @@ class SpooferCog:
             inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
             lines.append(f"client attr:    {attr or '—'}")
             lines.append(f"instance patch: {'YES' if inst_ok else 'NO'}")
-            lines.append(f"preset held:    {_PRESET_HOLDER[0]['label'] if _PRESET_HOLDER[0] else '—'}")
+            lines.append(f"pool mode:      {st['mode']}")
+            lines.append(f"pool keys:      {', '.join(st['keys']) or '—'}")
+            lines.append(f"pool size:      {len(st['pool'])}")
+            lines.append(f"cursor:         {st['cursor']}")
+            lines.append(f"last pick:      {st['last']['label'] if st['last'] else '—'}")
             lines.append(f"identify count: {self._identify_count}")
             lines.append(f"reconnect cnt:  {self._reconnect_count}")
             lines.append(f"reconnect grace:{max(0, int(self._reconnect_grace_until - time.time()))}s")
             if gw is not None:
                 try:
-                    st = gw.get_state() if hasattr(gw, "get_state") else {}
-                    lines.append(f"gateway state:  {st}")
+                    gws = gw.get_state() if hasattr(gw, "get_state") else {}
+                    lines.append(f"gateway state:  {gws}")
                 except Exception as e:
                     lines.append(f"gateway state err: {e}")
                 lines.append(f"last os:        {(self._last_props or {}).get('os', '?')}")
@@ -331,21 +403,14 @@ class SpooferCog:
         return lines
 
     def _current_preset_label(self):
-        plat = getattr(S, "_current_platform", "desktop")
-        preset = PLATFORM_PRESETS.get(plat)
-        return preset["label"] if preset else plat
+        st = _POOL_STATE[0]
+        if not st["keys"]:
+            return "—"
+        if len(st["keys"]) == 1:
+            return PLATFORM_PRESETS[st["keys"][0]]["label"]
+        return f"pool[{len(st['keys'])}] ({st['mode']})"
 
     # --------------------------------------------------------
-    async def _set_platform(self, preset_key, message):
-        preset = PLATFORM_PRESETS.get(preset_key)
-        if not preset:
-            await message.edit(content=S.ui_err(f"unknown platform: {preset_key}"))
-            return False
-        self._patched_preset = preset
-        _PRESET_HOLDER[0] = preset
-        S._current_platform = preset_key
-        return True
-
     async def _safe_reconnect(self):
         client = S.CLIENT
         if client is None:
@@ -441,7 +506,6 @@ class SpooferCog:
                 pass
 
     async def _dispatch_inner(self, message, cmd=None, args=None):
-        # --- shape B: router handed us only the message, parse it ourselves
         if cmd is None:
             content = getattr(message, "content", "") or ""
             parts = content.split()
@@ -450,24 +514,20 @@ class SpooferCog:
             cmd = parts[0].lstrip("$./!").lower()
             args = parts[1:]
 
-        # --- normalize args to a list
         if args is None:
             args = []
         elif isinstance(args, str):
             args = args.split()
 
-        # --- normalize cmd in case router passed a prefixed token
         if isinstance(cmd, str):
             cmd = cmd.lstrip("$./!").lower()
 
-        # --- some routers echo the command token as args[0]; strip it
         while args and isinstance(args[0], str) and \
                 args[0].lstrip("$./!").lower() == cmd:
             args = args[1:]
 
         print(f"[spoofer] dispatch cmd={cmd!r} args={args!r}")
 
-        # --- hard guard: never let an unknown command touch this cog
         if cmd not in self.COMMANDS:
             print(f"[spoofer] rejecting unknown cmd={cmd!r}")
             return
@@ -479,7 +539,7 @@ class SpooferCog:
             await message.edit(content=S.ui_err("client not ready"))
             return
 
-        # --- spooferdiag ---
+        # ---------- spooferdiag ----------
         if cmd == "spooferdiag":
             lines = self._build_diag()
             print("[spooferdiag] ====")
@@ -489,12 +549,14 @@ class SpooferCog:
             await message.edit(content=S._ansi_block(lines))
             return
 
-        # --- platform ---
+        # ---------- platform ----------
         if cmd == "platform":
             if len(args) < 1:
-                cur = getattr(S, "_current_platform", "desktop")
-                lines = [f"  current: {cur}", "",
-                         f"  live:    {self._current_preset_label()}", "",
+                st = _POOL_STATE[0]
+                lines = [f"  mode:   {st['mode']}",
+                         f"  pool:   {', '.join(st['keys']) or '—'}",
+                         f"  cursor: {st['cursor']}",
+                         "",
                          "  available:"]
                 for k in sorted(PLATFORM_PRESETS.keys()):
                     lines.append(f"    {k:<12} {PLATFORM_PRESETS[k]['label']}")
@@ -503,54 +565,139 @@ class SpooferCog:
             plat = args[0].lower()
             if plat == "off":
                 plat = "desktop"
-            if not await self._set_platform(plat, message):
+            if plat not in PLATFORM_PRESETS:
+                await message.edit(content=S.ui_err(f"unknown platform: {plat}"))
                 return
-            preset = PLATFORM_PRESETS[plat]
-            await message.edit(content=S.ui_ok(f"platform → {preset['label']}"))
+            _set_pool([plat])
+            _POOL_STATE[0]["mode"] = "sticky"
+            await message.edit(content=S.ui_ok(
+                f"single → {PLATFORM_PRESETS[plat]['label']} (sticky)"))
             await self._safe_reconnect()
             return
 
-        # --- spoof / spoofer ---
+        # ---------- spoof / spoofer ----------
         if cmd in ("spoof", "spoofer"):
             if len(args) < 1:
                 await message.edit(content=S.ui_info(
-                    "usage: spoof <platform> | spoof status | spoof reset"))
+                    "usage: spoof <platform> | add <p> | remove <p> | "
+                    "pool | mode <rotate|random|sticky> | clear | "
+                    "status | reset"))
                 return
             sub = args[0].lower()
+
+            # --- status ---
             if sub == "status":
                 await self._send_status(message)
                 return
+
+            # --- reset ---
             if sub == "reset":
-                if not await self._set_platform("desktop", message):
-                    return
-                await message.edit(content=S.ui_ok("platform reset → Desktop"))
+                _set_pool(["desktop"])
+                _POOL_STATE[0]["mode"] = "sticky"
+                await message.edit(content=S.ui_ok("reset → Desktop (sticky)"))
                 await self._safe_reconnect()
                 return
-            if not await self._set_platform(sub, message):
+
+            # --- pool ---
+            if sub == "pool":
+                st = _POOL_STATE[0]
+                lines = [f"  mode:   {st['mode']}",
+                         f"  cursor: {st['cursor']}",
+                         f"  size:   {len(st['keys'])}",
+                         "",
+                         "  keys:"]
+                if st["keys"]:
+                    for i, k in enumerate(st["keys"]):
+                        marker = "→" if (st["mode"] == "rotate"
+                                         and i == (st["cursor"] % max(len(st["keys"]), 1)))
+                        lines.append(f"    {marker} {k:<12} {PLATFORM_PRESETS[k]['label']}")
+                else:
+                    lines.append("    (empty)")
+                await message.edit(content=S._ansi_block(lines))
                 return
-            preset = PLATFORM_PRESETS[sub]
-            await message.edit(content=S.ui_ok(f"spoofed → {preset['label']}"))
+
+            # --- clear ---
+            if sub == "clear":
+                _set_pool([])
+                await message.edit(content=S.ui_ok("pool cleared — no spoofing"))
+                return
+
+            # --- add ---
+            if sub == "add":
+                if len(args) < 2:
+                    await message.edit(content=S.ui_err("usage: spoof add <platform>"))
+                    return
+                key = args[1].lower()
+                if key not in PLATFORM_PRESETS:
+                    await message.edit(content=S.ui_err(f"unknown platform: {key}"))
+                    return
+                if _add_key(key):
+                    await message.edit(content=S.ui_ok(
+                        f"added {key} → pool size {len(_pool_keys())}"))
+                else:
+                    await message.edit(content=S.ui_info(f"{key} already in pool"))
+                return
+
+            # --- remove ---
+            if sub == "remove":
+                if len(args) < 2:
+                    await message.edit(content=S.ui_err("usage: spoof remove <platform>"))
+                    return
+                key = args[1].lower()
+                if _remove_key(key):
+                    await message.edit(content=S.ui_ok(
+                        f"removed {key} → pool size {len(_pool_keys())}"))
+                else:
+                    await message.edit(content=S.ui_err(f"{key} not in pool"))
+                return
+
+            # --- mode ---
+            if sub == "mode":
+                if len(args) < 2:
+                    await message.edit(content=S.ui_err(
+                        "usage: spoof mode <rotate|random|sticky>"))
+                    return
+                m = args[1].lower()
+                if m not in ("rotate", "random", "sticky"):
+                    await message.edit(content=S.ui_err(f"unknown mode: {m}"))
+                    return
+                _POOL_STATE[0]["mode"] = m
+                _POOL_STATE[0]["cursor"] = 0
+                await message.edit(content=S.ui_ok(f"mode → {m}"))
+                return
+
+            # --- default: treat as platform shortcut ---
+            if sub not in PLATFORM_PRESETS:
+                await message.edit(content=S.ui_err(f"unknown platform: {sub}"))
+                return
+            _set_pool([sub])
+            _POOL_STATE[0]["mode"] = "sticky"
+            await message.edit(content=S.ui_ok(
+                f"spoofed → {PLATFORM_PRESETS[sub]['label']}"))
             await self._safe_reconnect()
             return
 
-        # --- vr / console ---
+        # ---------- vr / console ----------
         if cmd in ("vr", "console"):
-            if not await self._set_platform(cmd, message):
+            if cmd not in PLATFORM_PRESETS:
+                await message.edit(content=S.ui_err(f"unknown platform: {cmd}"))
                 return
-            preset = PLATFORM_PRESETS[cmd]
-            await message.edit(content=S.ui_ok(f"platform → {preset['label']}"))
+            _set_pool([cmd])
+            _POOL_STATE[0]["mode"] = "sticky"
+            await message.edit(content=S.ui_ok(
+                f"platform → {PLATFORM_PRESETS[cmd]['label']}"))
             await self._safe_reconnect()
             return
 
-        # --- spoofstatus ---
+        # ---------- spoofstatus ----------
         if cmd == "spoofstatus":
             await self._send_status(message)
             return
 
-        # --- spoofreset ---
+        # ---------- spoofreset ----------
         if cmd == "spoofreset":
-            if not await self._set_platform("desktop", message):
-                return
+            _set_pool(["desktop"])
+            _POOL_STATE[0]["mode"] = "sticky"
             await message.edit(content=S.ui_ok("platform reset → Desktop"))
             await self._safe_reconnect()
             return
@@ -558,15 +705,15 @@ class SpooferCog:
     # --------------------------------------------------------
     async def _send_status(self, message):
         p = self._last_props or {}
-        active = _PRESET_HOLDER[0]
+        st = _POOL_STATE[0]
         client = S.CLIENT
         _, gw = _find_client_gateway(client)
 
         state_str = "—"
         if gw is not None and hasattr(gw, "get_state"):
             try:
-                st = gw.get_state()
-                state_str = f"{st.get('state')} / conn={st.get('is_connected')}"
+                gws = gw.get_state()
+                state_str = f"{gws.get('state')} / conn={gws.get('is_connected')}"
             except Exception:
                 pass
 
@@ -575,8 +722,10 @@ class SpooferCog:
         inst_ok  = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
 
         lines = [
-            f"  tracked:      {getattr(S, '_current_platform', '?')}",
-            f"  preset held:  {active['label'] if active else '—'}",
+            f"  mode:         {st['mode']}",
+            f"  pool:         {', '.join(st['keys']) or '—'}",
+            f"  cursor:       {st['cursor']}",
+            f"  last pick:    {st['last']['label'] if st['last'] else '—'}",
             f"  class patch:  {'YES' if class_ok else 'NO'}",
             f"  inst patch:   {'YES' if inst_ok else 'NO'}",
             f"  identify #:   {self._identify_count}",
