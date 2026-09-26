@@ -29,7 +29,7 @@ def _ui_ok(msg):
     if callable(fn):
         try: return fn(msg)
         except Exception: pass
-    return _ansi([f"  ✓  {msg}"])
+    return _ansi([f"  \u2713  {msg}"])
 
 
 def _ui_err(msg):
@@ -37,7 +37,7 @@ def _ui_err(msg):
     if callable(fn):
         try: return fn(msg)
         except Exception: pass
-    return _ansi([f"  ✗  {msg}"])
+    return _ansi([f"  \u2717  {msg}"])
 
 
 def _ui_info(msg):
@@ -45,7 +45,7 @@ def _ui_info(msg):
     if callable(fn):
         try: return fn(msg)
         except Exception: pass
-    return _ansi([f"  •  {msg}"])
+    return _ansi([f"  \u2022  {msg}"])
 
 
 def _ui_warn(msg):
@@ -54,6 +54,29 @@ def _ui_warn(msg):
         try: return fn(msg)
         except Exception: pass
     return _ansi([f"  !  {msg}"])
+
+
+async def _reply(message, content):
+    """
+    Robust reply — tries edit first, falls back to delete+send if the
+    original message is inaccessible (age-restricted, deleted, DM lock).
+    """
+    try:
+        await message.edit(content=content)
+        return True
+    except Exception as e:
+        first_err = e
+    # fallback 1: delete the command message then send fresh
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        await message.channel.send(content)
+        return True
+    except Exception as second_err:
+        print(f"[spoofer] _reply failed: edit={first_err} send={second_err}")
+        return False
 
 
 # ============================================================
@@ -271,7 +294,7 @@ def _rewrite_identify_dict(data, preset):
         except Exception:
             pass
     _POOL_STATE[0]["last"] = preset
-    print(f"[spoofer] rewrote IDENTIFY → {preset['label']}")
+    print(f"[spoofer] rewrote IDENTIFY \u2192 {preset['label']}")
     return True
 
 
@@ -365,7 +388,6 @@ class SpooferCog:
 
         print("[spoofer] cog ready — commands: " + ", ".join(sorted(self.COMMANDS)))
 
-    # --------------------------------------------------------
     def _ensure_instance_patch(self):
         if self._instance_patched_attr:
             return True
@@ -460,7 +482,6 @@ class SpooferCog:
             return PLATFORM_PRESETS[st["keys"][0]]["label"]
         return f"pool[{len(st['keys'])}] ({st['mode']})"
 
-    # --------------------------------------------------------
     async def _safe_reconnect(self):
         client = S.CLIENT
         if client is None:
@@ -497,7 +518,7 @@ class SpooferCog:
                 print(f"[spoofer] client.close raised: {e}")
 
     # --------------------------------------------------------
-    # entry-point aliases — every one funnels into _dispatch
+    # entry-point aliases
     # --------------------------------------------------------
     async def handle(self, message, cmd=None, args=None):
         _CALL_COUNT[0] += 1
@@ -522,7 +543,6 @@ class SpooferCog:
     async def on_command(self, message, cmd=None, args=None):
         await self._dispatch(message, cmd, args)
 
-    # --------------------------------------------------------
     async def _dispatch(self, message, cmd=None, args=None):
         try:
             await self._dispatch_inner(message, cmd, args)
@@ -532,12 +552,11 @@ class SpooferCog:
             print(tb)
             short = f"{type(e).__name__}: {e}"
             try:
-                await message.edit(content=_ui_err(f"`spoofer` crash — {short}"))
+                await _reply(message, _ui_err(f"`spoofer` crash — {short}"))
             except Exception:
                 pass
 
     async def _dispatch_inner(self, message, cmd=None, args=None):
-        # if only message was passed, parse the command out of content
         if cmd is None:
             content = getattr(message, "content", "") or ""
             parts = content.split()
@@ -554,7 +573,6 @@ class SpooferCog:
         if isinstance(cmd, str):
             cmd = cmd.lstrip("$./!").lower()
 
-        # strip echoed cmd token from front of args
         while args and isinstance(args[0], str) and \
                 args[0].lstrip("$./!").lower() == cmd:
             args = args[1:]
@@ -569,7 +587,7 @@ class SpooferCog:
 
         client = S.CLIENT
         if client is None:
-            await message.edit(content=_ui_err("client not ready"))
+            await _reply(message, _ui_err("client not ready"))
             return
 
         # ---------- spooferdiag ----------
@@ -579,7 +597,7 @@ class SpooferCog:
             for ln in lines:
                 print(f"[spooferdiag] {ln}")
             print("[spooferdiag] ====")
-            await message.edit(content=_ansi(lines))
+            await _reply(message, _ansi(lines))
             return
 
         # ---------- platform ----------
@@ -593,17 +611,17 @@ class SpooferCog:
                          "  available:"]
                 for k in sorted(PLATFORM_PRESETS.keys()):
                     lines.append(f"    {k:<12} {PLATFORM_PRESETS[k]['label']}")
-                await message.edit(content=_ansi(lines))
+                await _reply(message, _ansi(lines))
                 return
             plat = args[0].lower()
             if plat == "off":
                 plat = "desktop"
             if plat not in PLATFORM_PRESETS:
-                await message.edit(content=_ui_err(f"unknown platform: {plat}"))
+                await _reply(message, _ui_err(f"unknown platform: {plat}"))
                 return
             _set_pool([plat])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=_ui_ok(
+            await _reply(message, _ui_ok(
                 f"single → {PLATFORM_PRESETS[plat]['label']} (sticky)"))
             await self._safe_reconnect()
             return
@@ -611,7 +629,7 @@ class SpooferCog:
         # ---------- spoof / spoofer ----------
         if cmd in ("spoof", "spoofer"):
             if len(args) < 1:
-                await message.edit(content=_ui_info(
+                await _reply(message, _ui_info(
                     "usage: spoof <platform> | add <p> | remove <p> | "
                     "pool | mode <rotate|random|sticky> | clear | "
                     "status | reset"))
@@ -625,7 +643,7 @@ class SpooferCog:
             if sub == "reset":
                 _set_pool(["desktop"])
                 _POOL_STATE[0]["mode"] = "sticky"
-                await message.edit(content=_ui_ok("reset → Desktop (sticky)"))
+                await _reply(message, _ui_ok("reset → Desktop (sticky)"))
                 await self._safe_reconnect()
                 return
 
@@ -643,61 +661,61 @@ class SpooferCog:
                         lines.append(f"    {marker} {k:<12} {PLATFORM_PRESETS[k]['label']}")
                 else:
                     lines.append("    (empty)")
-                await message.edit(content=_ansi(lines))
+                await _reply(message, _ansi(lines))
                 return
 
             if sub == "clear":
                 _set_pool([])
-                await message.edit(content=_ui_ok("pool cleared — no spoofing"))
+                await _reply(message, _ui_ok("pool cleared — no spoofing"))
                 return
 
             if sub == "add":
                 if len(args) < 2:
-                    await message.edit(content=_ui_err("usage: spoof add <platform>"))
+                    await _reply(message, _ui_err("usage: spoof add <platform>"))
                     return
                 key = args[1].lower()
                 if key not in PLATFORM_PRESETS:
-                    await message.edit(content=_ui_err(f"unknown platform: {key}"))
+                    await _reply(message, _ui_err(f"unknown platform: {key}"))
                     return
                 if _add_key(key):
-                    await message.edit(content=_ui_ok(
+                    await _reply(message, _ui_ok(
                         f"added {key} → pool size {len(_pool_keys())}"))
                 else:
-                    await message.edit(content=_ui_info(f"{key} already in pool"))
+                    await _reply(message, _ui_info(f"{key} already in pool"))
                 return
 
             if sub == "remove":
                 if len(args) < 2:
-                    await message.edit(content=_ui_err("usage: spoof remove <platform>"))
+                    await _reply(message, _ui_err("usage: spoof remove <platform>"))
                     return
                 key = args[1].lower()
                 if _remove_key(key):
-                    await message.edit(content=_ui_ok(
+                    await _reply(message, _ui_ok(
                         f"removed {key} → pool size {len(_pool_keys())}"))
                 else:
-                    await message.edit(content=_ui_err(f"{key} not in pool"))
+                    await _reply(message, _ui_err(f"{key} not in pool"))
                 return
 
             if sub == "mode":
                 if len(args) < 2:
-                    await message.edit(content=_ui_err(
+                    await _reply(message, _ui_err(
                         "usage: spoof mode <rotate|random|sticky>"))
                     return
                 m = args[1].lower()
                 if m not in ("rotate", "random", "sticky"):
-                    await message.edit(content=_ui_err(f"unknown mode: {m}"))
+                    await _reply(message, _ui_err(f"unknown mode: {m}"))
                     return
                 _POOL_STATE[0]["mode"] = m
                 _POOL_STATE[0]["cursor"] = 0
-                await message.edit(content=_ui_ok(f"mode → {m}"))
+                await _reply(message, _ui_ok(f"mode → {m}"))
                 return
 
             if sub not in PLATFORM_PRESETS:
-                await message.edit(content=_ui_err(f"unknown platform: {sub}"))
+                await _reply(message, _ui_err(f"unknown platform: {sub}"))
                 return
             _set_pool([sub])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=_ui_ok(
+            await _reply(message, _ui_ok(
                 f"spoofed → {PLATFORM_PRESETS[sub]['label']}"))
             await self._safe_reconnect()
             return
@@ -706,7 +724,7 @@ class SpooferCog:
         if cmd in ("vr", "console"):
             _set_pool([cmd])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=_ui_ok(
+            await _reply(message, _ui_ok(
                 f"platform → {PLATFORM_PRESETS[cmd]['label']}"))
             await self._safe_reconnect()
             return
@@ -720,11 +738,10 @@ class SpooferCog:
         if cmd == "spoofreset":
             _set_pool(["desktop"])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=_ui_ok("platform reset → Desktop"))
+            await _reply(message, _ui_ok("platform reset → Desktop"))
             await self._safe_reconnect()
             return
 
-    # --------------------------------------------------------
     async def _send_status(self, message):
         p = self._last_props or {}
         st = _POOL_STATE[0]
@@ -758,4 +775,4 @@ class SpooferCog:
             f"  $browser:     {p.get('browser', '?')}",
             f"  $device:      {p.get('device', '?')}",
         ]
-        await message.edit(content=_ansi(lines))
+        await _reply(message, _ansi(lines))
