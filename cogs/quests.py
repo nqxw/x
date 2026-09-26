@@ -1,5 +1,5 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
-# v4.5 — progress-aware heartbeat, VC stream key, Xbox/PS fallbacks
+# v4.6 — rpcauto pushes app_id to RPC before heartbeat; clears on exit
 import asyncio
 import base64
 import json
@@ -70,6 +70,9 @@ _autoclaim_task = None
 _transport = None
 _transport_lock = asyncio.Lock()
 
+# RPC override tracking — remember what we pushed so we can clear it
+_rpc_override_state = {"slot": 6, "active": False, "app_id": None, "prev": None}
+
 
 # ============================================================
 # fingerprint helpers
@@ -119,10 +122,6 @@ def _quest_headers(token):
 
 
 def _current_voice_channel_id():
-    """
-    Look up the channel id the selfbot currently occupies in voice.
-    Checks the voice cog's _self_vc cache, then the client gateway state.
-    """
     client = S.CLIENT
     if client is None:
         return None
@@ -153,6 +152,83 @@ def _current_voice_channel_id():
             except Exception:
                 pass
     return None
+
+
+# ============================================================
+# RPC override helper — pushes app_id to gateway presence
+# ============================================================
+async def _push_rpc_override(app_id, name=None):
+    """
+    Send an op:3 presence update with a custom activity carrying the
+    given application_id. Called before heartbeat quests so the backend
+    sees "this user is running app <id>" when the heartbeat arrives.
+    """
+    client = S.CLIENT
+    if client is None or not app_id:
+        return False
+
+    activity = {
+        "application_id": str(app_id),
+        "type": 0,
+        "name": name or "Game",
+        "details": "Playing",
+        "state": "In Menu",
+        "instance": True,
+        "flags": 0,
+    }
+
+    # save previous activity so we can restore on clear
+    try:
+        gw = getattr(client, "_gateway", None)
+        if gw and hasattr(gw, "send_json"):
+            payload = {
+                "op": 3,
+                "d": {
+                    "since": 0,
+                    "activities": [activity],
+                    "status": "online",
+                    "afk": False,
+                },
+            }
+            call = gw.send_json(payload)
+            if asyncio.iscoroutine(call):
+                await call
+            _rpc_override_state["active"] = True
+            _rpc_override_state["app_id"] = str(app_id)
+            print(f"[quests] rpc override pushed: app_id={app_id} name={name!r}")
+            return True
+    except Exception as e:
+        print(f"[quests] rpc override failed: {e}")
+    return False
+
+
+async def _clear_rpc_override():
+    """Send an empty activities list to clear the presence."""
+    client = S.CLIENT
+    if client is None:
+        return False
+    try:
+        gw = getattr(client, "_gateway", None)
+        if gw and hasattr(gw, "send_json"):
+            payload = {
+                "op": 3,
+                "d": {
+                    "since": 0,
+                    "activities": [],
+                    "status": "online",
+                    "afk": False,
+                },
+            }
+            call = gw.send_json(payload)
+            if asyncio.iscoroutine(call):
+                await call
+            _rpc_override_state["active"] = False
+            _rpc_override_state["app_id"] = None
+            print("[quests] rpc override cleared")
+            return True
+    except Exception as e:
+        print(f"[quests] rpc override clear failed: {e}")
+    return False
 
 
 # ============================================================
@@ -385,16 +461,13 @@ class QuestRecord:
 
     @property
     def app_id(self):
-        # primary: config.application.id
         direct = self.cfg.get("application", {}).get("id")
         if direct:
             return direct
-        # fallback: task_config.tasks.<task>.applications[0].id
         tcfg = self.tasks.get(self.selected_task) or {}
         apps = tcfg.get("applications") or []
         if apps and isinstance(apps[0], dict):
             return apps[0].get("id")
-        # final fallback: scan any task for an applications entry
         for t, body in self.tasks.items():
             apps = (body or {}).get("applications") or []
             if apps and isinstance(apps[0], dict):
@@ -414,12 +487,6 @@ class QuestRecord:
                 or self.selected_task in MISSION_TASKS)
 
     def progress_value(self):
-        """
-        Return the current progress for this quest, regardless of which
-        field Discord uses. Covers:
-          - user_status.progress.<task>.value  (video, achievement)
-          - user_status.stream_progress_seconds  (desktop/xbox/ps heartbeat)
-        """
         prog = self.user_status.get("progress") or {}
         p = prog.get(self.selected_task) or {}
         v = p.get("value")
@@ -428,7 +495,6 @@ class QuestRecord:
                 return float(v)
             except Exception:
                 pass
-        # stream-based heartbeat quests use this top-level field
         sps = self.user_status.get("stream_progress_seconds")
         if sps is not None:
             try:
@@ -580,42 +646,30 @@ class QuestService:
         return "completed" if quest.is_completed() else "recovering"
 
     def _build_heartbeat_payloads(self, quest, task):
-        """
-        Ordered list of heartbeat payload shapes for the given task.
-        First entry is the most likely to move progress; later entries
-        are fallbacks. Discord returns 200 for all of them, so the loop
-        in _heartbeat_task measures progress to pick the right one.
-        """
         payloads = []
         tcfg = quest.tasks.get(task) or {}
         app_id = quest.app_id
-
-        # external ids for xbox / playstation
         external_ids = tcfg.get("external_ids") or []
 
         if task in ("PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2", "PLAY_ACTIVITY",
                     "STREAM_ON_DESKTOP"):
             ch = _current_voice_channel_id()
-            # 1. real VC + app id (the shape a live desktop client sends)
             if ch and app_id:
                 payloads.append({
                     "stream_key": f"call:{ch}:1",
                     "application_id": str(app_id),
                     "terminal": False,
                 })
-            # 2. app id only
             if app_id:
                 payloads.append({
                     "application_id": str(app_id),
                     "terminal": False,
                 })
-            # 3. real VC stream key only
             if ch:
                 payloads.append({
                     "stream_key": f"call:{ch}:1",
                     "terminal": False,
                 })
-            # 4. synthetic call key
             if app_id:
                 payloads.append({
                     "stream_key": "call:0:0",
@@ -627,20 +681,13 @@ class QuestService:
                 "terminal": False,
             })
 
-        elif task == "PLAY_ON_XBOX":
-            for eid in external_ids:
-                payloads.append({"external_id": str(eid), "terminal": False})
-            if not payloads:
-                payloads.append({"stream_key": "call:0:0", "terminal": False})
-
-        elif task == "PLAY_ON_PLAYSTATION":
+        elif task in ("PLAY_ON_XBOX", "PLAY_ON_PLAYSTATION"):
             for eid in external_ids:
                 payloads.append({"external_id": str(eid), "terminal": False})
             if not payloads:
                 payloads.append({"stream_key": "call:0:0", "terminal": False})
 
         else:
-            # unknown task type — send app id and stream key shapes
             if app_id:
                 payloads.append({"application_id": str(app_id), "terminal": False})
             payloads.append({"stream_key": f"call:{quest.id}:1", "terminal": False})
@@ -660,87 +707,97 @@ class QuestService:
         max_runtime = min(1200, max(180, (quest.target or 60) * 2))
         start = time.time()
 
+        ch = _current_voice_channel_id()
         print(f"[heartbeat] {quest.name} task={task} target={quest.target} "
-              f"payloads={len(payloads)} vc={_current_voice_channel_id()}")
+              f"payloads={len(payloads)} vc={ch}")
 
-        # initial phase: probe each payload until one moves progress.
-        # Once we know which payload works, we commit to it.
+        # RPC override: push the app_id so Discord sees "playing app X"
+        # before the first heartbeat.
+        rpc_pushed = False
+        if quest.app_id:
+            rpc_pushed = await _push_rpc_override(quest.app_id, name=quest.name)
+            # give the gateway presence a moment to propagate
+            if rpc_pushed:
+                await asyncio.sleep(2.0)
+
         committed = False
-
-        while time.time() - start < max_runtime:
-            response = None
-            rate_limited = False
-            prev_val = quest.progress_value()
-
-            # if not committed yet, probe every payload this tick
-            candidates = payloads if not committed else [active]
-
-            for p in candidates:
-                try:
-                    d = await _api("POST",
-                                   f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
-                                   json_body=p, retries=1)
-                except APIError as e:
-                    if e.status == 429:
-                        await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
-                        rate_limited = True
-                        break
-                    continue
-                except Exception:
-                    continue
-
-                if not d:
-                    continue
-
-                quest.data["user_status"] = d
-                new_val = quest.progress_value()
-
-                if new_val > prev_val + 0.5:
-                    # this payload moves the counter — commit to it
-                    active = p
-                    committed = True
-                    response = d
-                    break
-
-                # no movement from this payload. if this is the last one,
-                # keep whatever response we got so the loop can continue
-                response = d
-
-            if rate_limited:
-                stall += 1
-                if stall >= 8:
-                    break
-                await asyncio.sleep(interval)
-                continue
-
-            if quest.is_completed():
-                break
-
-            cur = quest.progress_value()
-            if cur > last_seen + 0.5:
-                last_seen = cur
-                stall = 0
-            else:
-                stall += 1
-
-            if cur >= quest.target:
-                break
-
-            if stall >= 8:
-                print(f"[heartbeat] {quest.name} stalled at {last_seen:.0f}/{quest.target:.0f} "
-                      f"payload={active} committed={committed}")
-                break
-
-            await asyncio.sleep(interval)
-
-        # terminal ping so Discord closes the session cleanly
         try:
-            t = dict(active); t["terminal"] = True
-            await _api("POST",
-                       f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
-                       json_body=t, retries=1)
-        except Exception:
-            pass
+            while time.time() - start < max_runtime:
+                response = None
+                rate_limited = False
+                prev_val = quest.progress_value()
+                candidates = payloads if not committed else [active]
+
+                for p in candidates:
+                    try:
+                        d = await _api("POST",
+                                       f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                                       json_body=p, retries=1)
+                    except APIError as e:
+                        if e.status == 429:
+                            await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
+                            rate_limited = True
+                            break
+                        continue
+                    except Exception:
+                        continue
+
+                    if not d:
+                        continue
+
+                    quest.data["user_status"] = d
+                    new_val = quest.progress_value()
+
+                    if new_val > prev_val + 0.5:
+                        active = p
+                        committed = True
+                        response = d
+                        break
+
+                    response = d
+
+                if rate_limited:
+                    stall += 1
+                    if stall >= 8:
+                        break
+                    await asyncio.sleep(interval)
+                    continue
+
+                if quest.is_completed():
+                    break
+
+                cur = quest.progress_value()
+                if cur > last_seen + 0.5:
+                    last_seen = cur
+                    stall = 0
+                else:
+                    stall += 1
+
+                if cur >= quest.target:
+                    break
+
+                if stall >= 8:
+                    print(f"[heartbeat] {quest.name} stalled at {last_seen:.0f}/{quest.target:.0f} "
+                          f"payload={active} committed={committed}")
+                    break
+
+                await asyncio.sleep(interval)
+
+            # terminal ping
+            try:
+                t = dict(active); t["terminal"] = True
+                await _api("POST",
+                           f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                           json_body=t, retries=1)
+            except Exception:
+                pass
+        finally:
+            # clear RPC override if we pushed one
+            if rpc_pushed:
+                try:
+                    await _clear_rpc_override()
+                except Exception as e:
+                    print(f"[quests] rpc clear on exit failed: {e}")
 
         fresh = await self.re_fetch_one(quest.id)
         if fresh:
@@ -761,58 +818,71 @@ class QuestService:
         last_seen = quest.progress_value()
         stall = 0
 
-        while attempts < max_attempts and not quest.is_completed():
-            attempts += 1
-            rate_limited = False
-            prev_val = quest.progress_value()
-            candidates = payloads if not committed else [active]
-
-            for p in candidates:
-                try:
-                    d = await _api("POST",
-                                   f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
-                                   json_body=p, retries=1)
-                except APIError as e:
-                    if e.status == 429:
-                        await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
-                        rate_limited = True
-                        break
-                    continue
-                except Exception:
-                    continue
-
-                if not d:
-                    continue
-
-                quest.data["user_status"] = d
-                new_val = quest.progress_value()
-                if new_val > prev_val + 0.5:
-                    active = p
-                    committed = True
-                    break
-
-            if rate_limited:
-                stall += 1
-                if stall >= 12: break
-                continue
-
-            if quest.is_completed() or quest.progress_value() >= target:
-                break
-            cur = quest.progress_value()
-            if cur > last_seen + 0.5:
-                last_seen = cur; stall = 0
-            else:
-                stall += 1
-            if stall >= 12: break
-            await asyncio.sleep(interval)
+        rpc_pushed = False
+        if quest.app_id:
+            rpc_pushed = await _push_rpc_override(quest.app_id, name=quest.name)
+            if rpc_pushed:
+                await asyncio.sleep(1.5)
 
         try:
-            t = dict(active); t["terminal"] = True
-            await _api("POST",
-                       f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
-                       json_body=t, retries=1)
-        except Exception:
-            pass
+            while attempts < max_attempts and not quest.is_completed():
+                attempts += 1
+                rate_limited = False
+                prev_val = quest.progress_value()
+                candidates = payloads if not committed else [active]
+
+                for p in candidates:
+                    try:
+                        d = await _api("POST",
+                                       f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                                       json_body=p, retries=1)
+                    except APIError as e:
+                        if e.status == 429:
+                            await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
+                            rate_limited = True
+                            break
+                        continue
+                    except Exception:
+                        continue
+
+                    if not d:
+                        continue
+
+                    quest.data["user_status"] = d
+                    new_val = quest.progress_value()
+                    if new_val > prev_val + 0.5:
+                        active = p
+                        committed = True
+                        break
+
+                if rate_limited:
+                    stall += 1
+                    if stall >= 12: break
+                    continue
+
+                if quest.is_completed() or quest.progress_value() >= target:
+                    break
+                cur = quest.progress_value()
+                if cur > last_seen + 0.5:
+                    last_seen = cur; stall = 0
+                else:
+                    stall += 1
+                if stall >= 12: break
+                await asyncio.sleep(interval)
+
+            try:
+                t = dict(active); t["terminal"] = True
+                await _api("POST",
+                           f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                           json_body=t, retries=1)
+            except Exception:
+                pass
+        finally:
+            if rpc_pushed:
+                try:
+                    await _clear_rpc_override()
+                except Exception:
+                    pass
 
         fresh = await self.re_fetch_one(quest.id)
         if fresh: quest.data = fresh
@@ -836,27 +906,42 @@ class QuestService:
         payloads = self._build_heartbeat_payloads(quest, task)
         if not payloads:
             payloads = [{"stream_key": f"call:{quest.id}:1", "terminal": False}]
-        end_time = time.time() + 60
-        last_seen = quest.progress_value()
-        while time.time() < end_time:
-            for p in payloads:
+
+        rpc_pushed = False
+        if quest.app_id:
+            rpc_pushed = await _push_rpc_override(quest.app_id, name=quest.name)
+            if rpc_pushed:
+                await asyncio.sleep(1.0)
+
+        try:
+            end_time = time.time() + 60
+            last_seen = quest.progress_value()
+            while time.time() < end_time:
+                for p in payloads:
+                    try:
+                        d = await _api("POST",
+                                       f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
+                                       json_body=p, retries=1)
+                        if d: quest.data["user_status"] = d
+                        if quest.is_completed(): break
+                    except APIError as e:
+                        if e.status == 429:
+                            await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
+                            break
+                        continue
+                    except Exception:
+                        continue
+                if quest.is_completed(): break
+                cur = quest.progress_value()
+                if cur > last_seen + 0.5: last_seen = cur
+                await asyncio.sleep(5)
+        finally:
+            if rpc_pushed:
                 try:
-                    d = await _api("POST",
-                                   f"https://discord.com/api/v9/quests/{quest.id}/heartbeat",
-                                   json_body=p, retries=1)
-                    if d: quest.data["user_status"] = d
-                    if quest.is_completed(): break
-                except APIError as e:
-                    if e.status == 429:
-                        await asyncio.sleep(float(e.body.get("retry_after", 5.0)))
-                        break
-                    continue
+                    await _clear_rpc_override()
                 except Exception:
-                    continue
-            if quest.is_completed(): break
-            cur = quest.progress_value()
-            if cur > last_seen + 0.5: last_seen = cur
-            await asyncio.sleep(5)
+                    pass
+
         fresh = await self.re_fetch_one(quest.id)
         if fresh: quest.data = fresh
         return "completed" if quest.is_completed() else "recovering"
@@ -975,9 +1060,57 @@ async def autoquest_run(token):
 class QuestsCog:
     COMMANDS = {"quest", "questrun", "questall", "autoquest", "autoclaim",
                 "orbbadge", "questdump", "questdiag", "spdecode", "qtransport",
-                "qfind"}
+                "qfind", "rpcauto", "rpcautostop"}
 
     async def handle(self, message, cmd, args):
+        if cmd == "rpcauto":
+            try: await message.delete()
+            except Exception: pass
+            ref = " ".join(args[1:]).strip() if len(args) > 1 else ""
+            svc = QuestService(S.TOKEN)
+            try:
+                quests = await svc.fetch()
+            except APIError as e:
+                return await message.channel.send(
+                    S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+            if not quests:
+                return await message.channel.send(S.ui_err("no quests"), delete_after=6)
+            if not ref:
+                return await message.channel.send(
+                    S.ui_err("usage: rpcauto <index_or_keyword>"), delete_after=8)
+            if ref.isdigit():
+                idx = int(ref)
+            else:
+                kw = ref.lower()
+                matches = [i for i, q in enumerate(quests) if kw in q.name.lower()]
+                if not matches:
+                    return await message.channel.send(
+                        S.ui_err(f"no quest matches `{ref}`"), delete_after=8)
+                idx = matches[0]
+            if idx >= len(quests):
+                return await message.channel.send(
+                    S.ui_err("index out of range"), delete_after=6)
+            q = quests[idx]
+            if not q.app_id:
+                return await message.channel.send(
+                    S.ui_err(f"{q.name}: no app_id resolvable"), delete_after=8)
+            ok = await _push_rpc_override(q.app_id, name=q.name)
+            if ok:
+                return await message.channel.send(S.ui_ok(
+                    f"rpc override pushed for {q.name} (app_id={q.app_id})"),
+                    delete_after=10)
+            return await message.channel.send(
+                S.ui_err("rpc override failed — see console"), delete_after=8)
+
+        if cmd == "rpcautostop":
+            try: await message.delete()
+            except Exception: pass
+            ok = await _clear_rpc_override()
+            if ok:
+                return await message.channel.send(S.ui_ok("rpc override cleared"))
+            return await message.channel.send(
+                S.ui_err("clear failed — see console"), delete_after=8)
+
         if cmd == "qtransport":
             try: await message.delete()
             except Exception: pass
@@ -985,6 +1118,7 @@ class QuestsCog:
             name = type(tr).__name__ if tr else "none"
             mode = "fork TLS + HeaderSpoofer" if isinstance(tr, _ForkTransport) else "aiohttp"
             ch = _current_voice_channel_id()
+            rpc = _rpc_override_state
             lines = [
                 f"  transport:  {name}",
                 f"  mode:       {mode}",
@@ -992,6 +1126,7 @@ class QuestsCog:
                 f"  fingerprint: fork-generated",
                 f"  user agent:  fork-generated",
                 f"  voice ch:    {ch if ch else '—'}",
+                f"  rpc override: {'active app_id=' + str(rpc.get('app_id')) if rpc.get('active') else 'off'}",
             ]
             return await message.channel.send(S._ansi_block(lines), delete_after=30)
 
@@ -1227,6 +1362,7 @@ class QuestsCog:
             tr = await _get_transport(S.TOKEN)
             transport_name = type(tr).__name__ if tr else "none"
             ch = _current_voice_channel_id()
+            rpc = _rpc_override_state
             lines = [
                 f"  transport:      {transport_name}",
                 f"  fork http:      {'yes' if HAS_FORK_HTTP else 'no'}",
@@ -1234,6 +1370,7 @@ class QuestsCog:
                 f"  fingerprint:    fork-generated",
                 f"  user agent:     fork-generated",
                 f"  voice ch:       {ch if ch else '—'}",
+                f"  rpc override:   {'active app_id=' + str(rpc.get('app_id')) if rpc.get('active') else 'off'}",
                 f"  token uid:      {QuestService(S.TOKEN).uid}",
                 f"  autoclaim:      {'running' if autoclaim_running else 'idle'}",
                 f"  hcaptcha:       {'loaded' if HAS_HCAPTCHA else 'unavailable'}",
