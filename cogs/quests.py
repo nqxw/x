@@ -1,5 +1,5 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
-# v3.2 — build number bumped 358560 → 366000 for newer desktop quest visibility
+# v3.3 — supports captured x-super-properties header for exact fingerprint match
 import asyncio
 import base64
 import json
@@ -47,6 +47,19 @@ CLIENT_BUILD_NUMBER = 366000
 QUEST_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
+# ─────────────────────────────────────────────────────────────
+# CAPTURED FINGERPRINT — paste the full base64 value from
+# Kiwi DevTools here (x-super-properties request header).
+# If empty, the synthesised fallback is used.
+# ─────────────────────────────────────────────────────────────
+CAPTURED_SUPER_PROPERTIES = ""
+
+# ─────────────────────────────────────────────────────────────
+# OPTIONAL: exact browser fingerprint captured alongside
+# the x-super-properties header. If empty, falls back below.
+# ─────────────────────────────────────────────────────────────
+CAPTURED_USER_AGENT = ""
+
 _hcaptcha_agent = None
 _agent_init_lock = asyncio.Lock()
 _solve_lock = asyncio.Lock()
@@ -64,32 +77,67 @@ def _get_shared_session():
     return aiohttp.ClientSession(), True
 
 
-def _quest_headers(token):
-    token = token.strip().strip('"').strip("'")
+def _decode_super_properties(sp_b64: str) -> dict:
+    """Decode a base64 x-super-properties value into a dict."""
+    try:
+        padded = sp_b64 + "=" * (-len(sp_b64) % 4)
+        raw = base64.b64decode(padded)
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as e:
+        print(f"[quests] cannot decode captured super-properties: {e}")
+        return {}
+
+
+def _synth_super_properties() -> str:
+    """Fallback synthesised header when no capture is provided."""
+    ua = CAPTURED_USER_AGENT or QUEST_UA
     browser_version = "131.0.0.0"
     try:
-        m = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", QUEST_UA)
+        m = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", ua)
         if m:
             browser_version = m.group(1)
     except Exception:
         pass
-    sp = base64.b64encode(json.dumps({
-        "os": "Windows", "browser": "Chrome", "device": "",
-        "system_locale": "en-US", "has_client_mods": False,
+    sp_dict = {
+        "os": "Windows",
+        "browser": "Chrome",
+        "device": "",
+        "system_locale": "en-US",
+        "has_client_mods": False,
         "client_version": "1.0.0",
-        "browser_user_agent": QUEST_UA, "browser_version": browser_version,
-        "os_version": "10", "referrer": "", "referring_domain": "",
-        "referrer_current": "", "referring_domain_current": "",
+        "browser_user_agent": ua,
+        "browser_version": browser_version,
+        "os_version": "10",
+        "referrer": "",
+        "referring_domain": "",
+        "referrer_current": "",
+        "referring_domain_current": "",
         "release_channel": "stable",
         "client_build_number": CLIENT_BUILD_NUMBER,
-        "client_event_source": None, "client_launch_id": str(uuid4()),
-    }, separators=(",", ":")).encode()).decode()
+        "client_event_source": None,
+        "client_launch_id": str(uuid4()),
+    }
+    return base64.b64encode(
+        json.dumps(sp_dict, separators=(",", ":")).encode()
+    ).decode()
+
+
+def _quest_headers(token):
+    token = token.strip().strip('"').strip("'")
+    ua = CAPTURED_USER_AGENT or QUEST_UA
+    if CAPTURED_SUPER_PROPERTIES:
+        sp = CAPTURED_SUPER_PROPERTIES.strip()
+    else:
+        sp = _synth_super_properties()
     return {
-        "authorization": token, "accept": "*/*",
+        "authorization": token,
+        "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json",
-        "user-agent": QUEST_UA, "x-super-properties": sp,
-        "x-discord-locale": "en-US", "x-discord-timezone": "America/New_York",
+        "user-agent": ua,
+        "x-super-properties": sp,
+        "x-discord-locale": "en-US",
+        "x-discord-timezone": "America/New_York",
         "x-debug-options": "bugReporterEnabled",
         "origin": "https://discord.com",
         "referer": "https://discord.com/quest-home",
@@ -624,7 +672,7 @@ async def _claim_quest(token, quest_id):
 
 async def claim_orb(token):
     h = {"authorization": token, "content-type": "application/json",
-         "user-agent": QUEST_UA, "origin": "https://discord.com",
+         "user-agent": CAPTURED_USER_AGENT or QUEST_UA, "origin": "https://discord.com",
          "referer": "https://discord.com/shop?tab=orbs"}
     session, own = _get_shared_session()
     try:
@@ -710,9 +758,30 @@ async def autoquest_run(token):
 
 class QuestsCog:
     COMMANDS = {"quest", "questrun", "questall", "autoquest", "autoclaim",
-                "orbbadge", "questdump", "questdiag"}
+                "orbbadge", "questdump", "questdiag", "spdecode"}
 
     async def handle(self, message, cmd, args):
+        if cmd == "spdecode":
+            # .spdecode <base64>  → decode and pretty print the header
+            try: await message.delete()
+            except Exception: pass
+            if len(args) < 2:
+                return await message.channel.send(
+                    S.ui_err("usage: spdecode <base64 x-super-properties>"), delete_after=8)
+            raw = " ".join(args[1:]).strip()
+            decoded = _decode_super_properties(raw)
+            if not decoded:
+                return await message.channel.send(
+                    S.ui_err("decode failed — not valid base64 json"), delete_after=8)
+            lines = [f"  {S.WHITE}x-super-properties (decoded){S.RESET}", ""]
+            for k in sorted(decoded.keys()):
+                v = decoded[k]
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, separators=(",", ":"))[:80]
+                lines.append(f"  {S.DIM}{k:<28}{S.RESET} {v}")
+            await message.channel.send(S._ansi_block(lines), delete_after=60)
+            return
+
         if cmd == "quest":
             try: await message.delete()
             except Exception: pass
@@ -892,11 +961,14 @@ class QuestsCog:
             suspended = raw_d.get("quest_access_suspended_until") if isinstance(raw_d, dict) else None
             blocked = raw_d.get("quest_enrollment_blocked_until") if isinstance(raw_d, dict) else None
             excluded = raw_d.get("excluded_quests", []) if isinstance(raw_d, dict) else []
+            cap_state = "SET" if CAPTURED_SUPER_PROPERTIES else "synthesised"
+            ua_state = "captured" if CAPTURED_USER_AGENT else "synthesised"
             lines = [
                 f"  voice channel:  {ch if ch else '—'}",
                 f"  build number:   {CLIENT_BUILD_NUMBER}",
+                f"  fingerprint:    {cap_state}",
+                f"  user agent:     {ua_state}",
                 f"  token uid:      {QuestService(S.TOKEN).uid}",
-                f"  ua:             {QUEST_UA[:60]}...",
                 f"  autoclaim:      {'running' if autoclaim_running else 'idle'}",
                 f"  hcaptcha:       {'loaded' if HAS_HCAPTCHA else 'unavailable'}",
                 f"  /quests/@me:    HTTP {raw_status}",
