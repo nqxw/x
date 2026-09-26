@@ -1,5 +1,5 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
-# v4.7 — trust voice cache, request_raw fallback, unblocked heartbeats
+# v4.8 — process-gated tasks skipped, questforce override
 import asyncio
 import base64
 import json
@@ -50,6 +50,13 @@ ACHIEVEMENT_TASKS = ("ACHIEVEMENT_IN_ACTIVITY", "ACHIEVEMENT",
                      "COMPLETE_ACHIEVEMENT", "EARN_ACHIEVEMENT")
 MISSION_TASKS = ("COLLECT_ITEM", "COLLECT", "MISSION_COMPLETE", "COMPLETE_QUEST",
                  "COMPLETE_ACTIVITY", "EXTERNAL_TASK", "LAUNCH_GAME", "LAUNCH_QUEST")
+
+# tasks the bot cannot satisfy — Discord requires a local running game
+PROCESS_GATED_TASKS = (
+    "PLAY_ON_DESKTOP", "PLAY_ON_DESKTOP_V2",
+    "PLAY_ACTIVITY", "STREAM_ON_DESKTOP",
+    "PLAY_ON_XBOX", "PLAY_ON_PLAYSTATION",
+)
 
 DISCORD_HCAPTCHA_SITEKEY = "4c672d35-0701-42b2-88c3-78380b0db560"
 ORB_SKU = "1342211853484429445"
@@ -121,11 +128,6 @@ def _quest_headers(token):
 
 
 def _current_voice_channel_id():
-    """
-    Return the channel id the selfbot occupies. Trust the voice cog's
-    cache directly — no guild.get_channel validation, which fails when
-    modifyself hasn't cached the channel locally.
-    """
     client = S.CLIENT
     if client is None:
         return None
@@ -262,8 +264,6 @@ class _ForkTransport:
                 return 200, (call if isinstance(call, dict) else {"body": call})
             except Exception as e:
                 msg = str(e)
-                # wreq refuses some payloads through the json= path.
-                # retry via request_raw with a pre-serialized body.
                 if ("'int' object is not an instance" in msg
                         or "bytes | bytearray" in msg
                         or "not an instance of 'bytes" in msg):
@@ -498,6 +498,10 @@ class QuestRecord:
     def is_supported(self):
         return (self.selected_task in SUPPORTED_TASKS
                 or self.selected_task in MISSION_TASKS)
+
+    def is_process_gated(self):
+        """True when the quest requires a local running game process."""
+        return self.selected_task in PROCESS_GATED_TASKS
 
     def progress_value(self):
         prog = self.user_status.get("progress") or {}
@@ -1052,7 +1056,10 @@ async def autoquest_run(token):
     except APIError as e:
         print(f"[autoquest] auth failed: {e.status}")
         return
-    for q in [q for q in quests if not q.is_completed() and q.is_supported()]:
+    for q in [q for q in quests
+              if not q.is_completed()
+              and q.is_supported()
+              and not q.is_process_gated()]:
         print(f"[AutoQuest] running {q.name} ({q.selected_task})")
         res = await svc.run(q)
         print(f"[AutoQuest] {q.name} → {res}")
@@ -1064,9 +1071,53 @@ async def autoquest_run(token):
 class QuestsCog:
     COMMANDS = {"quest", "questrun", "questall", "autoquest", "autoclaim",
                 "orbbadge", "questdump", "questdiag", "spdecode", "qtransport",
-                "qfind", "rpcauto", "rpcautostop"}
+                "qfind", "rpcauto", "rpcautostop", "questforce"}
 
     async def handle(self, message, cmd, args):
+        # ============================================================
+        # questforce — override selected task then run
+        # ============================================================
+        if cmd == "questforce":
+            try: await message.delete()
+            except Exception: pass
+            if len(args) < 3 or not args[1].isdigit():
+                return await message.channel.send(
+                    S.ui_err("usage: questforce <index> <task_type>"), delete_after=8)
+            idx = int(args[1])
+            task_override = args[2].upper()
+            svc = QuestService(S.TOKEN)
+            try:
+                quests = await svc.fetch()
+            except APIError as e:
+                return await message.channel.send(
+                    S.ui_err(f"auth rejected: {e.status}"), delete_after=10)
+            if idx >= len(quests):
+                return await message.channel.send(
+                    S.ui_err("index out of range"), delete_after=6)
+            q = quests[idx]
+            if task_override not in q.tasks:
+                avail = ", ".join(list(q.tasks.keys())) or "—"
+                return await message.channel.send(
+                    S.ui_err(f"task `{task_override}` not in this quest. "
+                             f"available: {avail}"), delete_after=10)
+            q.selected_task = task_override
+            q.target = float(q.tasks[task_override].get("target", 0) or 0)
+            await message.channel.send(
+                S.ui_info(f"forced {q.name} → {task_override} "
+                          f"(target {q.target:.0f})"), delete_after=6)
+            if not q.is_enrolled():
+                try:
+                    await svc.enroll(q)
+                except APIError as e:
+                    return await message.channel.send(
+                        S.ui_err(f"enroll failed: {e.status}"), delete_after=10)
+            res = await svc.run(q)
+            if res == "completed":
+                await message.channel.send(S.ui_ok(f"{q.name} complete"), delete_after=10)
+            else:
+                await message.channel.send(S.ui_err(f"{q.name} → {res}"), delete_after=10)
+            return
+
         if cmd == "rpcauto":
             try: await message.delete()
             except Exception: pass
@@ -1173,8 +1224,9 @@ class QuestsCog:
                     S.ui_info(f"no quests matching `{kw}`"), delete_after=10)
             rows = []
             for i, q in hits:
+                gate = " [gated]" if q.is_process_gated() else ""
                 rows.append(
-                    f"  {S.GREY}[{i:>2}]{S.RESET} {S.WHITE}{q.name[:40]}{S.RESET}  "
+                    f"  {S.GREY}[{i:>2}]{S.RESET} {S.WHITE}{q.name[:36]}{S.RESET}{gate}  "
                     f"{S.DIM}{q.selected_task} {q.progress_value():.0f}/{q.target:.0f}{S.RESET}")
             await message.channel.send(S._ansi_block(
                 [f"  {S.WHITE}matches for `{kw}`{S.RESET}", ""] + rows))
@@ -1200,6 +1252,7 @@ class QuestsCog:
                 elif q.is_completed(): tag = f"{S.GREEN}done{S.RESET}"
                 elif q.selected_task in ACHIEVEMENT_TASKS: tag = f"{S.MAGENTA}ach{S.RESET}"
                 elif q.selected_task in MISSION_TASKS: tag = f"{S.YELLOW}mis{S.RESET}"
+                elif q.is_process_gated(): tag = f"{S.RED}gate{S.RESET}"
                 elif q.is_supported(): tag = f"{S.CYAN}ok{S.RESET}"
                 else: tag = f"{S.RED}unsup{S.RESET}"
                 prog = q.progress_value()
@@ -1231,6 +1284,11 @@ class QuestsCog:
                 if q.is_completed():
                     return await message.channel.send(
                         S.ui_ok("already done"), delete_after=6)
+                if q.is_process_gated():
+                    await message.channel.send(
+                        S.ui_warn(f"{q.name} is process-gated — Discord needs the "
+                                  f"game running locally. Attempting anyway."),
+                        delete_after=8)
                 ch = _current_voice_channel_id()
                 await message.channel.send(
                     S.ui_info(f"started {q.name} ({q.selected_task}) "
@@ -1250,13 +1308,23 @@ class QuestsCog:
             svc = QuestService(S.TOKEN)
             try:
                 quests = await svc.fetch()
-                active = [q for q in quests if not q.is_completed() and q.is_supported()]
+                active = [q for q in quests
+                          if not q.is_completed()
+                          and q.is_supported()
+                          and not q.is_process_gated()]
+                skipped = [q for q in quests
+                           if not q.is_completed()
+                           and q.is_supported()
+                           and q.is_process_gated()]
                 if not active:
-                    return await message.channel.send(
-                        S.ui_err("no active quests"), delete_after=6)
+                    msg = "no active non-gated quests"
+                    if skipped:
+                        msg += f" ({len(skipped)} process-gated, use .questforce)"
+                    return await message.channel.send(S.ui_err(msg), delete_after=10)
                 ch = _current_voice_channel_id()
                 await message.channel.send(
-                    S.ui_info(f"{len(active)} queued  •  vc={ch if ch else '—'}"), delete_after=6)
+                    S.ui_info(f"{len(active)} queued  •  {len(skipped)} gated skipped  "
+                              f"•  vc={ch if ch else '—'}"), delete_after=6)
                 async def _run(q):
                     res = await svc.run(q)
                     if res == "completed":
@@ -1431,6 +1499,7 @@ class QuestsCog:
                 f"  progress:      {q.progress_value()} / {q.target}",
                 f"  completed:     {q.is_completed()}",
                 f"  claimed:       {q.is_claimed()}",
+                f"  gated:         {q.is_process_gated()}",
                 f"  vc:            {_current_voice_channel_id() or '—'}",
                 f"  task types:    {', '.join(list(q.tasks.keys())) if q.tasks else '—'}",
             ]))
