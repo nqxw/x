@@ -53,22 +53,22 @@ class AsciiHelper:
 
     @staticmethod
     def info(message):
-        result = f"> ```ansi\n> \x1b[2;37m[lunar] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[decay] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
 
     @staticmethod
     def success(message):
-        result = f"> ```ansi\n> \x1b[2;37m[lunar] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[decay] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
 
     @staticmethod
     def error(message):
-        result = f"> ```ansi\n> \x1b[2;37m[lunar - error] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[decay - error] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
 
     @staticmethod
     def warning(message):
-        result = f"> ```ansi\n> \x1b[2;37m[lunar :-:] {message}\x1b[0m\n> ```"
+        result = f"> ```ansi\n> \x1b[2;37m[decay :-:] {message}\x1b[0m\n> ```"
         return AsciiHelper._clean_empty_lines(result)
 
     @staticmethod
