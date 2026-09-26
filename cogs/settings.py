@@ -1,7 +1,7 @@
 # cogs/settings.py | prefix, aliases, cooldowns, profiles, config import/export, encrypt, enable/disable
 import os
-import json
 import sys
+import json
 import time
 import modifyself_shim as discord
 from . import state as S
@@ -14,7 +14,7 @@ class SettingsCog:
 
     async def handle(self, message, cmd, args):
         if cmd == "prefix": await self._prefix(message, args)
-        elif cmd == "version": await message.edit(content=S.ui_info(f"lunar v{S.VERSION}"))
+        elif cmd == "version": await message.edit(content=S.ui_info(f"wilt v{S.VERSION}"))
         elif cmd == "reload": await message.edit(content=S.ui_ok("config reloaded"))
         elif cmd == "serverprefix": await self._serverprefix(message, args)
         elif cmd == "serverprefixclear": await self._serverprefixclear(message)
@@ -37,12 +37,23 @@ class SettingsCog:
                                         if rows else S.ui_info("none"))
 
     async def _prefix(self, message, args):
-        if len(args) < 2: return await message.edit(content=S.ui_info(f"current prefix: {S.PREFIX}"))
-        S.PREFIX = args[1]
-        cfg = S.load_config() or {}; cfg["prefix"] = S.PREFIX; S.save_config(cfg)
-        main = sys.modules.get("__main__")
-        if main and hasattr(main, "PREFIX"): main.PREFIX = S.PREFIX
-        await message.edit(content=S.ui_ok(f"prefix changed to `{S.PREFIX}`"))
+        if len(args) < 2:
+            return await message.edit(content=S.ui_info(f"current prefix: {S.PREFIX}"))
+        new_prefix = args[1]
+        S.PREFIX = new_prefix
+        try:
+            cfg = S.load_config() or {}
+            cfg["prefix"] = new_prefix
+            S.save_config(cfg)
+        except Exception as e:
+            print(f"[settings] prefix save failed: {e}")
+        try:
+            main = sys.modules.get("__main__")
+            if main is not None and hasattr(main, "PREFIX"):
+                main.PREFIX = new_prefix
+        except Exception:
+            pass
+        await message.edit(content=S.ui_ok(f"prefix changed to `{new_prefix}`"))
 
     async def _serverprefix(self, message, args):
         try: await message.delete()
@@ -53,9 +64,12 @@ class SettingsCog:
             cur = S._server_prefixes.get(str(message.guild.id), S.PREFIX)
             return await message.channel.send(S.ui_info(f"server prefix: `{cur}`"), delete_after=6)
         S._server_prefixes[str(message.guild.id)] = args[1]
-        cfg = S.load_config() or {}
-        cfg.setdefault("server_prefixes", {})[str(message.guild.id)] = args[1]
-        S.save_config(cfg)
+        try:
+            cfg = S.load_config() or {}
+            cfg.setdefault("server_prefixes", {})[str(message.guild.id)] = args[1]
+            S.save_config(cfg)
+        except Exception as e:
+            print(f"[settings] serverprefix save failed: {e}")
         await message.channel.send(S.ui_ok(f"server prefix → `{args[1]}`"))
 
     async def _serverprefixclear(self, message):
@@ -64,9 +78,13 @@ class SettingsCog:
         if not message.guild:
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
         S._server_prefixes.pop(str(message.guild.id), None)
-        cfg = S.load_config() or {}
-        if "server_prefixes" in cfg: cfg["server_prefixes"].pop(str(message.guild.id), None)
-        S.save_config(cfg)
+        try:
+            cfg = S.load_config() or {}
+            if "server_prefixes" in cfg:
+                cfg["server_prefixes"].pop(str(message.guild.id), None)
+            S.save_config(cfg)
+        except Exception as e:
+            print(f"[settings] serverprefixclear save failed: {e}")
         await message.channel.send(S.ui_ok("cleared"))
 
     async def _alias(self, message, args):
