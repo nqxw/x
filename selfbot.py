@@ -168,7 +168,7 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
               "Electron/28.2.10 Safari/537.36")
 
 # ─────────────────────────────────────────────
-# LATENCY TUNING — global aiohttp session
+# LATENCY TUNING
 # ─────────────────────────────────────────────
 
 _LATENCY_HEADERS = {
@@ -397,7 +397,8 @@ HELP_DATA = {
         ("questall","solve all quests at once"),("autoquest on/off","auto-run quests on startup"),
         ("autoclaim on/off","auto-claim completed quests"),("autoclaim run","sweep and claim now"),
         ("orbbadge","claim orb badge"),("questdump [idx]","dump raw quest config"),
-        ("questdiag","show quest diagnostics"),
+        ("questdiag","show quest diagnostics"),("qtransport","show transport mode"),
+        ("spdecode <base64>","decode a captured x-super-properties header"),
     ],
     "sniper": [
         ("sniper on/off","toggle nitro gift sniper"),
@@ -1758,7 +1759,6 @@ async def on_disconnect():
     global _reconnect_count
     _reconnect_count += 1
     _session_events.append({"ts": time.time(), "event": "disconnect", "count": _reconnect_count})
-    # kill satellites — they were bound to the same account session
     try:
         from cogs import state as cstate
         await cstate.satellite_stop_all()
@@ -1797,7 +1797,6 @@ async def _dispatch_message(_client, message):
     global _managed_tasks
     global _latency_history
 
-    # ── PRE-HOOKS (afk, filters, autoresponder, pingtrack) ──
     try:
         from cogs import state as cstate
         hooks = list(getattr(cstate, "_pre_hooks", []) or [])
@@ -2079,17 +2078,49 @@ async def on_message(message):
 
 @client.event
 async def on_message_delete(message):
-    if message.author.id == client.user.id: return
-    cid = message.channel_id
+    # modifyself shim sometimes delivers this as a raw dict
+    try:
+        author = message.author
+    except AttributeError:
+        author = None
+
+    if author is None and isinstance(message, dict):
+        author_id = (message.get("author") or {}).get("id") if isinstance(message.get("author"), dict) else None
+        if author_id is None:
+            return
+        if author_id == client.user.id:
+            return
+        cid = message.get("channel_id")
+        content = message.get("content") or ""
+        attachments_raw = message.get("attachments") or []
+        embeds_raw = message.get("embeds") or []
+        reactions_raw = message.get("reactions") or []
+        msg_id = message.get("id")
+        author_str = (message.get("author") or {}).get("username", "?") if isinstance(message.get("author"), dict) else "?"
+    else:
+        if author.id == client.user.id:
+            return
+        cid = message.channel_id
+        content = message.content or ""
+        attachments_raw = message.attachments or []
+        embeds_raw = message.embeds or []
+        reactions_raw = message.reactions or []
+        msg_id = message.id
+        author_str = str(author)
+        author_id = author.id
+
     _snipe_cache.setdefault(cid, [])
 
     try:
-        attachments = [a.get("url") for a in (message.attachments or [])]
+        attachments = [a.get("url") if isinstance(a, dict) else getattr(a, "url", None)
+                       for a in attachments_raw]
+        attachments = [a for a in attachments if a]
     except Exception:
         attachments = []
+
     try:
         embeds = []
-        for e in (message.embeds or []):
+        for e in embeds_raw:
             if isinstance(e, dict):
                 embeds.append({k: e.get(k) for k in ("title", "description", "url", "type") if e.get(k)})
             else:
@@ -2100,44 +2131,53 @@ async def on_message_delete(message):
                 if d: embeds.append(d)
     except Exception:
         embeds = []
+
     try:
-        reactions = [str(r.emoji) for r in (message.reactions or [])]
+        reactions = [str(r) if not isinstance(r, dict) else str(r.get("emoji", "?"))
+                     for r in reactions_raw]
     except Exception:
         reactions = []
 
     _snipe_cache[cid].append({
-        "author": str(message.author),
-        "author_id": message.author.id,
-        "content": message.content or "",
+        "author": author_str,
+        "author_id": author_id,
+        "content": content,
         "attachments": attachments,
         "embeds": embeds,
         "reactions": reactions,
-        "message_id": message.id,
-        "channel_id": message.channel_id,
+        "message_id": msg_id,
+        "channel_id": cid,
         "time": datetime.now().strftime("%H:%M:%S"),
         "ts": time.time(),
     })
     if len(_snipe_cache[cid]) > SNIPE_LIMIT:
         _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
     if LOGGER_ENABLED:
-        log_msg("DEL", f"{message.author}: {message.content[:100]}")
+        log_msg("DEL", f"{author_str}: {content[:100]}")
 
 @client.event
 async def on_message_edit(before, after):
-    if before.author.id == client.user.id: return
-    if before.content == after.content: return
-    cid = before.channel_id
-    _editsnipe_cache.setdefault(cid, [])
-    _editsnipe_cache[cid].append({
-        "author": str(before.author), "author_id": before.author.id,
-        "before": before.content or "", "after": after.content or "",
-        "message_id": before.id,
+    try:
+        before_author_id = before.author.id
+        before_cid = before.channel_id
+        before_content = before.content or ""
+        after_content = after.content or ""
+        msg_id = before.id
+    except AttributeError:
+        return
+    if before_author_id == client.user.id: return
+    if before_content == after_content: return
+    _editsnipe_cache.setdefault(before_cid, [])
+    _editsnipe_cache[before_cid].append({
+        "author": str(before.author), "author_id": before_author_id,
+        "before": before_content, "after": after_content,
+        "message_id": msg_id,
         "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(),
     })
-    if len(_editsnipe_cache[cid]) > SNIPE_LIMIT:
-        _editsnipe_cache[cid] = _editsnipe_cache[cid][-SNIPE_LIMIT:]
+    if len(_editsnipe_cache[before_cid]) > SNIPE_LIMIT:
+        _editsnipe_cache[before_cid] = _editsnipe_cache[before_cid][-SNIPE_LIMIT:]
     if LOGGER_ENABLED:
-        log_msg("EDIT", f"{before.author}: '{before.content[:60]}' → '{after.content[:60]}'")
+        log_msg("EDIT", f"{before.author}: '{before_content[:60]}' → '{after_content[:60]}'")
 
 @client.event
 async def on_member_update(before, after):
