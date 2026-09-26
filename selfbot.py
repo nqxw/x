@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# decay — v2.6.0
+# wilt — v2.6.0
 
 import modifyself_shim as discord
 
@@ -152,7 +152,7 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[decay] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[wilt] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
@@ -524,7 +524,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show decay version"),("reload","reload config from disk"),
+        ("version","show wilt version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -607,7 +607,7 @@ HELP_DATA = {
     ],
     "developer": [
         ("eval <code>","owner+dev only — evaluate python code"),
-        ("restart","restart the decay process"),
+        ("restart","restart the wilt process"),
         ("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),
@@ -865,11 +865,11 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> decay{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> wilt{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  decay | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  wilt | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -1485,9 +1485,9 @@ async def on_ready():
     # shared session + TCP_NODELAY on the gateway socket
     try:
         _get_session()
-        print("[decay] shared aiohttp session warm")
+        print("[wilt] shared aiohttp session warm")
     except Exception as e:
-        print(f"[decay] session init failed: {e}")
+        print(f"[wilt] session init failed: {e}")
 
     try:
         gw = getattr(client, "_gateway", None)
@@ -1495,9 +1495,9 @@ async def on_ready():
         sock = getattr(ws, "_sock", None) or getattr(ws, "sock", None)
         if sock is not None:
             _tcp_nodelay(sock)
-            print("[decay] TCP_NODELAY applied to gateway socket")
+            print("[wilt] TCP_NODELAY applied to gateway socket")
     except Exception as e:
-        print(f"[decay] tcp_nodelay skipped: {e}")
+        print(f"[wilt] tcp_nodelay skipped: {e}")
 
     is_main = True
     idx = "main"
@@ -1967,7 +1967,7 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[decay] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[wilt] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
     client.run()
 except Exception as e:
