@@ -388,8 +388,8 @@ HELP_DATA = {
         ("spam <n> <text>","blast n messages fast"),("spamstop","kill active spam loop"),
         ("purge [n]","delete your last n messages"),("clear","delete command message"),
         ("copycat <id>","mirror next 10 msgs from user"),("status <text>","set custom status"),
-        ("status clear","clear status"),("platform <type>","spoof gateway platform"),
-        ("platform off","reset platform to desktop"),("hypesquad <house>","set hypesquad house"),
+        ("status clear","clear status"),
+        ("hypesquad <house>","set hypesquad house"),
         ("hypesquad off","remove hypesquad badge"),
     ],
     "quests": [
@@ -849,6 +849,11 @@ HELP_DATA = {
         ("spoof remove <platform>","drop a platform from the pool"),
         ("spoof pool","show the pool, arrow marks next in rotate order"),
         ("spoof mode <mode>","rotate | random | sticky — how the pool cycles"),
+        ("spoof rotate start [secs]","auto-reconnect timer cycles the pool"),
+        ("spoof rotate stop","stop the rotation timer"),
+        ("spoof rotate interval <s>","set tick interval"),
+        ("spoof rotate status","show rotation state"),
+        ("spoof next","force reconnect to consume next preset"),
         ("spoof clear","empty the pool — no rewrite on next IDENTIFY"),
         ("spoof status","show spoofer state (mode, pool, cursor, last pick)"),
         ("spoof reset","reset to desktop, sticky mode"),
@@ -857,6 +862,13 @@ HELP_DATA = {
         ("vr","spoof as VR headset (sticky)"),
         ("console","spoof as console (sticky)"),
         ("spooferdiag","spoofer diagnostics dump"),
+    ],
+    "multispoof": [
+        ("multispoof start [names...]","default: mobile ios vr console"),
+        ("multispoof stop [names...]","stop all or named satellites"),
+        ("multispoof status","live session table"),
+        ("multispoof restart","cycle every satellite"),
+        ("multispoof list","show available satellite presets"),
     ],
     "profile": [
         ("setpfp <url>","set profile picture from url"),("setbio <text>","set profile bio"),
@@ -1008,7 +1020,8 @@ def build_help_root(page=1):
         "utility":"text, afk, translate","tracking":"message & profile tracking",
         "downloads":"media downloader","social":"friends & social",
         "auto":"automation, snipers, superreact",
-        "spoofer":"platform / device spoofing",
+        "spoofer":"platform / device spoofing — pool + rotation",
+        "multispoof":"concurrent sessions — 4+ device badges at once",
         "profile":"account profile","status":"custom status",
         "mass":"mass action tools","nuke":"destructive ops + backup","scrape":"scrape & export",
         "webhooks":"webhooks & emoji tools","automod":"automod, raid, quarantine, tickets, verify",
@@ -1466,6 +1479,7 @@ COG_MODULES = [
     ("cogs.meta", "MetaCog"),
     ("cogs.interactions", "InteractionsCog"),
     ("cogs.spoofer", "SpooferCog"),
+    ("cogs.multispoof", "MultiSpoofCog"),
     ("cogs.rpc_adapter", "RpcAdapterCog"),
 ]
 
@@ -1741,6 +1755,12 @@ async def on_disconnect():
     global _reconnect_count
     _reconnect_count += 1
     _session_events.append({"ts": time.time(), "event": "disconnect", "count": _reconnect_count})
+    # kill satellites — they were bound to the same account session
+    try:
+        from cogs import state as cstate
+        await cstate.satellite_stop_all()
+    except Exception as e:
+        print(f"[ws] satellite shutdown error: {e}")
     if _auto_reconnect:
         print(f"[ws] disconnected — auto-reconnect attempt #{_reconnect_count}")
 
@@ -1966,13 +1986,13 @@ async def _dispatch_message(_client, message):
         gw_ok = bool(getattr(gw, "is_connected", False)) if gw else False
         lat = getattr(client, "latency", 0) or 0
         await message.edit(content=ui_box("health", [
-            f"  {DIM}user{S.RESET}      {client.user}",
-            f"  {DIM}gateway{S.RESET}   {'ok' if gw_ok else 'DOWN'}",
-            f"  {DIM}latency{S.RESET}   {round(lat*1000,1)}ms",
-            f"  {DIM}cogs{S.RESET}      {cogs_n}",
-            f"  {DIM}tasks{S.RESET}     {live_tasks}",
-            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
-            f"  {DIM}uptime{S.RESET}    {int(time.time() - _last_ready_ts)}s",
+            f"  {DIM}user{RESET}      {client.user}",
+            f"  {DIM}gateway{RESET}   {'ok' if gw_ok else 'DOWN'}",
+            f"  {DIM}latency{RESET}   {round(lat*1000,1)}ms",
+            f"  {DIM}cogs{RESET}      {cogs_n}",
+            f"  {DIM}tasks{RESET}     {live_tasks}",
+            f"  {DIM}disconnects{RESET} {_reconnect_count}",
+            f"  {DIM}uptime{RESET}    {int(time.time() - _last_ready_ts)}s",
         ]))
         return
 
@@ -1980,9 +2000,9 @@ async def _dispatch_message(_client, message):
         up = int(time.time() - _last_ready_ts)
         h, rem = divmod(up, 3600); m, s = divmod(rem, 60)
         await message.edit(content=ui_box("uptime", [
-            f"  {DIM}up{S.RESET}          {h}h {m}m {s}s",
-            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
-            f"  {DIM}since ready{S.RESET} {datetime.fromtimestamp(_last_ready_ts).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"  {DIM}up{RESET}          {h}h {m}m {s}s",
+            f"  {DIM}disconnects{RESET} {_reconnect_count}",
+            f"  {DIM}since ready{RESET} {datetime.fromtimestamp(_last_ready_ts).strftime('%Y-%m-%d %H:%M:%S')}",
         ]))
         return
 
@@ -1997,11 +2017,11 @@ async def _dispatch_message(_client, message):
             avg = sum(vals) / len(vals)
             lo, hi = min(vals), max(vals)
             await message.edit(content=ui_box("latency history", [
-                f"  {DIM}samples{S.RESET}  {len(samples)}",
-                f"  {DIM}avg{S.RESET}      {avg:.1f}ms",
-                f"  {DIM}min{S.RESET}      {lo:.1f}ms",
-                f"  {DIM}max{S.RESET}      {hi:.1f}ms",
-                f"  {DIM}current{S.RESET}  {round(getattr(client, 'latency', 0)*1000, 1)}ms",
+                f"  {DIM}samples{RESET}  {len(samples)}",
+                f"  {DIM}avg{RESET}      {avg:.1f}ms",
+                f"  {DIM}min{RESET}      {lo:.1f}ms",
+                f"  {DIM}max{RESET}      {hi:.1f}ms",
+                f"  {DIM}current{RESET}  {round(getattr(client, 'latency', 0)*1000, 1)}ms",
             ]))
             return
         cur = round(getattr(client, "latency", 0) * 1000, 1)
