@@ -18,13 +18,26 @@ class ServerCog:
             g = message.guild
             if not g:
                 return await message.edit(content=S.ui_err("not in a server"))
-            await message.edit(content=S.ui_box(g.name, [
+            owner_display = "?"
+            try:
+                owner_display = str(getattr(g, "owner", None) or getattr(g, "owner_id", "?"))
+            except Exception:
+                pass
+            member_count = getattr(g, "member_count", 0) or len(getattr(g, "members", []) or [])
+            rows = [
                 f"  {S.DIM}id{S.RESET}          {g.id}",
-                f"  {S.DIM}owner{S.RESET}       {g.owner}",
-                f"  {S.DIM}members{S.RESET}     {g.member_count}",
+                f"  {S.DIM}name{S.RESET}        {g.name}",
+                f"  {S.DIM}owner{S.RESET}       {owner_display}",
+                f"  {S.DIM}members{S.RESET}     {member_count}",
                 f"  {S.DIM}channels{S.RESET}    {len(g.channels)}",
                 f"  {S.DIM}roles{S.RESET}       {len(g.roles)}",
-            ]))
+                f"  {S.DIM}emojis{S.RESET}      {len(getattr(g, 'emojis', []) or [])}",
+            ]
+            try:
+                rows.append(f"  {S.DIM}created{S.RESET}    {g.created_at.strftime('%Y-%m-%d')}")
+            except Exception:
+                pass
+            await message.edit(content=S.ui_box(g.name, rows))
 
         elif cmd == "members":
             g = message.guild

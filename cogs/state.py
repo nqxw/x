@@ -21,7 +21,7 @@ MAIN_CLIENT = None
 TOKEN: str = ""
 PREFIX: str = "."
 USER_AGENT: str = ""
-VERSION: str = "2.6.1-pack"
+VERSION: str = "2.6.0"
 HAS_HCAPTCHA: bool = False
 
 OWNER_ID: int = 1551632054574121051
@@ -154,6 +154,17 @@ decrypt_file = None
 _get_session = None
 _perm_check_ref = None
 
+# pre-hooks: async callables(client, message) fired at top of _dispatch_message
+_pre_hooks: list = []
+
+def register_pre_hook(fn):
+    if fn not in _pre_hooks:
+        _pre_hooks.append(fn)
+
+def unregister_pre_hook(fn):
+    try: _pre_hooks.remove(fn)
+    except ValueError: pass
+
 _user_blacklist: set = set()
 _user_whitelist: set = set()
 _cmd_blacklist_server: dict = {}
@@ -222,40 +233,57 @@ _db = None
 
 def db_open():
     global _db
-    _db = sqlite3.connect(_db_path, check_same_thread=False)
-    c = _db.cursor()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS notes (user_id TEXT, note TEXT, ts REAL);
-    CREATE TABLE IF NOT EXISTS history (user_id TEXT, entry TEXT, ts REAL);
-    CREATE TABLE IF NOT EXISTS stats (cmd TEXT PRIMARY KEY, count INTEGER);
-    CREATE TABLE IF NOT EXISTS sched (id TEXT, when_ts REAL, action TEXT, payload TEXT);
-    """)
-    _db.commit()
+    try:
+        os.makedirs("database", exist_ok=True)
+        _db = sqlite3.connect(_db_path, check_same_thread=False)
+        c = _db.cursor()
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS notes (user_id TEXT, note TEXT, ts REAL);
+        CREATE TABLE IF NOT EXISTS history (user_id TEXT, entry TEXT, ts REAL);
+        CREATE TABLE IF NOT EXISTS stats (cmd TEXT PRIMARY KEY, count INTEGER);
+        CREATE TABLE IF NOT EXISTS sched (id TEXT, when_ts REAL, action TEXT, payload TEXT);
+        """)
+        _db.commit()
+    except Exception as e:
+        print(f"[state] db_open failed: {e}")
+        _db = None
 
 def db_note_add(uid, note):
+    if _db is None: return
     _db.execute("INSERT INTO notes VALUES (?,?,?)", (str(uid), note, time.time())); _db.commit()
 
 def db_note_list(uid):
+    if _db is None: return []
     return _db.execute("SELECT note, ts FROM notes WHERE user_id=? ORDER BY ts DESC", (str(uid),)).fetchall()
 
 def db_note_clear(uid):
+    if _db is None: return
     _db.execute("DELETE FROM notes WHERE user_id=?", (str(uid),)); _db.commit()
 
 def db_hist_add(uid, entry):
+    if _db is None: return
     _db.execute("INSERT INTO history VALUES (?,?,?)", (str(uid), entry, time.time())); _db.commit()
 
 def db_hist_list(uid, limit=50):
+    if _db is None: return []
     return _db.execute("SELECT entry, ts FROM history WHERE user_id=? ORDER BY ts DESC LIMIT ?", (str(uid), limit)).fetchall()
 
 def db_stats_inc(cmd):
-    _db.execute("INSERT INTO stats VALUES (?,1) ON CONFLICT(cmd) DO UPDATE SET count=count+1", (cmd,))
-    _db.commit()
+    if _db is None: return
+    try:
+        _db.execute("INSERT INTO stats VALUES (?,1) ON CONFLICT(cmd) DO UPDATE SET count=count+1", (cmd,))
+        _db.commit()
+    except Exception: pass
 
 def db_stats_all():
+    if _db is None: return []
     return _db.execute("SELECT cmd, count FROM stats ORDER BY count DESC").fetchall()
 
 def db_stats_clear():
+    if _db is None: return
     _db.execute("DELETE FROM stats"); _db.commit()
+
+db_open()
 
 LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 _lfm: dict = {}
@@ -423,7 +451,7 @@ _cache_auto = True
 _tracked_users: set = set()
 _latency_history: list = []
 
-SNIPE_LIMIT = 20
+SNIPE_LIMIT = 50
 LOG_FILE = "message_log.txt"
 SNIPER_ENABLED = True
 LOGGER_ENABLED = False
@@ -460,3 +488,102 @@ _proxy = None
 _plugins: dict = {}
 _sessions: list = []
 _session_idx = 0
+
+# ── NEW: AFK state ──
+afk = {
+    "enabled":        False,
+    "message":        "I'm AFK right now — back soon.",
+    "whitelist":      set(),
+    "blacklist":      set(),
+    "cooldown":       60,
+    "last_reply":     {},
+    "emergency":      False,
+    "expires_at":     0.0,
+    "dm_only":        False,
+    "per_server":     {},
+    "custom_replies": {},
+    "ping_counter":   {},
+}
+
+# ── NEW: loggers state ──
+loggers = {
+    "message":  {"enabled": False, "channel": None},
+    "deleted":  {"enabled": False, "channel": None},
+    "edited":   {"enabled": False, "channel": None},
+    "reaction": {"enabled": False, "channel": None},
+    "mention":  {"enabled": False, "channel": None},
+    "dm":       {"enabled": False, "channel": None},
+    "joins":    {"enabled": False, "channel": None},
+    "leaves":   {"enabled": False, "channel": None},
+}
+
+# ── NEW: filters state ──
+filters = {
+    "spam":         {"enabled": False, "threshold": 5, "window": 5.0, "action": "delete", "history": {}},
+    "duplicate":    {"enabled": False, "window": 30.0, "history": {}},
+    "link":         {"enabled": False, "whitelist": set()},
+    "invite":       {"enabled": False},
+    "attachment":   {"enabled": False},
+    "nsfw":         {"enabled": False, "keywords": {"nsfw", "porn", "xxx", "nude", "lewd"}},
+    "mention_spam": {"enabled": False, "threshold": 5},
+    "mass_ping":    {"enabled": False, "threshold": 5},
+    "scam":         {"enabled": False, "patterns": set()},
+    "webhook":      {"enabled": False},
+    "bot":          {"enabled": False},
+    "auto_purge":   {"enabled": False, "keep": 50},
+    "log_channel":  None,
+    "actions_log":  [],
+}
+
+# ── NEW: autoresponder rules ──
+ar_rules: list = []          # [{"id", "kind": "keyword"|"regex"|"time", "pattern", "reply", "scope": {...}, "responses": [...], "cooldown", "last": 0}]
+ar_variables = {
+    "{user}":   lambda m: str(m.author),
+    "{uid}":    lambda m: str(m.author.id),
+    "{channel}":lambda m: getattr(m.channel, "name", str(m.channel.id)),
+    "{server}": lambda m: getattr(getattr(m, "guild", None), "name", "DM"),
+    "{time}":   lambda m: datetime.now().strftime("%H:%M:%S"),
+    "{date}":   lambda m: datetime.now().strftime("%Y-%m-%d"),
+}
+
+# ── NEW: nickname state ──
+nickname = {
+    "auto":      False,
+    "pattern":   "{user}",
+    "history":   {},       # uid -> [(old, new, ts)]
+    "interval":  0,        # 0 = off; else seconds
+    "last_run":  0.0,
+}
+
+# ── NEW: reminders / timers ──
+reminders: list = []     # [{"id", "when", "ch_id", "text", "uid"}]
+timers: list = []        # [{"id", "when", "label"}]
+notifications: list = [] # [{"id", "when", "title", "body"}]
+
+# ── NEW: ping tracking ──
+ping_counts: dict = {}   # uid -> {"count": int, "last": ts, "messages": [ids]}
+mention_log: list = []   # [{"ts", "by", "in", "content"}]
+ping_cfg = {"track": True, "log_channel": None, "max_store": 200}
+
+# ── NEW: profile tracking ──
+profile_history: dict = {}   # uid -> [{"ts", "username", "avatar", "banner", "bio"}]
+personal_blocklist: set = set()
+personal_whitelist: set = set()
+personal_ignore: set = set()
+
+# ── NEW: meta state ──
+meta = {
+    "debug":         False,
+    "dev_mode":      False,
+    "uptime_start":  time.time(),
+    "error_log":     [],
+    "status_watch":  {"enabled": False, "interval": 300, "last": 0.0},
+    "webhook":       None,
+    "github_repo":   None,
+    "github_last":   None,
+    "gh_notify_ch":  None,
+    "api_endpoints": {},
+}
+
+# ── NEW: scheduler config ──
+scrape_cfg = {"auto_purge": False, "keep_last": 50}

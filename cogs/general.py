@@ -1,4 +1,5 @@
-# cogs/general.py | ping, info, say, spam, purge, snipe, editsnipe, copycat, status, platform, hypesquad, sniper, logger, readlog, ar
+# cogs/general.py | ping, info, say, spam, purge, snipe (extended), editsnipe, copycat,
+#                   status, platform, hypesquad, sniper, logger, readlog, ar
 import asyncio
 import sys
 import os
@@ -9,6 +10,10 @@ import re
 import aiohttp
 import modifyself_shim as discord
 from . import state as S
+
+
+# snipe ignore — per-user filter, module-local because only this cog reads it
+_snipe_ignore: set = set()
 
 
 def _sync(**kw):
@@ -84,6 +89,59 @@ async def _spam_worker(channel, count, text):
         raise
     except Exception as e:
         print(f"[spam] {e}")
+
+
+# ---------- snipe helpers ----------
+def _snipe_entries(cid):
+    return S._snipe_cache.get(cid, [])
+
+
+def _snipe_visible(entries):
+    if not _snipe_ignore:
+        return entries
+    return [e for e in entries if int(e.get("author_id") or 0) not in _snipe_ignore]
+
+
+def _filter_entries(entries, kind):
+    if not kind or kind == "all":
+        return entries
+    if kind == "attachments":
+        return [e for e in entries if e.get("attachments")]
+    if kind == "embeds":
+        return [e for e in entries if e.get("embeds")]
+    if kind == "reactions":
+        return [e for e in entries if e.get("reactions")]
+    if kind == "text":
+        return [e for e in entries if (e.get("content") or "").strip()]
+    return entries
+
+
+def _snipe_render(e, header):
+    atts = "\n".join(e.get("attachments", [])) or "none"
+    embeds = e.get("embeds") or []
+    reacts = e.get("reactions") or []
+    rows = [
+        f"  {S.DIM}author{S.RESET}      {S.WHITE}{e.get('author','?')}{S.RESET}",
+        f"  {S.DIM}deleted{S.RESET}     {e.get('time','?')}",
+        f"  {S.DIM}id{S.RESET}          {e.get('message_id','?')}",
+        f"  {S.DIM}attachments{S.RESET} {atts}",
+    ]
+    if embeds:
+        rows.append(f"  {S.DIM}embeds{S.RESET}      {len(embeds)}")
+    if reacts:
+        rows.append(f"  {S.DIM}reactions{S.RESET}   {' '.join(str(r) for r in reacts)}")
+    rows += ["", f"  {S.WHITE}{e.get('content') or '(no content)'}{S.RESET}"]
+    return S.ui_box(header, rows)
+
+
+def _clear_snipe_where(entries, *, author_id=None, channel_id=None):
+    kept = []
+    for e in entries:
+        if author_id is not None and int(e.get("author_id") or 0) != int(author_id):
+            kept.append(e); continue
+        if channel_id is not None and int(e.get("channel_id") or 0) != int(channel_id):
+            kept.append(e); continue
+    return kept
 
 
 class GeneralCog:
@@ -166,8 +224,7 @@ class GeneralCog:
                     d = await _purge_own_messages(session, ch_id, own_uid, limit)
                 if d:
                     try:
-                        await message.channel.send(
-                            S.ui_ok(f"purged {d}"), delete_after=4)
+                        await message.channel.send(S.ui_ok(f"purged {d}"), delete_after=4)
                     except Exception:
                         pass
             except Exception as e:
@@ -183,8 +240,7 @@ class GeneralCog:
                     d = await _purge_own_messages(session, ch_id, own_uid, 1000)
                 if d:
                     try:
-                        await message.channel.send(
-                            S.ui_ok(f"purged {d}"), delete_after=4)
+                        await message.channel.send(S.ui_ok(f"purged {d}"), delete_after=4)
                     except Exception:
                         pass
             except Exception as e:
@@ -195,53 +251,10 @@ class GeneralCog:
             except Exception: pass
 
         elif cmd == "snipe":
-            try: await message.delete()
-            except Exception: pass
-            sub = args[1].lower() if len(args) > 1 else ""
-            cid = message.channel.id
-            if sub == "clear":
-                S._snipe_cache.pop(cid, None)
-                return await message.channel.send(S.ui_ok("snipe cache cleared"), delete_after=4)
-            entries = S._snipe_cache.get(cid, [])
-            if not entries:
-                return await message.channel.send(S.ui_info("nothing to snipe"), delete_after=5)
-            try: idx = int(sub) if sub else 1
-            except ValueError: idx = 1
-            if idx < 1 or idx > len(entries):
-                return await message.channel.send(S.ui_err(f"range 1–{len(entries)}"), delete_after=5)
-            e = entries[-idx]
-            atts = "\n".join(e.get("attachments", [])) or "none"
-            await message.channel.send(S.ui_box(f"sniped #{idx}/{len(entries)}", [
-                f"  {S.DIM}author{S.RESET}      {S.WHITE}{e['author']}{S.RESET}",
-                f"  {S.DIM}deleted{S.RESET}     {e['time']}",
-                f"  {S.DIM}attachments{S.RESET} {atts}", "",
-                f"  {S.WHITE}{e['content'] or '(no content)'}{S.RESET}",
-            ]))
+            await self._handle_snipe(message, args)
 
         elif cmd in ("editsnipe", "esnipe"):
-            try: await message.delete()
-            except Exception: pass
-            sub = args[1].lower() if len(args) > 1 else ""
-            cid = message.channel.id
-            if sub == "clear":
-                S._editsnipe_cache.pop(cid, None)
-                return await message.channel.send(S.ui_ok("editsnipe cache cleared"), delete_after=4)
-            entries = S._editsnipe_cache.get(cid, [])
-            if not entries:
-                return await message.channel.send(S.ui_info("no edits"), delete_after=5)
-            try: idx = int(sub) if sub else 1
-            except ValueError: idx = 1
-            if idx < 1 or idx > len(entries):
-                return await message.channel.send(S.ui_err(f"range 1–{len(entries)}"), delete_after=5)
-            e = entries[-idx]
-            await message.channel.send(S.ui_box(f"sniped edit #{idx}/{len(entries)}", [
-                f"  {S.DIM}author{S.RESET}  {S.WHITE}{e['author']}{S.RESET}",
-                f"  {S.DIM}edited{S.RESET}  {e['time']}", "",
-                f"  {S.DIM}before:{S.RESET}",
-                f"  {S.WHITE}{e['before'] or '(empty)'}{S.RESET}", "",
-                f"  {S.DIM}after:{S.RESET}",
-                f"  {S.WHITE}{e['after'] or '(empty)'}{S.RESET}",
-            ]))
+            await self._handle_editsnipe(message, args)
 
         elif cmd == "copycat":
             if len(args) < 2:
@@ -343,3 +356,240 @@ class GeneralCog:
                                             if rows else S.ui_info("none set"))
             else:
                 await message.edit(content=S.ui_info("usage: ar add/remove/list"))
+
+    # ----------------------------------------------------------
+    # snipe dispatcher
+    # ----------------------------------------------------------
+    async def _handle_snipe(self, message, args):
+        try: await message.delete()
+        except Exception: pass
+        cid = message.channel.id
+        sub = args[1].lower() if len(args) > 1 else ""
+        rest = args[2:]
+
+        # cache-wide ops
+        if sub == "clear":
+            S._snipe_cache.pop(cid, None)
+            return await message.channel.send(S.ui_ok("snipe cache cleared"), delete_after=4)
+
+        if sub == "cache":
+            total = sum(len(v) for v in S._snipe_cache.values())
+            rows = [f"  {S.DIM}channels cached{S.RESET}  {len(S._snipe_cache)}",
+                    f"  {S.DIM}entries total{S.RESET}    {total}",
+                    f"  {S.DIM}this channel{S.RESET}     {len(_snipe_entries(cid))}",
+                    f"  {S.DIM}ignored users{S.RESET}    {len(_snipe_ignore)}"]
+            return await message.channel.send(S.ui_box("snipe cache", rows), delete_after=8)
+
+        # history
+        if sub == "history":
+            entries = _snipe_visible(_snipe_entries(cid))
+            if not entries:
+                return await message.channel.send(S.ui_info("nothing sniped here"), delete_after=5)
+            rows = []
+            for i, e in enumerate(reversed(entries[-50:]), 1):
+                content = (e.get("content") or "")[:60]
+                atts = "📎" if e.get("attachments") else "  "
+                rows.append(f"  {S.GREY}{i:>3}.{S.RESET} {atts} {S.WHITE}{e.get('author','?')[:18]:<18}"
+                            f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}  {content}")
+            return await message.channel.send(S._paginate("snipe history", "recent 50", rows))
+
+        # paging
+        if sub == "page":
+            entries = _snipe_visible(_snipe_entries(cid))
+            if not entries:
+                return await message.channel.send(S.ui_info("nothing sniped"), delete_after=5)
+            try: page = int(rest[0]) if rest and rest[0].isdigit() else 1
+            except ValueError: page = 1
+            per = 10
+            total = max(1, (len(entries) + per - 1) // per)
+            page = max(1, min(page, total))
+            chunk = entries[(page-1)*per : page*per]
+            rows = []
+            for i, e in enumerate(chunk, (page-1)*per + 1):
+                atts = "📎" if e.get("attachments") else "  "
+                rows.append(f"  {S.GREY}{i:>3}.{S.RESET} {atts} {S.WHITE}{e.get('author','?')[:18]:<18}"
+                            f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}  "
+                            f"{(e.get('content') or '')[:40]}")
+            return await message.channel.send(S._paginate("snipe history", f"page {page}/{total}", rows))
+
+        # search
+        if sub == "search":
+            if not rest:
+                return await message.channel.send(S.ui_err("usage: snipe search <keyword>"), delete_after=5)
+            kw = " ".join(rest).lower()
+            entries = _snipe_visible(_snipe_entries(cid))
+            hits = [e for e in entries if kw in (e.get("content") or "").lower()]
+            if not hits:
+                return await message.channel.send(S.ui_info("no match"), delete_after=5)
+            rows = []
+            for e in hits[-30:]:
+                rows.append(f"  {S.GREY}•{S.RESET} {S.WHITE}{e.get('author','?')[:18]:<18}"
+                            f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}  "
+                            f"{(e.get('content') or '')[:60]}")
+            return await message.channel.send(S._paginate("snipe search", f"`{kw}`", rows))
+
+        # filters
+        if sub == "filter":
+            if not rest:
+                return await message.channel.send(S.ui_info(
+                    "usage: snipe filter <attachments|embeds|reactions|text|all|clear>"), delete_after=6)
+            kind = rest[0].lower()
+            if kind in ("clear", "all", "reset"):
+                return await message.channel.send(S.ui_ok("filter reset → all"), delete_after=5)
+            entries = _snipe_visible(_snipe_entries(cid))
+            hits = _filter_entries(entries, kind)
+            if not hits:
+                return await message.channel.send(S.ui_info(f"no `{kind}` entries"), delete_after=5)
+            rows = []
+            for e in hits[-30:]:
+                rows.append(f"  {S.GREY}•{S.RESET} {S.WHITE}{e.get('author','?')[:18]:<18}"
+                            f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}  "
+                            f"{(e.get('content') or '')[:50]}")
+            return await message.channel.send(S._paginate("snipe filter", kind, rows))
+
+        # attachments / embeds / reactions / time — shortcuts
+        if sub in ("attachments", "embeds", "reactions"):
+            entries = _snipe_visible(_snipe_entries(cid))
+            hits = _filter_entries(entries, sub)
+            if not hits:
+                return await message.channel.send(S.ui_info(f"no `{sub}` entries"), delete_after=5)
+            rows = []
+            for e in hits[-30:]:
+                extra = ""
+                if sub == "attachments":
+                    extra = "  " + ", ".join(e.get("attachments", [])[:1])
+                rows.append(f"  {S.GREY}•{S.RESET} {S.WHITE}{e.get('author','?')[:18]:<18}"
+                            f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}{extra}")
+            return await message.channel.send(S._paginate(f"snipe {sub}", "", rows))
+
+        if sub == "time":
+            entries = _snipe_visible(_snipe_entries(cid))
+            if not entries:
+                return await message.channel.send(S.ui_info("nothing sniped"), delete_after=5)
+            now = time.time()
+            rows = []
+            for e in entries[-30:]:
+                ago = int(now - float(e.get("ts", now)))
+                rows.append(f"  {S.GREY}•{S.RESET} {e.get('time','?')}  "
+                            f"{S.DIM}{ago}s ago{S.RESET}  {e.get('author','?')}")
+            return await message.channel.send(S._paginate("snipe timestamps", "", rows))
+
+        # purge
+        if sub == "purge":
+            target = rest[0].lower() if rest else ""
+            if target == "user":
+                if len(rest) < 2 or not rest[1].strip("<@!>").isdigit():
+                    return await message.channel.send(S.ui_err("usage: snipe purge user <uid>"), delete_after=5)
+                uid = int(rest[1].strip("<@!>"))
+                removed = 0
+                for ch_id, lst in list(S._snipe_cache.items()):
+                    kept = [e for e in lst if int(e.get("author_id") or 0) != uid]
+                    removed += len(lst) - len(kept)
+                    if kept: S._snipe_cache[ch_id] = kept
+                    else: S._snipe_cache.pop(ch_id, None)
+                return await message.channel.send(S.ui_ok(f"purged {removed} entries by {uid}"))
+            if target == "channel":
+                n = len(S._snipe_cache.pop(cid, []))
+                return await message.channel.send(S.ui_ok(f"purged channel ({n} entries)"))
+            if target == "server":
+                total = sum(len(v) for v in S._snipe_cache.values())
+                S._snipe_cache.clear()
+                return await message.channel.send(S.ui_ok(f"purged all ({total} entries)"))
+            return await message.channel.send(S.ui_info(
+                "usage: snipe purge user <uid> | channel | server"), delete_after=6)
+
+        # ignore list
+        if sub == "ignore":
+            if not rest:
+                return await message.channel.send(S.ui_info(
+                    "usage: snipe ignore add/remove/list/clear"), delete_after=6)
+            action = rest[0].lower()
+            if action == "add" and len(rest) >= 2 and rest[1].strip("<@!>").isdigit():
+                _snipe_ignore.add(int(rest[1].strip("<@!>")))
+                return await message.channel.send(S.ui_ok(f"ignoring {rest[1]}"))
+            if action == "remove" and len(rest) >= 2 and rest[1].strip("<@!>").isdigit():
+                _snipe_ignore.discard(int(rest[1].strip("<@!>")))
+                return await message.channel.send(S.ui_ok("removed"))
+            if action == "clear":
+                _snipe_ignore.clear()
+                return await message.channel.send(S.ui_ok("ignore list cleared"))
+            if action == "list":
+                if not _snipe_ignore:
+                    return await message.channel.send(S.ui_info("ignore list empty"))
+                rows = [f"  {S.GREY}•{S.RESET} <@{u}>" for u in sorted(_snipe_ignore)]
+                return await message.channel.send(S._paginate("snipe ignore", "", rows))
+            return await message.channel.send(S.ui_info(
+                "usage: snipe ignore add/remove/list/clear"), delete_after=6)
+
+        # default — nth from end, or plain view
+        entries = _snipe_visible(_snipe_entries(cid))
+        if not entries:
+            return await message.channel.send(S.ui_info("nothing to snipe"), delete_after=5)
+        try: idx = int(sub) if sub else 1
+        except ValueError: idx = 1
+        if idx < 1 or idx > len(entries):
+            return await message.channel.send(S.ui_err(f"range 1–{len(entries)}"), delete_after=5)
+        e = entries[-idx]
+        await message.channel.send(_snipe_render(e, f"sniped #{idx}/{len(entries)}"))
+
+    # ----------------------------------------------------------
+    # editsnipe dispatcher
+    # ----------------------------------------------------------
+    async def _handle_editsnipe(self, message, args):
+        try: await message.delete()
+        except Exception: pass
+        cid = message.channel.id
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        if sub == "clear":
+            S._editsnipe_cache.pop(cid, None)
+            return await message.channel.send(S.ui_ok("editsnipe cache cleared"), delete_after=4)
+
+        if sub == "history":
+            entries = S._editsnipe_cache.get(cid, [])
+            if not entries:
+                return await message.channel.send(S.ui_info("no edits"), delete_after=5)
+            rows = []
+            for i, e in enumerate(reversed(entries[-50:]), 1):
+                rows.append(f"  {S.GREY}{i:>3}.{S.RESET} {S.WHITE}{e.get('author','?')[:18]:<18}"
+                            f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}  "
+                            f"{(e.get('before') or '')[:30]} → {(e.get('after') or '')[:30]}")
+            return await message.channel.send(S._paginate("editsnipe history", "", rows))
+
+        if sub == "purge":
+            target = args[2].lower() if len(args) > 2 else ""
+            if target == "channel":
+                n = len(S._editsnipe_cache.pop(cid, []))
+                return await message.channel.send(S.ui_ok(f"purged ({n})"))
+            if target == "server":
+                total = sum(len(v) for v in S._editsnipe_cache.values())
+                S._editsnipe_cache.clear()
+                return await message.channel.send(S.ui_ok(f"purged all ({total})"))
+            if target == "user" and len(args) >= 4 and args[3].strip("<@!>").isdigit():
+                uid = int(args[3].strip("<@!>"))
+                removed = 0
+                for ch_id, lst in list(S._editsnipe_cache.items()):
+                    kept = [e for e in lst if int(e.get("author_id") or 0) != uid]
+                    removed += len(lst) - len(kept)
+                    if kept: S._editsnipe_cache[ch_id] = kept
+                    else: S._editsnipe_cache.pop(ch_id, None)
+                return await message.channel.send(S.ui_ok(f"purged {removed}"))
+            return await message.channel.send(S.ui_info(
+                "usage: editsnipe purge user <uid> | channel | server"), delete_after=6)
+
+        entries = S._editsnipe_cache.get(cid, [])
+        if not entries:
+            return await message.channel.send(S.ui_info("no edits"), delete_after=5)
+        try: idx = int(sub) if sub else 1
+        except ValueError: idx = 1
+        if idx < 1 or idx > len(entries):
+            return await message.channel.send(S.ui_err(f"range 1–{len(entries)}"), delete_after=5)
+        e = entries[-idx]
+        await message.channel.send(S.ui_box(f"sniped edit #{idx}/{len(entries)}", [
+            f"  {S.DIM}author{S.RESET}  {S.WHITE}{e['author']}{S.RESET}",
+            f"  {S.DIM}edited{S.RESET}  {e['time']}", "",
+            f"  {S.DIM}before:{S.RESET}",
+            f"  {S.WHITE}{e['before'] or '(empty)'}{S.RESET}", "",
+            f"  {S.DIM}after:{S.RESET}",
+            f"  {S.WHITE}{e['after'] or '(empty)'}{S.RESET}",
+        ]))
