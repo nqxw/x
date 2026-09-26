@@ -1,5 +1,5 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# mist — v2.6.0-turbo
+# decay — v2.6.0
 
 import modifyself_shim as discord
 
@@ -152,14 +152,14 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[mist] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[decay] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.6.0-turbo"
+VERSION = "2.6.0"
 OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
 
@@ -296,9 +296,35 @@ def access_load():
         print(f"[access] load error: {e}")
 
 def _access_level(uid: int) -> str:
-    if uid == _current_owner(): return "owner"
-    if uid in _admins: return "admin"
-    if uid in _devs: return "dev"
+    # read through cstate — cogs write there; module globals here may
+    # hold a stale reference after a cog rebinds the set
+    try:
+        from cogs import state as cstate
+        owner  = getattr(cstate, "OWNER_ID", None)
+        if not isinstance(owner, int):
+            owner = _current_owner()
+        admins = getattr(cstate, "_admins", None)
+        devs   = getattr(cstate, "_devs", None)
+        if admins is None: admins = _admins
+        if devs   is None: devs   = _devs
+    except Exception:
+        owner, admins, devs = _current_owner(), _admins, _devs
+
+    try:
+        if uid == int(owner):  return "owner"
+    except Exception:
+        if uid == owner:       return "owner"
+
+    try:
+        if uid in admins:      return "admin"
+    except TypeError:
+        if uid in set(admins): return "admin"
+
+    try:
+        if uid in devs:        return "dev"
+    except TypeError:
+        if uid in set(devs):   return "dev"
+
     return "user"
 
 def _access_ok(uid: int, cmd: str) -> bool:
@@ -498,7 +524,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show mist version"),("reload","reload config from disk"),
+        ("version","show decay version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -581,7 +607,7 @@ HELP_DATA = {
     ],
     "developer": [
         ("eval <code>","owner+dev only — evaluate python code"),
-        ("restart","restart the mist process"),
+        ("restart","restart the decay process"),
         ("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),
@@ -677,14 +703,20 @@ HELP_DATA = {
         ("reactdiag","show autoreact/superreact state"),
     ],
     "spoofer": [
-        ("platform [name]","show or set spoofed platform"),
-        ("spoof <platform>","rewrite IDENTIFY payload + reconnect"),
+        ("platform [name]","show pool or set a single sticky platform"),
+        ("spoof <platform>","single-platform shortcut — sticky, reconnect"),
         ("spoofer <platform>","alias for spoof"),
-        ("spoof status","show spoofer state"),
-        ("spoof reset","reset to desktop"),
-        ("spoofstatus","show spoofer state"),
-        ("spoofreset","reset to desktop"),
-        ("vr","spoof as VR headset"),("console","spoof as console"),
+        ("spoof add <platform>","add a platform to the rotation pool"),
+        ("spoof remove <platform>","drop a platform from the pool"),
+        ("spoof pool","show the pool, arrow marks next in rotate order"),
+        ("spoof mode <mode>","rotate | random | sticky — how the pool cycles"),
+        ("spoof clear","empty the pool — no rewrite on next IDENTIFY"),
+        ("spoof status","show spoofer state (mode, pool, cursor, last pick)"),
+        ("spoof reset","reset to desktop, sticky mode"),
+        ("spoofstatus","alias for spoof status"),
+        ("spoofreset","alias for spoof reset"),
+        ("vr","spoof as VR headset (sticky)"),
+        ("console","spoof as console (sticky)"),
         ("spooferdiag","spoofer diagnostics dump"),
     ],
     "profile": [
@@ -833,11 +865,11 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> mist{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> decay{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  mist | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  decay | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -1319,7 +1351,7 @@ async def _boot_cogs():
         cstate._has_crypto = _HAS_CRYPTO
         cstate._HAS_CRYPTO = _HAS_CRYPTO
 
-        # NEW — expose the shared session builder so cogs stop opening
+        # expose the shared session builder so cogs stop opening
         # fresh ClientSessions on every request
         cstate._get_session = _get_session
 
@@ -1383,10 +1415,19 @@ async def _boot_cogs():
         cstate._latency_history = _latency_history
         cstate._last_ready_ts = _last_ready_ts
 
-        # access control (shared by reference)
+        # access control — share the SAME mutable set objects as the
+        # dispatcher. cogs must .add()/.discard() in place, never reassign.
         cstate.OWNER_ID           = OWNER_ID
-        cstate._admins            = _admins
-        cstate._devs              = _devs
+        if not hasattr(cstate, "_admins") or cstate._admins is None:
+            cstate._admins = _admins
+        else:
+            _admins.update(getattr(cstate, "_admins", set()) or set())
+            cstate._admins = _admins
+        if not hasattr(cstate, "_devs") or cstate._devs is None:
+            cstate._devs = _devs
+        else:
+            _devs.update(getattr(cstate, "_devs", set()) or set())
+            cstate._devs = _devs
         cstate.ADMIN_COMMANDS     = ADMIN_COMMANDS
         cstate.DEVELOPER_COMMANDS = DEVELOPER_COMMANDS
         cstate.OWNER_COMMANDS     = OWNER_COMMANDS
@@ -1441,12 +1482,12 @@ async def on_ready():
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
 
-    # NEW — shared session + TCP_NODELAY on the gateway socket
+    # shared session + TCP_NODELAY on the gateway socket
     try:
         _get_session()
-        print("[turbo] shared aiohttp session warm")
+        print("[decay] shared aiohttp session warm")
     except Exception as e:
-        print(f"[turbo] session init failed: {e}")
+        print(f"[decay] session init failed: {e}")
 
     try:
         gw = getattr(client, "_gateway", None)
@@ -1454,9 +1495,9 @@ async def on_ready():
         sock = getattr(ws, "_sock", None) or getattr(ws, "sock", None)
         if sock is not None:
             _tcp_nodelay(sock)
-            print("[turbo] TCP_NODELAY applied to gateway socket")
+            print("[decay] TCP_NODELAY applied to gateway socket")
     except Exception as e:
-        print(f"[turbo] tcp_nodelay skipped: {e}")
+        print(f"[decay] tcp_nodelay skipped: {e}")
 
     is_main = True
     idx = "main"
@@ -1926,7 +1967,7 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[Mist] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[decay] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
     client.run()
 except Exception as e:
