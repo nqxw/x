@@ -1,5 +1,5 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
-# v4.1 — _ForkTransport wired to modifyself HTTPClient.request
+# v4.2 — HTTPClient(headers=) required kwarg supplied
 import asyncio
 import base64
 import json
@@ -13,7 +13,6 @@ from uuid import uuid4
 import modifyself_shim as discord
 from . import state as S
 
-# fork HTTP client — carries browser-identical TLS fingerprint
 try:
     from modifyself.http.client import HTTPClient as _ForkHTTP
     HAS_FORK_HTTP = True
@@ -68,9 +67,6 @@ _transport = None
 _transport_lock = asyncio.Lock()
 
 
-# ============================================================
-# fingerprint helpers
-# ============================================================
 def _decode_super_properties(sp_b64: str) -> dict:
     try:
         padded = sp_b64 + "=" * (-len(sp_b64) % 4)
@@ -133,18 +129,12 @@ def _quest_headers(token):
     }
 
 
-# ============================================================
-# transports
-# ============================================================
 class _ForkTransport:
-    """
-    Wraps modifyself.http.client.HTTPClient. Uses .request(...) for
-    generic calls. TLS fingerprint comes from the fork's rust client.
-    """
     def __init__(self, token, headers):
         self._token = token
         self._headers = headers
-        self._client = _ForkHTTP(token=token)
+        # HTTPClient requires headers as a required keyword-only arg
+        self._client = _ForkHTTP(token=token, headers=headers)
         print(f"[quests] fork HTTPClient: {type(self._client).__module__}."
               f"{type(self._client).__name__}")
 
@@ -152,22 +142,20 @@ class _ForkTransport:
         merged = dict(self._headers)
         if headers:
             merged.update(headers)
-        # try both positional patterns the fork might use
         for attempt in range(3):
             try:
                 call = self._client.request(method, url, headers=merged, json=json)
                 if asyncio.iscoroutine(call):
                     call = await call
                 return self._unwrap(call)
-            except TypeError:
-                # positional shape
+            except TypeError as te:
                 try:
                     call = self._client.request(method, url, json, merged)
                     if asyncio.iscoroutine(call):
                         call = await call
                     return self._unwrap(call)
                 except Exception as e:
-                    print(f"[quests] fork transport positional failed: {e}")
+                    print(f"[quests] fork positional failed: {e}")
             except Exception as e:
                 print(f"[quests] fork transport attempt {attempt+1} failed: {e}")
                 await asyncio.sleep(0.5 * (attempt + 1))
@@ -262,9 +250,6 @@ async def _get_transport(token):
         return _transport
 
 
-# ============================================================
-# API
-# ============================================================
 class APIError(Exception):
     def __init__(self, status, body=None):
         super().__init__(f"Discord API {status}")
@@ -349,9 +334,6 @@ async def _solve_hcaptcha(sitekey: str, url: str, rqdata: str = None):
         return None
 
 
-# ============================================================
-# quest model
-# ============================================================
 class QuestRecord:
     def __init__(self, data):
         self.data = data
@@ -420,9 +402,6 @@ class QuestRecord:
         return next(iter(self.tasks.keys()), "UNKNOWN")
 
 
-# ============================================================
-# service
-# ============================================================
 class QuestService:
     def __init__(self, token):
         self.token = token.strip().strip('"').strip("'")
@@ -723,9 +702,6 @@ class QuestService:
         return "completed" if quest.is_completed() else "recovering"
 
 
-# ============================================================
-# claim / orb
-# ============================================================
 async def _claim_quest(token, quest_id):
     url = f"https://discord.com/api/v9/quests/{quest_id}/claim"
     h = _quest_headers(token)
@@ -788,9 +764,6 @@ async def claim_orb(token):
         return False, str(e)
 
 
-# ============================================================
-# background loops
-# ============================================================
 async def _ensure_autoclaim():
     global _autoclaim_task
     if _autoclaim_task is not None and not _autoclaim_task.done():
@@ -838,9 +811,6 @@ async def autoquest_run(token):
         print(f"[AutoQuest] {q.name} → {res}")
 
 
-# ============================================================
-# cog
-# ============================================================
 class QuestsCog:
     COMMANDS = {"quest", "questrun", "questall", "autoquest", "autoclaim",
                 "orbbadge", "questdump", "questdiag", "spdecode", "qtransport"}
@@ -1065,7 +1035,7 @@ class QuestsCog:
                 f"  first quest:    {raw_first}",
                 f"  suspended til:  {suspended if suspended else '—'}",
                 f"  blocked til:    {blocked if blocked else '—'}",
-                f"  excluded count: {len(excluded) if isinstance(excluded, list) else '?'}",
+                f"  excluded count: {len(excluded) if isinstance(excluded, list) else 0}",
             ]
             await message.channel.send(S._ansi_block(lines))
 
