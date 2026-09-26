@@ -1,5 +1,5 @@
 # cogs/general.py | ping, info, say, spam, purge, snipe (extended), editsnipe, copycat,
-#                   status, platform, hypesquad, sniper, logger, readlog, ar
+#                   status, hypesquad, sniper, logger, readlog, ar
 import asyncio
 import sys
 import os
@@ -134,20 +134,11 @@ def _snipe_render(e, header):
     return S.ui_box(header, rows)
 
 
-def _clear_snipe_where(entries, *, author_id=None, channel_id=None):
-    kept = []
-    for e in entries:
-        if author_id is not None and int(e.get("author_id") or 0) != int(author_id):
-            kept.append(e); continue
-        if channel_id is not None and int(e.get("channel_id") or 0) != int(channel_id):
-            kept.append(e); continue
-    return kept
-
-
 class GeneralCog:
+    # NOTE: "platform" removed — SpooferCog owns that command now
     COMMANDS = {"ping", "info", "say", "spam", "spamstop", "purge", "purgeall",
                 "clear", "snipe", "editsnipe", "esnipe", "copycat",
-                "status", "platform", "hypesquad", "sniper", "logger",
+                "status", "hypesquad", "sniper", "logger",
                 "readlog", "logs", "ar"}
 
     async def handle(self, message, cmd, args):
@@ -282,22 +273,6 @@ class GeneralCog:
                 await client.change_presence(activity=discord.CustomActivity(name=text))
                 await message.edit(content=S.ui_ok(f"status set: {text}"))
 
-        elif cmd == "platform":
-            if len(args) < 2:
-                return await message.edit(content=S.ui_info(
-                    f"platform: {S._current_platform}\ntypes: {' '.join(S.PLATFORM_MAP)}"))
-            plat = "desktop" if args[1].lower() == "off" else args[1].lower()
-            if plat not in S.PLATFORM_MAP:
-                return await message.edit(content=S.ui_err(f"unknown platform: {plat}"))
-            S._current_platform = plat
-            _sync(_current_platform=plat)
-            await message.edit(content=S.ui_ok(f"platform → {plat}"))
-            try:
-                gw = getattr(client, "_gateway", None)
-                if gw:
-                    await gw.close()
-            except Exception: pass
-
         elif cmd == "hypesquad":
             if len(args) < 2:
                 return await message.edit(content=S.ui_err(
@@ -367,7 +342,6 @@ class GeneralCog:
         sub = args[1].lower() if len(args) > 1 else ""
         rest = args[2:]
 
-        # cache-wide ops
         if sub == "clear":
             S._snipe_cache.pop(cid, None)
             return await message.channel.send(S.ui_ok("snipe cache cleared"), delete_after=4)
@@ -380,7 +354,6 @@ class GeneralCog:
                     f"  {S.DIM}ignored users{S.RESET}    {len(_snipe_ignore)}"]
             return await message.channel.send(S.ui_box("snipe cache", rows), delete_after=8)
 
-        # history
         if sub == "history":
             entries = _snipe_visible(_snipe_entries(cid))
             if not entries:
@@ -393,7 +366,6 @@ class GeneralCog:
                             f"{S.RESET} {S.DIM}{e.get('time','?')}{S.RESET}  {content}")
             return await message.channel.send(S._paginate("snipe history", "recent 50", rows))
 
-        # paging
         if sub == "page":
             entries = _snipe_visible(_snipe_entries(cid))
             if not entries:
@@ -412,7 +384,6 @@ class GeneralCog:
                             f"{(e.get('content') or '')[:40]}")
             return await message.channel.send(S._paginate("snipe history", f"page {page}/{total}", rows))
 
-        # search
         if sub == "search":
             if not rest:
                 return await message.channel.send(S.ui_err("usage: snipe search <keyword>"), delete_after=5)
@@ -428,7 +399,6 @@ class GeneralCog:
                             f"{(e.get('content') or '')[:60]}")
             return await message.channel.send(S._paginate("snipe search", f"`{kw}`", rows))
 
-        # filters
         if sub == "filter":
             if not rest:
                 return await message.channel.send(S.ui_info(
@@ -447,7 +417,6 @@ class GeneralCog:
                             f"{(e.get('content') or '')[:50]}")
             return await message.channel.send(S._paginate("snipe filter", kind, rows))
 
-        # attachments / embeds / reactions / time — shortcuts
         if sub in ("attachments", "embeds", "reactions"):
             entries = _snipe_visible(_snipe_entries(cid))
             hits = _filter_entries(entries, sub)
@@ -474,7 +443,6 @@ class GeneralCog:
                             f"{S.DIM}{ago}s ago{S.RESET}  {e.get('author','?')}")
             return await message.channel.send(S._paginate("snipe timestamps", "", rows))
 
-        # purge
         if sub == "purge":
             target = rest[0].lower() if rest else ""
             if target == "user":
@@ -498,7 +466,6 @@ class GeneralCog:
             return await message.channel.send(S.ui_info(
                 "usage: snipe purge user <uid> | channel | server"), delete_after=6)
 
-        # ignore list
         if sub == "ignore":
             if not rest:
                 return await message.channel.send(S.ui_info(
@@ -521,7 +488,6 @@ class GeneralCog:
             return await message.channel.send(S.ui_info(
                 "usage: snipe ignore add/remove/list/clear"), delete_after=6)
 
-        # default — nth from end, or plain view
         entries = _snipe_visible(_snipe_entries(cid))
         if not entries:
             return await message.channel.send(S.ui_info("nothing to snipe"), delete_after=5)
