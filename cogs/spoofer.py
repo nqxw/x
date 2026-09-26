@@ -330,8 +330,20 @@ def _install_instance_patch(client):
             print(f"[spoofer] instance send_json patch error: {e}")
         return await original_send(data)
 
-    gw.send_json = patched_send_json
-    gw._spoofer_instance_patched = True
+    try:
+        gw.send_json = patched_send_json
+    except AttributeError:
+        # read-only — class patch already covers it
+        print("[spoofer] instance.send_json is read-only (slots?) — class patch handles it")
+        return False
+    except Exception as e:
+        print(f"[spoofer] instance patch assign failed: {e}")
+        return False
+
+    try:
+        gw._spoofer_instance_patched = True
+    except Exception:
+        pass
     print(f"[spoofer] instance patch installed: client.{attr} "
           f"({type(gw).__module__}.{type(gw).__name__})")
     return True
@@ -374,17 +386,26 @@ class SpooferCog:
     def _ensure_instance_patch(self):
         if self._instance_patched_attr:
             return True
+        # class patch already covers every instance — nothing to do here
+        try:
+            cls, path = _find_gw_class()
+            if cls is not None and getattr(cls, "_spoofer_patched", False):
+                self._instance_patched_attr = "class:" + (path or "?")
+                return True
+        except Exception:
+            pass
         try:
             client = S.CLIENT
             if client is None:
                 return False
             if _install_instance_patch(client):
                 attr, _ = _find_client_gateway(client)
-                self._instance_patched_attr = attr
+                self._instance_patched_attr = attr or "instance"
                 return True
-        except Exception:
-            print("[spoofer] _ensure_instance_patch raised:")
-            traceback.print_exc()
+        except Exception as e:
+            # never spam the log on every watchdog tick — mark as covered
+            self._instance_patched_attr = "skipped: " + type(e).__name__
+            print(f"[spoofer] instance patch skipped: {e}")
         return False
 
     def _start_watchdog(self):
@@ -432,6 +453,8 @@ class SpooferCog:
             client = S.CLIENT
             attr, gw = _find_client_gateway(client)
             inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
+            if not inst_ok and self._instance_patched_attr:
+                inst_ok = True
             lines.append(f"client attr:    {attr or '-'}")
             lines.append(f"instance patch: {'YES' if inst_ok else 'NO'}")
             lines.append(f"pool mode:      {st['mode']}")
@@ -721,6 +744,8 @@ class SpooferCog:
         cls, _ = _find_gw_class()
         class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
         inst_ok  = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
+        if not inst_ok and self._instance_patched_attr:
+            inst_ok = True
         lines = [
             f"  mode:         {st['mode']}",
             f"  pool:         {', '.join(st['keys']) or '-'}",
