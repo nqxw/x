@@ -229,11 +229,11 @@ class MultiSpoofCog:
     COMMANDS = {"multispoof", "mspoof"}
 
     def __init__(self):
-        # satellites live in S.satellites — shared across the whole bot
         print("[multispoof] cog ready — "
               f"available: {', '.join(SATELLITES.keys())}")
 
     async def handle(self, message, cmd=None, args=None):
+        print(f"[multispoof] handle cmd={cmd!r} args={args!r}")
         try:
             await self._dispatch(message, cmd, args)
         except Exception as e:
@@ -249,6 +249,13 @@ class MultiSpoofCog:
             args = parts[1:]
         if args is None:
             args = []
+        elif isinstance(args, str):
+            args = args.split()
+        if isinstance(cmd, str):
+            cmd = cmd.lstrip("$./!").lower()
+        while args and isinstance(args[0], str) and \
+                args[0].lstrip("$./!").lower() == cmd:
+            args = args[1:]
 
         sub = (args[0].lower() if args else "status")
 
