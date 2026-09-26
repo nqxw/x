@@ -1,8 +1,4 @@
 # cogs/multispoof.py | concurrent gateway sessions — one per client type
-# Discord allows up to 5 simultaneous sessions per account (one per client
-# class: desktop / mobile / web / vr / embedded / console). Each satellite
-# opens its own gateway websocket with a distinct `properties` fingerprint,
-# so the account appears on 4+ devices at once — no rotation, no reconnects.
 import asyncio
 import json
 import time
@@ -12,15 +8,6 @@ import modifyself_shim as discord
 from . import state as S
 
 
-GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
-CLIENT_BUILD = 331500
-
-# Each satellite = one distinct client-type fingerprint.
-# Discord keys session coexistence off the `browser` field:
-#   "Discord Android" / "Discord iOS"  -> mobile slot
-#   "Discord VR"                       -> VR slot
-#   "Discord Embedded"                 -> embedded / console slot
-#   raw browser name (Chrome/Firefox)  -> web/desktop slot
 SATELLITES = {
     "mobile": {
         "os": "Android", "browser": "Discord Android", "device": "Android",
@@ -89,9 +76,6 @@ async def _reply(message, content):
         print(f"[multispoof] reply failed: {e}")
 
 
-# ============================================================
-# satellite session
-# ============================================================
 class _Satellite:
     def __init__(self, name, profile, token):
         self.name = name
@@ -125,7 +109,7 @@ class _Satellite:
             "referrer_current": "",
             "referring_domain_current": "",
             "release_channel": "stable",
-            "client_build_number": CLIENT_BUILD,
+            "client_build_number": S.MULTISPOOF_CLIENT_BUILD,
             "client_event_source": None,
         }
         return {
@@ -157,7 +141,7 @@ class _Satellite:
             try:
                 async with aiohttp.ClientSession() as sess:
                     async with sess.ws_connect(
-                        GATEWAY_URL, heartbeat=30, max_msg_size=0,
+                        S.MULTISPOOF_GATEWAY, heartbeat=30, max_msg_size=0,
                     ) as ws:
                         self.ws = ws
                         self.identified = False
@@ -187,7 +171,7 @@ class _Satellite:
 
     async def _on_frame(self, data):
         op = data.get("op")
-        if op == 10:  # Hello
+        if op == 10:
             hb = data.get("d", {}).get("heartbeat_interval", 41250) / 1000.0
             self.heartbeat_interval = hb
             asyncio.create_task(self._heartbeat_loop())
@@ -195,21 +179,21 @@ class _Satellite:
                 await self.ws.send_json(self._identify_payload())
             except Exception as e:
                 print(f"[multispoof:{self.name}] identify send failed: {e}")
-        elif op == 11:  # Heartbeat ACK
+        elif op == 11:
             pass
-        elif op == 7:   # Reconnect
+        elif op == 7:
             try:
                 await self.ws.close()
             except Exception:
                 pass
-        elif op == 9:   # Invalid session
+        elif op == 9:
             print(f"[multispoof:{self.name}] invalid session")
             await asyncio.sleep(3)
             try:
                 await self.ws.close()
             except Exception:
                 pass
-        elif op == 0:   # Dispatch
+        elif op == 0:
             self.seq = data.get("s", self.seq)
             t = data.get("t")
             if t == "READY":
@@ -241,14 +225,11 @@ class _Satellite:
         self.identified = False
 
 
-# ============================================================
-# cog
-# ============================================================
 class MultiSpoofCog:
     COMMANDS = {"multispoof", "mspoof"}
 
     def __init__(self):
-        self.satellites = {}   # name -> _Satellite
+        # satellites live in S.satellites — shared across the whole bot
         print("[multispoof] cog ready — "
               f"available: {', '.join(SATELLITES.keys())}")
 
@@ -271,21 +252,19 @@ class MultiSpoofCog:
 
         sub = (args[0].lower() if args else "status")
 
-        # ---------- start ----------
         if sub == "start":
-            # default: 4 distinct client types not counting the main desktop session
             names = [a.lower() for a in args[1:]] or ["mobile", "ios", "vr", "console"]
             launched = []
             for n in names:
                 if n not in SATELLITES:
                     await _reply(message, _ansi([f"  \u2717  unknown satellite: {n}"]))
                     continue
-                existing = self.satellites.get(n)
+                existing = S.satellites.get(n)
                 if existing and existing.alive:
                     launched.append(f"{n}(already)")
                     continue
                 sat = _Satellite(n, SATELLITES[n], S.TOKEN)
-                self.satellites[n] = sat
+                S.satellites[n] = sat
                 sat.task = asyncio.create_task(sat.run())
                 launched.append(n)
             await _reply(message, _ansi(
@@ -294,23 +273,21 @@ class MultiSpoofCog:
                  "  satellites stay connected in parallel — each one",
                  "  occupies a distinct client slot on the account."]))
 
-        # ---------- stop ----------
         elif sub == "stop":
-            if not self.satellites:
+            if not S.satellites:
                 await _reply(message, _ansi(["  \u2022  no satellites running"]))
                 return
-            names = [a.lower() for a in args[1:]] or list(self.satellites.keys())
+            names = [a.lower() for a in args[1:]] or list(S.satellites.keys())
             for n in names:
-                sat = self.satellites.pop(n, None)
+                sat = S.satellites.pop(n, None)
                 if sat:
                     if sat.task and not sat.task.done():
                         sat.task.cancel()
                     await sat.close()
             await _reply(message, _ansi(["  \u2713  stopped: " + ", ".join(names)]))
 
-        # ---------- status ----------
         elif sub == "status":
-            if not self.satellites:
+            if not S.satellites:
                 await _reply(message, _ansi([
                     "  \u2022  no satellites running",
                     f"  available: {', '.join(SATELLITES.keys())}",
@@ -318,7 +295,7 @@ class MultiSpoofCog:
                 ]))
                 return
             lines = ["  name       state       session    uptime   label"]
-            for n, sat in self.satellites.items():
+            for n, sat in S.satellites.items():
                 if sat.identified:
                     state = "READY"
                 elif sat.alive:
@@ -329,15 +306,14 @@ class MultiSpoofCog:
                 up = int(time.time() - sat.started_at) if sat.started_at else 0
                 lbl = SATELLITES[n]["label"]
                 lines.append(f"  {n:<10} {state:<11} {sid:<10} {up:>5}s   {lbl}")
-            total = len(self.satellites)
+            total = len(S.satellites)
             lines += ["", f"  {total} satellite(s) online + main desktop session"]
             await _reply(message, _ansi(lines))
 
-        # ---------- restart ----------
         elif sub == "restart":
-            names = list(self.satellites.keys())
+            names = list(S.satellites.keys())
             for n in names:
-                sat = self.satellites.pop(n, None)
+                sat = S.satellites.pop(n, None)
                 if sat:
                     if sat.task and not sat.task.done():
                         sat.task.cancel()
@@ -346,11 +322,10 @@ class MultiSpoofCog:
             await asyncio.sleep(2)
             for n in names:
                 sat = _Satellite(n, SATELLITES[n], S.TOKEN)
-                self.satellites[n] = sat
+                S.satellites[n] = sat
                 sat.task = asyncio.create_task(sat.run())
             await _reply(message, _ansi(["  \u2713  relaunched: " + ", ".join(names)]))
 
-        # ---------- list ----------
         elif sub == "list":
             lines = ["  available client types:"]
             for n, p in SATELLITES.items():
