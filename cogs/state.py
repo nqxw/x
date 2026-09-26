@@ -154,7 +154,6 @@ decrypt_file = None
 _get_session = None
 _perm_check_ref = None
 
-# pre-hooks: async callables(client, message) fired at top of _dispatch_message
 _pre_hooks: list = []
 
 def register_pre_hook(fn):
@@ -489,7 +488,7 @@ _plugins: dict = {}
 _sessions: list = []
 _session_idx = 0
 
-# ── NEW: AFK state ──
+# ── AFK state ──
 afk = {
     "enabled":        False,
     "message":        "I'm AFK right now — back soon.",
@@ -505,7 +504,7 @@ afk = {
     "ping_counter":   {},
 }
 
-# ── NEW: loggers state ──
+# ── loggers ──
 loggers = {
     "message":  {"enabled": False, "channel": None},
     "deleted":  {"enabled": False, "channel": None},
@@ -517,7 +516,7 @@ loggers = {
     "leaves":   {"enabled": False, "channel": None},
 }
 
-# ── NEW: filters state ──
+# ── filters ──
 filters = {
     "spam":         {"enabled": False, "threshold": 5, "window": 5.0, "action": "delete", "history": {}},
     "duplicate":    {"enabled": False, "window": 30.0, "history": {}},
@@ -535,8 +534,8 @@ filters = {
     "actions_log":  [],
 }
 
-# ── NEW: autoresponder rules ──
-ar_rules: list = []          # [{"id", "kind": "keyword"|"regex"|"time", "pattern", "reply", "scope": {...}, "responses": [...], "cooldown", "last": 0}]
+# ── autoresponder rules ──
+ar_rules: list = []
 ar_variables = {
     "{user}":   lambda m: str(m.author),
     "{uid}":    lambda m: str(m.author.id),
@@ -546,32 +545,32 @@ ar_variables = {
     "{date}":   lambda m: datetime.now().strftime("%Y-%m-%d"),
 }
 
-# ── NEW: nickname state ──
+# ── nickname ──
 nickname = {
     "auto":      False,
     "pattern":   "{user}",
-    "history":   {},       # uid -> [(old, new, ts)]
-    "interval":  0,        # 0 = off; else seconds
+    "history":   {},
+    "interval":  0,
     "last_run":  0.0,
 }
 
-# ── NEW: reminders / timers ──
-reminders: list = []     # [{"id", "when", "ch_id", "text", "uid"}]
-timers: list = []        # [{"id", "when", "label"}]
-notifications: list = [] # [{"id", "when", "title", "body"}]
+# ── reminders / timers / notifications ──
+reminders: list = []
+timers: list = []
+notifications: list = []
 
-# ── NEW: ping tracking ──
-ping_counts: dict = {}   # uid -> {"count": int, "last": ts, "messages": [ids]}
-mention_log: list = []   # [{"ts", "by", "in", "content"}]
+# ── ping tracking ──
+ping_counts: dict = {}
+mention_log: list = []
 ping_cfg = {"track": True, "log_channel": None, "max_store": 200}
 
-# ── NEW: profile tracking ──
-profile_history: dict = {}   # uid -> [{"ts", "username", "avatar", "banner", "bio"}]
+# ── profile tracking ──
+profile_history: dict = {}
 personal_blocklist: set = set()
 personal_whitelist: set = set()
 personal_ignore: set = set()
 
-# ── NEW: meta state ──
+# ── meta ──
 meta = {
     "debug":         False,
     "dev_mode":      False,
@@ -585,5 +584,49 @@ meta = {
     "api_endpoints": {},
 }
 
-# ── NEW: scheduler config ──
+# ── scrapers / schedulers ──
 scrape_cfg = {"auto_purge": False, "keep_last": 50}
+
+# ============================================================
+# multispoof satellite state — shared across cogs
+# ============================================================
+MULTISPOOF_GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
+MULTISPOOF_CLIENT_BUILD = 331500
+satellites: dict = {}   # name -> _Satellite instance
+
+
+async def satellite_stop_all():
+    """Stop every satellite, cancelling its task and closing the socket."""
+    for name in list(satellites.keys()):
+        sat = satellites.pop(name, None)
+        if sat is None:
+            continue
+        try:
+            if getattr(sat, "task", None) and not sat.task.done():
+                sat.task.cancel()
+        except Exception:
+            pass
+        try:
+            await sat.close()
+        except Exception:
+            pass
+
+
+async def reply(message, content):
+    """
+    Robust reply — tries edit, falls back to delete+send. Survives
+    age-restricted channels where edit_message 403s.
+    """
+    try:
+        return await message.edit(content=content)
+    except Exception:
+        pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        return await message.channel.send(content)
+    except Exception as e:
+        print(f"[state.reply] {e}")
+        return None
