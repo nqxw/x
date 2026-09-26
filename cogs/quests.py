@@ -1,5 +1,5 @@
 # cogs/quests.py | quest completer + orb badge + autoclaim
-# v4.6 — rpcauto pushes app_id to RPC before heartbeat; clears on exit
+# v4.7 — trust voice cache, request_raw fallback, unblocked heartbeats
 import asyncio
 import base64
 import json
@@ -70,7 +70,6 @@ _autoclaim_task = None
 _transport = None
 _transport_lock = asyncio.Lock()
 
-# RPC override tracking — remember what we pushed so we can clear it
 _rpc_override_state = {"slot": 6, "active": False, "app_id": None, "prev": None}
 
 
@@ -122,6 +121,11 @@ def _quest_headers(token):
 
 
 def _current_voice_channel_id():
+    """
+    Return the channel id the selfbot occupies. Trust the voice cog's
+    cache directly — no guild.get_channel validation, which fails when
+    modifyself hasn't cached the channel locally.
+    """
     client = S.CLIENT
     if client is None:
         return None
@@ -129,16 +133,11 @@ def _current_voice_channel_id():
         from . import voice as _v
         svc = getattr(_v, "_self_vc", {}) or {}
         ch = svc.get("channel_id")
-        gid = svc.get("guild_id")
-        if ch and gid:
-            guilds = getattr(client._state, "_guilds", None) or {}
-            g = guilds.get(int(gid))
-            if g is not None:
-                try:
-                    if g.get_channel(int(ch)) is not None:
-                        return int(ch)
-                except Exception:
-                    pass
+        if ch:
+            try:
+                return int(ch)
+            except Exception:
+                pass
     except Exception:
         pass
     for attr in ("_voice_state", "_current_voice", "_voice"):
@@ -155,18 +154,12 @@ def _current_voice_channel_id():
 
 
 # ============================================================
-# RPC override helper — pushes app_id to gateway presence
+# RPC override helper
 # ============================================================
 async def _push_rpc_override(app_id, name=None):
-    """
-    Send an op:3 presence update with a custom activity carrying the
-    given application_id. Called before heartbeat quests so the backend
-    sees "this user is running app <id>" when the heartbeat arrives.
-    """
     client = S.CLIENT
     if client is None or not app_id:
         return False
-
     activity = {
         "application_id": str(app_id),
         "type": 0,
@@ -176,8 +169,6 @@ async def _push_rpc_override(app_id, name=None):
         "instance": True,
         "flags": 0,
     }
-
-    # save previous activity so we can restore on clear
     try:
         gw = getattr(client, "_gateway", None)
         if gw and hasattr(gw, "send_json"):
@@ -203,7 +194,6 @@ async def _push_rpc_override(app_id, name=None):
 
 
 async def _clear_rpc_override():
-    """Send an empty activities list to clear the presence."""
     client = S.CLIENT
     if client is None:
         return False
@@ -271,6 +261,29 @@ class _ForkTransport:
                     call = await call
                 return 200, (call if isinstance(call, dict) else {"body": call})
             except Exception as e:
+                msg = str(e)
+                # wreq refuses some payloads through the json= path.
+                # retry via request_raw with a pre-serialized body.
+                if ("'int' object is not an instance" in msg
+                        or "bytes | bytearray" in msg
+                        or "not an instance of 'bytes" in msg):
+                    try:
+                        body_bytes = json.dumps(json or {}).encode("utf-8")
+                        base_headers = self._spoofer.get_headers()
+                        if headers:
+                            base_headers.update(headers)
+                        call = self._client.request_raw(
+                            method.upper(),
+                            path,
+                            headers=base_headers,
+                            data=body_bytes,
+                        )
+                        if asyncio.iscoroutine(call):
+                            call = await call
+                        return 200, (call if isinstance(call, dict) else {"body": call})
+                    except Exception as e2:
+                        print(f"[quests] request_raw fallback failed: {e2}")
+
                 status = (getattr(e, "status", None)
                           or getattr(getattr(e, "response", None), "status", None))
                 if status:
@@ -711,19 +724,15 @@ class QuestService:
         print(f"[heartbeat] {quest.name} task={task} target={quest.target} "
               f"payloads={len(payloads)} vc={ch}")
 
-        # RPC override: push the app_id so Discord sees "playing app X"
-        # before the first heartbeat.
         rpc_pushed = False
         if quest.app_id:
             rpc_pushed = await _push_rpc_override(quest.app_id, name=quest.name)
-            # give the gateway presence a moment to propagate
             if rpc_pushed:
                 await asyncio.sleep(2.0)
 
         committed = False
         try:
             while time.time() - start < max_runtime:
-                response = None
                 rate_limited = False
                 prev_val = quest.progress_value()
                 candidates = payloads if not committed else [active]
@@ -751,10 +760,7 @@ class QuestService:
                     if new_val > prev_val + 0.5:
                         active = p
                         committed = True
-                        response = d
                         break
-
-                    response = d
 
                 if rate_limited:
                     stall += 1
@@ -778,12 +784,11 @@ class QuestService:
 
                 if stall >= 8:
                     print(f"[heartbeat] {quest.name} stalled at {last_seen:.0f}/{quest.target:.0f} "
-                          f"payload={active} committed={committed}")
+                          f"payload={active} committed={committed} vc={ch}")
                     break
 
                 await asyncio.sleep(interval)
 
-            # terminal ping
             try:
                 t = dict(active); t["terminal"] = True
                 await _api("POST",
@@ -792,7 +797,6 @@ class QuestService:
             except Exception:
                 pass
         finally:
-            # clear RPC override if we pushed one
             if rpc_pushed:
                 try:
                     await _clear_rpc_override()
