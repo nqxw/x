@@ -1,0 +1,9 @@
+{
+  "name": "Platform Spoof",
+  "description": "Show as desktop, web, console, VR (Quest), Xbox, PlayStation, Linux, macOS, iOS or Android. Spoofs gateway IDENTIFY client properties.",
+  "authors": [{ "name": "fade", "id": "0" }],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "UserPlatformIcon"
+  }
+}
